@@ -1,0 +1,176 @@
+package exchange
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/shopspring/decimal"
+	"hyperliquid-builder-code-bot/internal/hyperliquid"
+	httpclient "hyperliquid-builder-code-bot/internal/hyperliquid/client"
+	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
+	"hyperliquid-builder-code-bot/internal/hyperliquid/signing"
+)
+
+type Transport interface {
+	ExchangeRaw(ctx context.Context, request json.RawMessage, out any) (httpclient.Response, error)
+}
+
+type Client struct {
+	transport Transport
+	network   hyperliquid.Network
+	signers   map[string]signing.PrivateKey
+}
+
+func New(transport Transport, network hyperliquid.Network, signers map[string]signing.PrivateKey) (*Client, error) {
+	if transport == nil {
+		return nil, fmt.Errorf("hyperliquid exchange transport is nil")
+	}
+	network = hyperliquid.NormalizeNetwork(network)
+	if err := hyperliquid.ValidateNetwork(network); err != nil {
+		return nil, err
+	}
+	registry := make(map[string]signing.PrivateKey, len(signers))
+	for configuredAddress, key := range signers {
+		address, err := key.Address()
+		if err != nil {
+			return nil, fmt.Errorf("resolve signer %q: %w", configuredAddress, err)
+		}
+		if !strings.EqualFold(configuredAddress, address) {
+			return nil, fmt.Errorf("signer address %q does not match private key address %q", configuredAddress, address)
+		}
+		registry[strings.ToLower(address)] = key
+	}
+	return &Client{transport: transport, network: network, signers: registry}, nil
+}
+
+func (c *Client) PrepareClaim(address string, nonce uint64) (PreparedAction, error) {
+	key, signer, err := c.signer(address)
+	if err != nil {
+		return PreparedAction{}, err
+	}
+	action := signing.Object{signing.F("type", "claimRewards")}
+	signature, err := signing.SignL1Action(key, signing.L1ActionSignInput{Action: action, Nonce: nonce, Network: c.network})
+	if err != nil {
+		return PreparedAction{}, fmt.Errorf("sign claim rewards: %w", err)
+	}
+	body := struct {
+		Action       claimAction       `json:"action"`
+		Nonce        uint64            `json:"nonce"`
+		Signature    signing.Signature `json:"signature"`
+		VaultAddress *string           `json:"vaultAddress"`
+	}{Action: claimAction{Type: "claimRewards"}, Nonce: nonce, Signature: signature}
+	return prepare("claimRewards", signer, "", "", "", nonce, body)
+}
+
+func (c *Client) PrepareSpotSend(address, destination string, token info.Token, amount decimal.Decimal, nonce uint64) (PreparedAction, error) {
+	key, signer, err := c.signer(address)
+	if err != nil {
+		return PreparedAction{}, err
+	}
+	destination = strings.TrimSpace(destination)
+	if destination == "" {
+		return PreparedAction{}, fmt.Errorf("spot send destination is required")
+	}
+	if token.WireToken == "" || token.WireToken != token.Name+":"+token.TokenID {
+		return PreparedAction{}, fmt.Errorf("spot send token wire value is invalid")
+	}
+	if !amount.IsPositive() {
+		return PreparedAction{}, fmt.Errorf("spot send amount must be positive")
+	}
+	amountText := amount.String()
+	normalizedAmount, err := decimal.NewFromString(amountText)
+	if err != nil {
+		return PreparedAction{}, fmt.Errorf("normalize spot send amount: %w", err)
+	}
+	if token.WeiDecimals < 0 || -normalizedAmount.Exponent() > int32(token.WeiDecimals) {
+		return PreparedAction{}, fmt.Errorf("spot send amount exceeds token precision")
+	}
+	action := signing.SpotSendAction{
+		Type: "spotSend", HyperliquidChain: chainLabel(c.network),
+		SignatureChainID: signing.DefaultSignatureChainID, Destination: destination,
+		Token: token.WireToken, Amount: amountText, Time: nonce,
+	}
+	signature, err := signing.SignSpotSend(key, action)
+	if err != nil {
+		return PreparedAction{}, fmt.Errorf("sign spot send: %w", err)
+	}
+	body := struct {
+		Action       signing.SpotSendAction `json:"action"`
+		Nonce        uint64                 `json:"nonce"`
+		Signature    signing.Signature      `json:"signature"`
+		VaultAddress *string                `json:"vaultAddress"`
+	}{Action: action, Nonce: nonce, Signature: signature}
+	return prepare("spotSend", signer, destination, token.WireToken, action.Amount, nonce, body)
+}
+
+func (c *Client) Submit(ctx context.Context, action PreparedAction) (SubmitResult, error) {
+	if len(action.RequestBody) == 0 {
+		return SubmitResult{}, fmt.Errorf("prepared request body is empty")
+	}
+	response, err := c.transport.ExchangeRaw(ctx, action.RequestBody, nil)
+	result := SubmitResult{Response: append(json.RawMessage(nil), response.Body...)}
+	var envelope struct {
+		Status string `json:"status"`
+	}
+	decodeErr := json.Unmarshal(response.Body, &envelope)
+	if decodeErr == nil {
+		switch envelope.Status {
+		case "ok":
+			result.Accepted = true
+		case "err":
+			result.Rejected = true
+		}
+	}
+	if err != nil {
+		return result, err
+	}
+	if decodeErr != nil {
+		return result, fmt.Errorf("decode exchange response status: %w", decodeErr)
+	}
+	if !result.Accepted && !result.Rejected {
+		return result, fmt.Errorf("ambiguous exchange response status %q", envelope.Status)
+	}
+	return result, nil
+}
+
+type claimAction struct {
+	Type string `json:"type"`
+}
+
+func (c *Client) signer(address string) (signing.PrivateKey, string, error) {
+	if c == nil {
+		return signing.PrivateKey{}, "", fmt.Errorf("hyperliquid exchange client is nil")
+	}
+	key, ok := c.signers[strings.ToLower(strings.TrimSpace(address))]
+	if !ok {
+		return signing.PrivateKey{}, "", fmt.Errorf("no private key for signer %q", address)
+	}
+	canonicalAddress, err := key.Address()
+	if err != nil {
+		return signing.PrivateKey{}, "", err
+	}
+	return key, canonicalAddress, nil
+}
+
+func prepare(kind, signer, destination, token, amount string, nonce uint64, body any) (PreparedAction, error) {
+	requestBody, err := json.Marshal(body)
+	if err != nil {
+		return PreparedAction{}, fmt.Errorf("encode prepared %s request: %w", kind, err)
+	}
+	digest := sha256.Sum256(requestBody)
+	return PreparedAction{
+		Kind: kind, Signer: signer, Destination: destination, Token: token, Amount: amount,
+		Nonce: nonce, RequestHash: hex.EncodeToString(digest[:]), RequestBody: requestBody,
+	}, nil
+}
+
+func chainLabel(network hyperliquid.Network) string {
+	if network == hyperliquid.NetworkMainnet {
+		return "Mainnet"
+	}
+	return "Testnet"
+}

@@ -1,0 +1,52 @@
+# Copy this file to config.toml and restrict it to the service account.
+[mysql]
+host = "127.0.0.1"
+port = 3306
+database = "trasia"
+user = "builder_code_bot"
+password = "REPLACE_WITH_MYSQL_PASSWORD"
+
+[hyperliquid]
+network = "mainnet"
+# Leave empty for the selected network or set a local mock URL for testing.
+base_url = ""
+
+[signing]
+# Leave empty to read the shared decryption password once from a TTY at startup.
+decrypt_password = ""
+
+[[builders]]
+name = "builder-1"
+address = "0x0000000000000000000000000000000000000001"
+encrypted_private_key = "REPLACE_WITH_KEYTOOL_OUTPUT_FOR_BUILDER_1"
+
+[[builders]]
+name = "builder-2"
+address = "0x0000000000000000000000000000000000000002"
+encrypted_private_key = "REPLACE_WITH_KEYTOOL_OUTPUT_FOR_BUILDER_2"
+
+[settlement]
+address = "0x0000000000000000000000000000000000000003"
+encrypted_private_key = "REPLACE_WITH_KEYTOOL_OUTPUT_FOR_SETTLEMENT"
+
+[payout]
+recipient_address = "0x0000000000000000000000000000000000000004"
+
+[logging]
+format = "console"
+level = "info"
+color = "auto"
+add_source = false
+
+[aws]
+region = "ap-northeast-1"
+profile = ""
+
+[notification]
+enabled = false
+
+[notification.ses]
+from = ""
+to = []
+reply_to = []
+subject_prefix = "[builder-code]"
