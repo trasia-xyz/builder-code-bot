@@ -616,11 +616,17 @@ func (n *fakeNonce) Next() uint64 { n.next++; return n.next }
 type fakeNotifier struct {
 	keys     []string
 	messages []string
+	reports  []string
 }
 
 func (n *fakeNotifier) Alert(_ context.Context, key, message string) error {
 	n.keys = append(n.keys, key)
 	n.messages = append(n.messages, message)
+	return nil
+}
+
+func (n *fakeNotifier) Report(_ context.Context, subject, message string) error {
+	n.reports = append(n.reports, subject+"\n"+message)
 	return nil
 }
 

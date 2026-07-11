@@ -17,7 +17,9 @@ const (
 	ledgerFutureMargin = 30 * time.Second
 )
 
-func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) error {
+func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) (err error) {
+	report := runReport{trigger: trigger}
+	defer func() { o.reportRun(ctx, report, err) }()
 	current, metadata, err := o.loadCurrent(ctx)
 	if err != nil {
 		return err
@@ -27,7 +29,7 @@ func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) error {
 			return err
 		}
 	}
-	return o.RunNew(ctx, trigger)
+	return o.runNew(ctx, trigger, &report)
 }
 
 func (o *Orchestrator) Recover(ctx context.Context) error {

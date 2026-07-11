@@ -85,6 +85,60 @@ func TestRunNewLogsStructuredRunPhaseActionAndDatabaseEventsWithoutSecrets(t *te
 	}
 }
 
+func TestRunNewReportsEveryOutcome(t *testing.T) {
+	tests := []struct {
+		name       string
+		setup      func(*orchestratorFixture)
+		wantErr    bool
+		wantReport []string
+	}{
+		{
+			name: "completed",
+			setup: func(fx *orchestratorFixture) {
+				fx.repo.records = []Record{{ID: 9, Amount: "1"}}
+				fx.chain.balances = map[string]decimal.Decimal{"0xsettlement": decimal.NewFromInt(2)}
+			},
+			wantReport: []string{"Funding run succeeded", "status: succeeded", "outcome: completed", "record count: 1", "phase: completed", "payout total: 1"},
+		},
+		{
+			name:       "no data",
+			setup:      func(*orchestratorFixture) {},
+			wantReport: []string{"Funding run succeeded", "status: succeeded", "outcome: no_data", "record count: 0"},
+		},
+		{
+			name: "failed validation",
+			setup: func(fx *orchestratorFixture) {
+				fx.repo.records = []Record{{ID: 9, Amount: "-1"}}
+			},
+			wantErr:    true,
+			wantReport: []string{"Funding run failed", "status: failed", "outcome: failed_validation", "record count: 1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := newOrchestratorFixture(t)
+			tt.setup(fx)
+			err := fx.orchestrator.RunNew(context.Background(), TriggerUTC)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("RunNew() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if len(fx.notifier.reports) != 1 {
+				t.Fatalf("reports = %q, want exactly one", fx.notifier.reports)
+			}
+			for _, want := range tt.wantReport {
+				if !strings.Contains(fx.notifier.reports[0], want) {
+					t.Fatalf("report %q does not contain %q", fx.notifier.reports[0], want)
+				}
+			}
+			for _, secret := range []string{"0xbuilder1", "0xsettlement", "0xrecipient"} {
+				if strings.Contains(fx.notifier.reports[0], secret) {
+					t.Fatalf("report leaked %q: %q", secret, fx.notifier.reports[0])
+				}
+			}
+		})
+	}
+}
+
 func TestRunNewSaveFailpointsCoverEveryMutationBoundary(t *testing.T) {
 	boundaries := []struct {
 		name   string

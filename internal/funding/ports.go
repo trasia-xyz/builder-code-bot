@@ -49,6 +49,7 @@ type NonceSource interface{ Next() uint64 }
 
 type Notifier interface {
 	Alert(context.Context, string, string) error
+	Report(context.Context, string, string) error
 }
 
 // Logger is the smallest structured logging surface needed by funding. The

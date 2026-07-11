@@ -59,6 +59,20 @@ func (d *Dispatcher) Alert(ctx context.Context, key string, message Message) {
 	}
 }
 
+// Report sends a notification without opening a deduplication window. Reports
+// describe individual funding runs, so every invocation must be delivered.
+func (d *Dispatcher) Report(ctx context.Context, message Message) {
+	if d == nil {
+		return
+	}
+	if err := d.notifier.Notify(ctx, message); err != nil {
+		d.logger.Error(ctx, "notification delivery failed",
+			logging.String("event", "notification_delivery_failed"),
+			logging.String("notification_kind", "funding_run_report"),
+		)
+	}
+}
+
 // Resolve sends a recovery notification only for an active key and then
 // closes that key's window, allowing a later incident to alert again.
 func (d *Dispatcher) Resolve(ctx context.Context, key string, message Message) {

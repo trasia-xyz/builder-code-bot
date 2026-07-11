@@ -289,6 +289,13 @@ func (n dispatcherFundingNotifier) Alert(ctx context.Context, key, message strin
 	return nil
 }
 
+func (n dispatcherFundingNotifier) Report(ctx context.Context, subject, message string) error {
+	if n.dispatcher != nil {
+		n.dispatcher.Report(ctx, notification.Message{Subject: subject, Body: message})
+	}
+	return nil
+}
+
 type systemClock struct{}
 
 func (systemClock) Now() time.Time { return time.Now() }

@@ -95,7 +95,21 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 	}, nil
 }
 
-func (o *Orchestrator) RunNew(ctx context.Context, trigger Trigger) error {
+type runReport struct {
+	trigger     Trigger
+	state       *RunState
+	recordCount int
+	recordsRead bool
+	outcome     string
+}
+
+func (o *Orchestrator) RunNew(ctx context.Context, trigger Trigger) (err error) {
+	report := runReport{trigger: trigger}
+	defer func() { o.reportRun(ctx, report, err) }()
+	return o.runNew(ctx, trigger, &report)
+}
+
+func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runReport) error {
 	current, _, err := o.loadCurrent(ctx)
 	if err != nil {
 		return err
@@ -107,10 +121,13 @@ func (o *Orchestrator) RunNew(ctx context.Context, trigger Trigger) error {
 	if err != nil {
 		return err
 	}
+	report.recordCount = len(records)
+	report.recordsRead = true
 	run, err := o.newState(trigger)
 	if err != nil {
 		return err
 	}
+	report.state = &run
 	o.info(ctx, "funding run started",
 		slog.String("event", "funding_run_started"),
 		slog.String("run_id", run.RunID),
@@ -125,6 +142,7 @@ func (o *Orchestrator) RunNew(ctx context.Context, trigger Trigger) error {
 		Records: records, Builders: o.builderAddresses(), Settlement: o.settlement, Recipient: o.recipient,
 	}
 	if len(records) == 0 {
+		report.outcome = "no_data"
 		run.Manifest, err = buildTerminalArchiveManifest(manifestInput, false)
 		if err != nil {
 			return err
@@ -133,6 +151,7 @@ func (o *Orchestrator) RunNew(ctx context.Context, trigger Trigger) error {
 	}
 	_, payout, validationErr := CalculateTotals(records)
 	if validationErr != nil {
+		report.outcome = "failed_validation"
 		run.Manifest, err = buildTerminalArchiveManifest(manifestInput, true)
 		if err != nil {
 			return err
@@ -161,6 +180,7 @@ func (o *Orchestrator) RunNew(ctx context.Context, trigger Trigger) error {
 		return err
 	}
 	run.Manifest = manifest
+	report.outcome = "completed"
 	run.Builders = o.builderProgress()
 	if err := o.save(ctx, &run, PhasePrepared); err != nil {
 		return err
@@ -169,6 +189,49 @@ func (o *Orchestrator) RunNew(ctx context.Context, trigger Trigger) error {
 		return o.completeDatabase(ctx, &run)
 	}
 	return o.runPositive(ctx, &run)
+}
+
+func (o *Orchestrator) reportRun(ctx context.Context, report runReport, runErr error) {
+	if o.notifier == nil {
+		return
+	}
+	status := "succeeded"
+	subject := "Funding run succeeded"
+	if runErr != nil {
+		status = "failed"
+		subject = "Funding run failed"
+		if report.outcome == "" || report.outcome == "completed" {
+			report.outcome = "failed"
+		}
+	}
+	if report.outcome == "" {
+		report.outcome = "completed"
+	}
+	lines := []string{
+		"status: " + status,
+		"trigger: " + string(report.trigger),
+		"outcome: " + report.outcome,
+	}
+	if report.recordsRead {
+		lines = append(lines, fmt.Sprintf("record count: %d", report.recordCount))
+	}
+	if report.state != nil {
+		lines = append(lines,
+			"run id: "+report.state.RunID,
+			"utc date: "+report.state.UTCDate,
+		)
+		if report.state.Phase != "" {
+			lines = append(lines, "phase: "+string(report.state.Phase))
+		}
+		if report.state.Manifest.PayoutTotal != "" {
+			lines = append(lines, "payout total: "+report.state.Manifest.PayoutTotal)
+		}
+	}
+	if err := o.notifier.Report(ctx, subject, strings.Join(lines, "\n")); err != nil {
+		o.error(ctx, "funding report delivery failed",
+			slog.String("event", "funding_report_delivery_failed"),
+		)
+	}
 }
 
 func buildTerminalArchiveManifest(input ManifestInput, validationFailed bool) (Manifest, error) {

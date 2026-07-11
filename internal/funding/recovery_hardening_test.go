@@ -698,4 +698,7 @@ func TestRunWithNoCurrentAndNoPendingArchivesOnlyNoData(t *testing.T) {
 	if fx.store.saveCalls != 0 || fx.chain.calls != 0 || fx.repo.completeCalls != 0 || len(fx.store.archives) != 1 || fx.store.archives[0] != "no_data" {
 		t.Fatalf("saves = %d, chain = %d, complete = %d, archives = %v", fx.store.saveCalls, fx.chain.calls, fx.repo.completeCalls, fx.store.archives)
 	}
+	if len(fx.notifier.reports) != 1 {
+		t.Fatalf("reports = %q, want exactly one", fx.notifier.reports)
+	}
 }

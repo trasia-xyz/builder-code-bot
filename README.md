@@ -114,10 +114,11 @@ accepted before MySQL became unavailable, recovery remains in the database
 phase and never creates another payout. Authentication, schema, SQL, scan, and
 business-validation errors are not retried automatically.
 
-Configure SES alerts for negative source amounts, builder failures, insufficient
-settlement balance, ambiguous chain results, sustained MySQL outages and
-recovery, database completion failures, and damaged state. Notification failure
-does not change the authoritative funding state.
+Configure SES notifications for an end-of-run report on every successful or
+failed funding cycle, plus alerts for negative source amounts, builder failures,
+insufficient settlement balance, ambiguous chain results, sustained MySQL
+outages and recovery, database completion failures, and damaged state.
+Notification failure does not change the authoritative funding state.
 
 ## Manual upgrade procedure
 

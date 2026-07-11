@@ -56,6 +56,18 @@ func TestDispatcherResolveClosesDedupeWindow(t *testing.T) {
 	}
 }
 
+func TestDispatcherReportsEveryInvocation(t *testing.T) {
+	t.Parallel()
+	n := &recordingNotifier{}
+	d := NewDispatcher(n)
+	message := Message{Subject: "funding run succeeded", Body: "status: succeeded"}
+	d.Report(context.Background(), message)
+	d.Report(context.Background(), message)
+	if got := len(n.snapshot()); got != 2 {
+		t.Fatalf("messages = %d, want 2", got)
+	}
+}
+
 func TestDispatcherDedupeIsConcurrentAndFailureDoesNotEscape(t *testing.T) {
 	t.Parallel()
 	const secret = "password=do-not-log"
