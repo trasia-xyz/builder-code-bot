@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -27,9 +28,21 @@ func ParsePrivateKey(value secret.SecretString) (PrivateKey, error) {
 	if err != nil {
 		return PrivateKey{}, fmt.Errorf("parse private key: %w", err)
 	}
+	defer func() {
+		clear(decoded)
+		runtime.KeepAlive(decoded)
+	}()
 	var raw [32]byte
+	defer func() {
+		clear(raw[:])
+		runtime.KeepAlive(&raw)
+	}()
 	copy(raw[:], decoded)
 	var scalar secp256k1.ModNScalar
+	defer func() {
+		scalar.Zero()
+		runtime.KeepAlive(&scalar)
+	}()
 	overflow := scalar.SetBytes(&raw)
 	if overflow != 0 || scalar.IsZero() {
 		return PrivateKey{}, fmt.Errorf("private key is outside secp256k1 range")
