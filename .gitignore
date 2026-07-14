@@ -3,3 +3,5 @@
 /bin/
 builder-code-bot
 keytool
+rsync-testnet.sh
+rsync-mainnet.sh
