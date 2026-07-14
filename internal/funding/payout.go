@@ -30,6 +30,11 @@ func IsFatal(err error) bool {
 }
 
 func (o *Orchestrator) executePayout(ctx context.Context, state *RunState, before, amount decimal.Decimal) error {
+	o.info(ctx, "final payout preparation started",
+		slog.String("event", "funding_payout_preparation_started"),
+		slog.String("run_id", state.RunID), slog.String("payout_total", amount.String()),
+		slog.String("settlement_total_before", before.String()),
+		slog.String("recipient", state.Manifest.Recipient))
 	prepared, err := o.chain.PrepareSpotSend(
 		state.Manifest.Settlement, state.Manifest.Recipient, *state.Manifest.Token, amount, o.nonce.Next(),
 	)
@@ -64,8 +69,12 @@ func (o *Orchestrator) submitPreparedPayout(ctx context.Context, state *RunState
 	attrs := []slog.Attr{
 		slog.String("event", "funding_payout_submit_result"),
 		slog.String("run_id", state.RunID),
+		slog.String("payout_total", state.Manifest.PayoutTotal),
 		slog.Bool("accepted", result.Accepted),
 		slog.Bool("rejected", result.Rejected),
+	}
+	if state.Payout != nil {
+		attrs = append(attrs, slog.String("settlement_total_before", state.Payout.TotalBefore))
 	}
 	if len(result.Response) != 0 {
 		attrs = append(attrs, slog.String("response", string(result.Response)))
@@ -97,8 +106,18 @@ func (o *Orchestrator) observeUncertainPayout(ctx context.Context, state *RunSta
 		if balanceErr != nil && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if balanceErr == nil && balance.Total.LessThan(before) {
-			return o.confirmPayout(ctx, state, "settlement_balance_decreased")
+		if balanceErr == nil {
+			decreased := balance.Total.LessThan(before)
+			o.info(ctx, "uncertain payout balance observed",
+				slog.String("event", "funding_payout_balance_observed"),
+				slog.String("run_id", state.RunID), slog.Int("attempt", attempt),
+				slog.String("total_before", before.String()),
+				slog.String("total", balance.Total.String()),
+				slog.String("available", balance.Available.String()),
+				slog.Bool("decreased", decreased))
+			if decreased {
+				return o.confirmPayout(ctx, state, "settlement_balance_decreased")
+			}
 		}
 		if attempt < payoutBalanceObservationAttempts {
 			if err := o.sleeper.Sleep(ctx, payoutBalanceObservationInterval); err != nil {
@@ -116,9 +135,15 @@ func (o *Orchestrator) confirmPayout(ctx context.Context, state *RunState, evide
 	if err := o.save(ctx, state, PhasePayoutConfirmed); err != nil {
 		return err
 	}
-	o.info(ctx, "final payout confirmed",
+	attrs := []slog.Attr{
 		slog.String("event", "funding_payout_confirmed"),
-		slog.String("run_id", state.RunID), slog.String("evidence", evidence))
+		slog.String("run_id", state.RunID), slog.String("evidence", evidence),
+		slog.String("payout_total", state.Manifest.PayoutTotal),
+	}
+	if state.Payout != nil {
+		attrs = append(attrs, slog.String("settlement_total_before", state.Payout.TotalBefore))
+	}
+	o.info(ctx, "final payout confirmed", attrs...)
 	return o.completeDatabase(ctx, state)
 }
 

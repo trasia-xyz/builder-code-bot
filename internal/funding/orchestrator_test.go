@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -40,6 +41,36 @@ func TestRunHappyPathOnlyPersistsFinalPayout(t *testing.T) {
 			t.Fatalf("unexpected state before payout journal: %#v", saved)
 		}
 	}
+}
+
+func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.payoutResult.Response = json.RawMessage(`{"status":"ok"}`)
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+
+	assertLogFields(t, fx.logger, "funding_snapshot_calculated", map[string]any{
+		"record_count": int64(2), "raw_total": "1.500000000000000000", "payout_total": "1.5",
+	})
+	assertLogFields(t, fx.logger, "funding_builder_balance_observed", map[string]any{
+		"builder": "0xbuilder", "attempt": int64(1),
+		"total": "1.5", "hold": "0", "available": "1.5",
+	})
+	assertLogFields(t, fx.logger, "funding_settlement_balance_observed", map[string]any{
+		"attempt": int64(1), "total": "1.5", "hold": "0", "available": "1.5",
+		"payout_total": "1.5", "sufficient": true,
+	})
+	assertLogFields(t, fx.logger, "funding_payout_preparation_started", map[string]any{
+		"payout_total": "1.5", "settlement_total_before": "1.5",
+	})
+	assertLogFields(t, fx.logger, "funding_payout_submit_result", map[string]any{
+		"payout_total": "1.5", "settlement_total_before": "1.5",
+		"accepted": true, "response": `{"status":"ok"}`,
+	})
+	assertLogFields(t, fx.logger, "funding_run_completed", map[string]any{
+		"record_count": int64(2), "raw_total": "1.500000000000000000", "payout_total": "1.5",
+	})
 }
 
 func TestUnknownPayoutConfirmsWhenSettlementBalanceDecreases(t *testing.T) {
@@ -318,6 +349,7 @@ type fixture struct {
 	chain        *fakeChain
 	sleeper      *fakeSleeper
 	notifier     *fakeNotifier
+	logger       *fakeLogger
 	clock        fixedClock
 }
 
@@ -343,9 +375,10 @@ func newFixture(t *testing.T) *fixture {
 	}
 	sleeper := &fakeSleeper{}
 	notifier := &fakeNotifier{}
+	logger := &fakeLogger{}
 	clock := fixedClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: repo, Store: store, Chain: chain, Notifier: notifier,
+		Repository: repo, Store: store, Chain: chain, Notifier: notifier, Logger: logger,
 		Builders:   []string{"0xbuilder"},
 		Settlement: "0xsettlement", Recipient: "0xrecipient",
 		Clock: clock, Nonce: &fakeNonce{next: uint64(clock.now.UnixMilli())}, Sleeper: sleeper,
@@ -353,7 +386,10 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{orchestrator: orchestrator, repo: repo, store: store, chain: chain, sleeper: sleeper, notifier: notifier, clock: clock}
+	return &fixture{
+		orchestrator: orchestrator, repo: repo, store: store, chain: chain,
+		sleeper: sleeper, notifier: notifier, logger: logger, clock: clock,
+	}
 }
 
 func (f *fixture) positiveState(t *testing.T, phase Phase) RunState {
@@ -478,6 +514,46 @@ func (n *fakeNotifier) Alert(_ context.Context, key, _ string) {
 	n.alerts = append(n.alerts, key)
 }
 func (n *fakeNotifier) Report(context.Context, string, string) {}
+
+type fakeLogEntry struct {
+	level string
+	attrs map[string]any
+}
+
+type fakeLogger struct{ entries []fakeLogEntry }
+
+func (l *fakeLogger) Info(_ context.Context, _ string, attrs ...slog.Attr) {
+	l.record("info", attrs)
+}
+func (l *fakeLogger) Warn(_ context.Context, _ string, attrs ...slog.Attr) {
+	l.record("warn", attrs)
+}
+func (l *fakeLogger) Error(_ context.Context, _ string, attrs ...slog.Attr) {
+	l.record("error", attrs)
+}
+func (l *fakeLogger) record(level string, attrs []slog.Attr) {
+	values := make(map[string]any, len(attrs))
+	for _, attr := range attrs {
+		values[attr.Key] = attr.Value.Any()
+	}
+	l.entries = append(l.entries, fakeLogEntry{level: level, attrs: values})
+}
+
+func assertLogFields(t *testing.T, logger *fakeLogger, event string, want map[string]any) {
+	t.Helper()
+	for _, entry := range logger.entries {
+		if entry.attrs["event"] != event {
+			continue
+		}
+		for key, value := range want {
+			if got := entry.attrs[key]; got != value {
+				t.Fatalf("event %s field %s = %#v, want %#v", event, key, got, value)
+			}
+		}
+		return
+	}
+	t.Fatalf("event %s was not logged", event)
+}
 
 type fixedClock struct{ now time.Time }
 

@@ -118,6 +118,10 @@ ListPending 和 Complete 对瞬时 MySQL 错误无限重试，退避响应 conte
 阈值后只发送一次 outage email，期间按间隔记录 progress；恢复后发送一次 recovery email 并
 重置状态，未来 outage 可重新告警。通知投递失败只记录，不中断资金流程。
 
+结构化日志使用 16 位十六进制 run ID，并记录 record/builder 数量、raw/payout total、每个
+builder 与 settlement 的 total/hold/available、实际 sweep 数量、payout 前余额和 submit
+response。固定的 service component 不重复写入每条日志。
+
 成功 funding run 等待下一 UTC 00:00。普通错误（API 暂时失败、reward 未可见、归集不足）
 约 1 分钟后重试，最多重试 5 次；全部失败则返回 retry-exhausted 错误并退出。Fatal payout
 错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL 自身

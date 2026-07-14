@@ -45,7 +45,7 @@ func buildManifest(input ManifestInput, requireToken bool) (Manifest, error) {
 }
 
 func NewRunID() (string, error) {
-	var value [16]byte
+	var value [8]byte
 	if _, err := rand.Read(value[:]); err != nil {
 		return "", fmt.Errorf("generate run ID: %w", err)
 	}

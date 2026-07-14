@@ -9,6 +9,9 @@ import (
 func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) (err error) {
 	report := runReport{trigger: trigger}
 	defer func() { o.reportRun(ctx, report, err) }()
+	o.info(ctx, "funding task started",
+		slog.String("event", "funding_task_started"),
+		slog.String("trigger", string(trigger)))
 	current, metadata, err := o.loadCurrent(ctx)
 	if err != nil {
 		return err
@@ -24,6 +27,8 @@ func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) (err error) {
 }
 
 func (o *Orchestrator) Recover(ctx context.Context) error {
+	o.info(ctx, "funding recovery check started",
+		slog.String("event", "funding_recovery_check_started"))
 	current, metadata, err := o.loadCurrent(ctx)
 	if err != nil || current == nil {
 		return err
@@ -34,7 +39,10 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 func (o *Orchestrator) recoverState(ctx context.Context, state RunState, metadata StateLoadMetadata) (err error) {
 	o.info(ctx, "funding recovery started",
 		slog.String("event", "recovery_started"), slog.String("run_id", state.RunID),
-		slog.String("phase", string(state.Phase)))
+		slog.String("phase", string(state.Phase)),
+		slog.Int("record_count", len(state.Manifest.Records)),
+		slog.String("raw_total", state.Manifest.RawTotal),
+		slog.String("payout_total", state.Manifest.PayoutTotal))
 	defer func() {
 		if err == nil {
 			o.info(ctx, "funding recovery completed",

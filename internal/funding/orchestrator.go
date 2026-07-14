@@ -96,10 +96,15 @@ type runReport struct {
 }
 
 func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runReport) error {
+	o.info(ctx, "pending funding records query started",
+		slog.String("event", "funding_pending_records_query_started"))
 	records, err := o.repository.ListPending(ctx)
 	if err != nil {
 		return err
 	}
+	o.info(ctx, "pending funding records query completed",
+		slog.String("event", "funding_pending_records_query_completed"),
+		slog.Int("record_count", len(records)))
 	report.recordCount, report.recordsRead = len(records), true
 	if len(records) == 0 {
 		report.outcome = "no_data"
@@ -113,7 +118,8 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 	report.state = &run
 	o.info(ctx, "funding run started",
 		slog.String("event", "funding_run_started"), slog.String("run_id", run.RunID),
-		slog.String("trigger", string(trigger)))
+		slog.String("trigger", string(trigger)), slog.Int("record_count", len(records)),
+		slog.Int("builder_count", len(o.builders)))
 
 	input := ManifestInput{Records: records, Settlement: o.settlement, Recipient: o.recipient}
 	manifest, validationErr := buildManifest(input, false)
@@ -134,6 +140,11 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 		}
 		run.Manifest.Token = &token
 	}
+	o.info(ctx, "funding snapshot calculated",
+		slog.String("event", "funding_snapshot_calculated"),
+		slog.String("run_id", run.RunID), slog.Int("record_count", len(records)),
+		slog.String("raw_total", run.Manifest.RawTotal),
+		slog.String("payout_total", run.Manifest.PayoutTotal))
 	report.outcome = "completed"
 	if err := o.save(ctx, &run, PhasePrepared); err != nil {
 		return err
@@ -151,12 +162,13 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 		}
 		prepared, err := o.chain.PrepareClaim(builder, o.nonce.Next())
 		if err != nil {
-			o.builderFailure(ctx, state, "claimRewards", "prepare")
+			o.builderFailure(ctx, state, builder, "claimRewards", "prepare")
 			continue
 		}
 		result, _ := o.chain.Submit(ctx, prepared)
+		o.logBuilderSubmitResult(ctx, state, builder, "claimRewards", "", result)
 		if !result.Accepted {
-			o.builderFailure(ctx, state, "claimRewards", submitResultName(result))
+			o.builderFailure(ctx, state, builder, "claimRewards", submitResultName(result))
 		}
 	}
 	token := *state.Manifest.Token
@@ -175,25 +187,46 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 			}
 			balance, balanceErr := o.chain.SpotBalance(ctx, builder, token)
 			if balanceErr != nil {
-				o.builderFailure(ctx, state, "spotBalance", "query")
+				o.builderFailure(ctx, state, builder, "spotBalance", "query")
 				continue
 			}
+			o.info(ctx, "builder balance observed",
+				slog.String("event", "funding_builder_balance_observed"),
+				slog.String("run_id", state.RunID), slog.String("builder", builder),
+				slog.Int("attempt", attempt), slog.String("total", balance.Total.String()),
+				slog.String("hold", balance.Total.Sub(balance.Available).String()),
+				slog.String("available", balance.Available.String()))
 			if !balance.Available.IsPositive() {
 				continue
 			}
 			prepared, prepareErr := o.chain.PrepareSpotSend(builder, state.Manifest.Settlement, token, balance.Available, o.nonce.Next())
 			if prepareErr != nil {
-				o.builderFailure(ctx, state, "spotSend", "prepare")
+				o.builderFailure(ctx, state, builder, "spotSend", "prepare")
 				continue
 			}
 			result, _ := o.chain.Submit(ctx, prepared)
+			o.logBuilderSubmitResult(ctx, state, builder, "spotSend", balance.Available.String(), result)
 			if !result.Accepted {
-				o.builderFailure(ctx, state, "spotSend", submitResultName(result))
+				o.builderFailure(ctx, state, builder, "spotSend", submitResultName(result))
 			}
 		}
 		settlement, err = o.chain.SpotBalance(ctx, state.Manifest.Settlement, token)
-		if err == nil && !settlement.Available.LessThan(payout) {
-			return o.executePayout(ctx, state, settlement.Total, payout)
+		if err == nil {
+			sufficient := !settlement.Available.LessThan(payout)
+			o.info(ctx, "settlement balance observed",
+				slog.String("event", "funding_settlement_balance_observed"),
+				slog.String("run_id", state.RunID), slog.Int("attempt", attempt),
+				slog.String("total", settlement.Total.String()),
+				slog.String("hold", settlement.Total.Sub(settlement.Available).String()),
+				slog.String("available", settlement.Available.String()),
+				slog.String("payout_total", payout.String()), slog.Bool("sufficient", sufficient))
+			if sufficient {
+				return o.executePayout(ctx, state, settlement.Total, payout)
+			}
+		} else {
+			o.warn(ctx, "settlement balance query failed",
+				slog.String("event", "funding_settlement_balance_query_failed"),
+				slog.String("run_id", state.RunID), slog.Int("attempt", attempt))
 		}
 		if attempt < builderConvergenceAttempts {
 			if sleepErr := o.sleeper.Sleep(ctx, builderConvergenceInterval); sleepErr != nil {
@@ -215,10 +248,32 @@ func submitResultName(result exchange.SubmitResult) string {
 	return "unknown"
 }
 
-func (o *Orchestrator) builderFailure(ctx context.Context, state *RunState, action, outcome string) {
+func (o *Orchestrator) logBuilderSubmitResult(
+	ctx context.Context,
+	state *RunState,
+	builder, action, amount string,
+	result exchange.SubmitResult,
+) {
+	attrs := []slog.Attr{
+		slog.String("event", "funding_builder_submit_result"),
+		slog.String("run_id", state.RunID), slog.String("builder", builder),
+		slog.String("action_kind", action), slog.Bool("accepted", result.Accepted),
+		slog.Bool("rejected", result.Rejected),
+	}
+	if amount != "" {
+		attrs = append(attrs, slog.String("amount", amount))
+	}
+	if len(result.Response) != 0 {
+		attrs = append(attrs, slog.String("response", string(result.Response)))
+	}
+	o.info(ctx, "builder submission returned", attrs...)
+}
+
+func (o *Orchestrator) builderFailure(ctx context.Context, state *RunState, builder, action, outcome string) {
 	o.warn(ctx, "builder action did not complete",
 		slog.String("event", "funding_builder_action_failed"),
-		slog.String("run_id", state.RunID), slog.String("action_kind", action),
+		slog.String("run_id", state.RunID), slog.String("builder", builder),
+		slog.String("action_kind", action),
 		slog.String("outcome", outcome))
 	o.alertOnce(ctx, state.RunID, "builder_"+action+"_failed", action+" action did not complete")
 }
@@ -262,6 +317,10 @@ func (o *Orchestrator) completeDatabase(ctx context.Context, state *RunState) er
 	if err := o.store.Clear(ctx); err != nil {
 		return err
 	}
+	o.info(ctx, "funding run completed",
+		slog.String("event", "funding_run_completed"), slog.String("run_id", state.RunID),
+		slog.Int("record_count", len(ids)), slog.String("raw_total", state.Manifest.RawTotal),
+		slog.String("payout_total", state.Manifest.PayoutTotal))
 	o.forgetAlerts(state.RunID)
 	return nil
 }
@@ -342,6 +401,19 @@ func (o *Orchestrator) error(ctx context.Context, message string, attrs ...slog.
 
 func (o *Orchestrator) loadCurrent(ctx context.Context) (*RunState, StateLoadMetadata, error) {
 	current, metadata, err := o.store.LoadWithMetadata(ctx)
+	if err == nil {
+		attrs := []slog.Attr{
+			slog.String("event", "funding_current_state_checked"),
+			slog.Bool("current_exists", current != nil),
+			slog.Bool("recovered_from_backup", metadata.RecoveredFromBackup),
+		}
+		if current != nil {
+			attrs = append(attrs,
+				slog.String("run_id", current.RunID),
+				slog.String("phase", string(current.Phase)))
+		}
+		o.info(ctx, "funding current state checked", attrs...)
+	}
 	if err == nil && metadata.RecoveredFromBackup {
 		runID := "state-store"
 		if current != nil && current.RunID != "" {

@@ -58,8 +58,10 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 	}
 
 	logger := logging.New(logging.Config{
-		Format: cfg.Logging.Format, Level: cfg.Logging.Level, Color: cfg.Logging.Color,
-		AddSource: cfg.Logging.AddSource, Component: "builder-code-bot",
+		Format:    cfg.Logging.Format,
+		Level:     cfg.Logging.Level,
+		Color:     cfg.Logging.Color,
+		AddSource: cfg.Logging.AddSource,
 		SensitiveKeys: []string{
 			"decrypt_password", "private_key", "encrypted_private_key", "signature", "signed_request",
 		},
@@ -80,6 +82,9 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		})
 		return nil, err
 	}
+	logger.Info(ctx, "private key initialization started",
+		slog.String("event", "startup_signer_initialization_started"),
+		slog.Int("signer_count", len(cfg.Builders)+1))
 	signers, err := buildSigners(cfg, password)
 	if err != nil {
 		dispatcher.Alert(ctx, "startup_signing", notification.Message{
@@ -87,11 +92,16 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		})
 		return nil, err
 	}
+	logger.Info(ctx, "private keys initialized",
+		slog.String("event", "startup_signer_initialization_completed"),
+		slog.Int("signer_count", len(signers)))
 
 	db, err := mysql.Open(cfg.MySQL)
 	if err != nil {
 		return nil, fmt.Errorf("initialize MySQL pool: %w", err)
 	}
+	logger.Info(ctx, "MySQL pool initialized",
+		slog.String("event", "startup_mysql_pool_initialized"))
 	defer func() {
 		if err != nil {
 			_ = db.Close()
@@ -102,6 +112,9 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 	if err != nil {
 		return nil, err
 	}
+	logger.Info(ctx, "funding process lock acquired",
+		slog.String("event", "startup_process_lock_acquired"),
+		slog.String("data_dir", state.DataDir))
 	defer func() {
 		if err != nil {
 			_ = processLock.Close()
@@ -112,6 +125,9 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 	if err != nil {
 		return nil, err
 	}
+	logger.Info(ctx, "funding runtime starting",
+		slog.String("event", "startup_funding_runtime_started"),
+		slog.Bool("run_on_start", opts.RunOnStart))
 	if err := startRuntime(ctx, orchestrator, opts.RunOnStart); err != nil {
 		return nil, err
 	}

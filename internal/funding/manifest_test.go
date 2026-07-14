@@ -64,7 +64,7 @@ func TestNewRunIDReturnsDistinctIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != 32 || len(second) != 32 || first == second {
+	if len(first) != 16 || len(second) != 16 || first == second {
 		t.Fatalf("NewRunID() = %q, %q", first, second)
 	}
 }
