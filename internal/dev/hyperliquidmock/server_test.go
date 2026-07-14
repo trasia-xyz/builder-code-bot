@@ -1,11 +1,7 @@
 package hyperliquidmock
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"io"
-	"net/http"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -36,12 +32,12 @@ func TestServerProvidesSpotMetadataAndBalances(t *testing.T) {
 	if token.WireToken != "USDC:0" || token.WeiDecimals != 6 {
 		t.Fatalf("token = %#v", token)
 	}
-	balance, err := client.AvailableSpotBalance(context.Background(), "0xAbC", token)
+	balance, err := client.SpotBalance(context.Background(), "0xAbC", token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !balance.Equal(decimal.RequireFromString("12.5")) {
-		t.Fatalf("balance = %s, want 12.5", balance)
+	if !balance.Total.Equal(decimal.RequireFromString("12.5")) || !balance.Available.Equal(decimal.RequireFromString("12.5")) {
+		t.Fatalf("balance = %+v, want total and available 12.5", balance)
 	}
 }
 
@@ -63,10 +59,6 @@ func TestServerAppliesSpotSendOnceForSameSignedRequest(t *testing.T) {
 
 	assertBalance(t, server, signer, "2.75")
 	assertBalance(t, server, "0x00000000000000000000000000000000000000aa", "2.25")
-	updates := queryLedger(t, server.URL, signer)
-	if len(updates) != 1 || updates[0].Time != 2001 {
-		t.Fatalf("ledger updates = %#v", updates)
-	}
 	requests := server.Requests()
 	exchangeRequests := 0
 	for _, request := range requests {
@@ -218,33 +210,11 @@ func assertBalance(t *testing.T, server *Server, address, want string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := info.New(transport).AvailableSpotBalance(context.Background(), address, testToken())
+	got, err := info.New(transport).SpotBalance(context.Background(), address, testToken())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Equal(decimal.RequireFromString(want)) {
-		t.Fatalf("balance for %s = %s, want %s", address, got, want)
+	if !got.Available.Equal(decimal.RequireFromString(want)) {
+		t.Fatalf("balance for %s = %s, want %s", address, got.Available, want)
 	}
-}
-
-func queryLedger(t *testing.T, baseURL, address string) []info.LedgerUpdate {
-	t.Helper()
-	payload, err := json.Marshal(map[string]any{"type": "userNonFundingLedgerUpdates", "user": address, "startTime": 0, "endTime": 3000})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := http.Post(baseURL+"/info", "application/json", bytes.NewReader(payload))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var updates []info.LedgerUpdate
-	if err := json.Unmarshal(body, &updates); err != nil {
-		t.Fatalf("decode ledger %s: %v", body, err)
-	}
-	return updates
 }

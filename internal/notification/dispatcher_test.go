@@ -30,61 +30,26 @@ func (n *recordingNotifier) snapshot() []Message {
 	return append([]Message(nil), n.messages...)
 }
 
-func TestDispatcherSuppressesDuplicateActiveAlert(t *testing.T) {
-	t.Parallel()
+func TestDispatcherSendsEveryFundingAlertAndReport(t *testing.T) {
 	n := &recordingNotifier{}
 	d := NewDispatcher(n)
-	d.Alert(context.Background(), "mysql_down", Message{Subject: "mysql down", Body: "body"})
-	d.Alert(context.Background(), "mysql_down", Message{Subject: "mysql still down", Body: "body"})
-	if got := len(n.snapshot()); got != 1 {
-		t.Fatalf("messages = %d, want 1", got)
-	}
-}
-
-func TestDispatcherResolveClosesDedupeWindow(t *testing.T) {
-	t.Parallel()
-	n := &recordingNotifier{}
-	d := NewDispatcher(n)
-	d.Resolve(context.Background(), "mysql_down", Message{Subject: "unused", Body: "unused"})
-	d.Alert(context.Background(), "mysql_down", Message{Subject: "down", Body: "body"})
-	d.Resolve(context.Background(), "mysql_down", Message{Subject: "recovered", Body: "body"})
-	d.Resolve(context.Background(), "mysql_down", Message{Subject: "duplicate recovery", Body: "body"})
-	d.Alert(context.Background(), "mysql_down", Message{Subject: "down again", Body: "body"})
+	d.Alert(context.Background(), "first", Message{Subject: "alert"})
+	d.Alert(context.Background(), "first", Message{Subject: "alert again"})
+	d.Report(context.Background(), Message{Subject: "report"})
 	got := n.snapshot()
-	if len(got) != 3 || got[0].Subject != "down" || got[1].Subject != "recovered" || got[2].Subject != "down again" {
+	if len(got) != 3 || got[0].Subject != "alert" || got[1].Subject != "alert again" || got[2].Subject != "report" {
 		t.Fatalf("messages = %#v", got)
 	}
 }
 
-func TestDispatcherReportsEveryInvocation(t *testing.T) {
-	t.Parallel()
-	n := &recordingNotifier{}
-	d := NewDispatcher(n)
-	message := Message{Subject: "funding run succeeded", Body: "status: succeeded"}
-	d.Report(context.Background(), message)
-	d.Report(context.Background(), message)
-	if got := len(n.snapshot()); got != 2 {
-		t.Fatalf("messages = %d, want 2", got)
-	}
-}
-
-func TestDispatcherDedupeIsConcurrentAndFailureDoesNotEscape(t *testing.T) {
-	t.Parallel()
+func TestDispatcherContainsDeliveryFailureWithoutLeakingError(t *testing.T) {
 	const secret = "password=do-not-log"
 	var output bytes.Buffer
 	n := &recordingNotifier{err: errors.New(secret)}
 	d := NewDispatcher(n, logging.New(logging.Config{Format: logging.FormatJSON, Level: logging.LevelDebug, Output: &output}))
-	var wg sync.WaitGroup
-	for range 20 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			d.Alert(context.Background(), "same", Message{Subject: "down", Body: "body"})
-		}()
-	}
-	wg.Wait()
-	if got := len(n.snapshot()); got != 1 {
-		t.Fatalf("messages = %d, want 1", got)
+	d.Alert(context.Background(), "funding", Message{Subject: "down"})
+	if len(n.snapshot()) != 1 {
+		t.Fatal("notification was not attempted")
 	}
 	if strings.Contains(output.String(), secret) {
 		t.Fatalf("log leaked notifier error: %s", output.String())

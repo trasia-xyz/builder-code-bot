@@ -1,107 +1,106 @@
 # 运维指南
 
-系统组件、资金状态机和恢复原则参见 [架构说明](architecture.md)。本文只描述部署、
-运行和故障处置。
-
-本服务必须始终从同一个项目工作目录启动，因为恢复状态固定保存在 `./data`。
-生产运行前，请为服务创建独立系统账户，并只授予该账户读取配置、状态目录、AWS
-凭证以及连接业务数据库所需的最小权限。
+系统设计与安全不变量见 [架构说明](architecture.md)。
 
 ## 构建与测试
 
 ```sh
 go test ./... -count=1
-go build -o bin/builder-code-bot ./cmd/builder-code-bot
+go test -race ./... -count=1
+staticcheck ./...
+```
+
+集成测试使用本地 HTTP Hyperliquid mock 和真实签名，覆盖明确成功、拒绝、响应不确定但已
+执行，以及不确定且无法确认的路径。
+
+## 配置与私钥
+
+```sh
 go build -o bin/keytool ./cmd/keytool
-```
-
-本地 mock 会使用真实 HTTP 客户端、签名和文件状态存储验证恢复流程：
-
-```sh
-go test ./internal/dev/hyperliquidmock -count=1
-go test ./internal/funding -run Integration -count=1
-```
-
-## 生成私钥密文
-
-在可信终端中运行：
-
-```sh
 ./bin/keytool encrypt
-```
-
-工具会无回显读取私钥、加密密码和确认密码，然后输出派生地址与
-`encrypted_private_key`。先核对派生地址，再把密文复制到配置。所有 builder 与
-settlement 私钥共用同一个密码。不要把私钥、密码、签名、完整签名请求或完整生产
-配置写入日志、工单、邮件或 shell 历史。
-
-`keytool decrypt` 默认只输出派生地址。只有受控灾难恢复时才考虑
-`--show-private-key`，因为该参数会把明文私钥写到标准输出。
-
-## 首次配置与启动
-
-```sh
 cp config.example.toml config.toml
 chmod 0600 config.toml
-./bin/builder-code-bot -config ./config.toml
 ```
 
-生产环境建议保持 `signing.decrypt_password` 为空。首次启动和以后每次重启都必须
-提供控制终端，程序只读取一次密码且不回显。服务不会从环境变量读取这个密码。
-如果为了无人值守启动而把密码写入配置，密文和密码将位于同一个文件中，安全隔离
-能力会明显降低。
+配置使用严格 TOML decoder，未知字段会导致启动失败。生产环境建议把
+`signing.decrypt_password` 留空，由真实 TTY 无回显读取。核对每个配置地址与 keytool 派生
+地址一致，不要把私钥、密码、完整签名请求或生产配置写入日志、邮件或 shell history。
 
-不带参数启动时，服务先恢复已有任务，然后等待下一个 UTC 00:00。带
-`--run-on-start` 时，服务仍先恢复已有任务，再额外执行一轮新任务，之后继续常驻，
-不会执行一轮后退出。调度器每次重新计算下一个 UTC 零点。
+Builder 与 settlement 必须全部为我方账户。Settlement 必须是本服务专用出账账户，不得
+人工或由其他程序转出 spot USDC；否则 total 下降不能作为 payout 成功证据。
 
-## AWS SES 与告警
+## 启动与调度
 
-开启通知时，需要配置 AWS region、SES 发件人和至少一个收件人。AWS SDK 使用默认
-凭证提供链，也可以通过 `aws.profile` 选择共享配置 profile。上线前确认 SES 身份
-已验证，服务账户有发送权限。
+始终使用同一工作目录，因为状态位于 `./data`：
 
-重点告警包括负数源记录、builder 领取或归集失败、settlement 余额不足、链上结果
-不明确、MySQL 长时间不可用及恢复、数据库完成失败、状态文件损坏。通知发送失败
-不会改变权威资金状态。
+```sh
+./bin/builder-code-bot -config ./config.toml
+./bin/builder-code-bot -config ./config.toml --run-on-start
+```
 
-## 状态目录、备份与恢复
+启动先恢复 current，再决定是否 run-on-start。成功后等待下一 UTC 00:00；普通错误每隔约
+1 分钟最多重试 5 次；全部失败或 payout fatal 都会退出。不要为这些退出配置无间隔自动
+重启，否则进程重启会开启一组新的重试，绕过单次任务的自动重试上限。
 
-服务会把 `./data` 权限收紧为 `0700`，状态文件和锁文件为 `0600`。本地状态为支持
-崩溃恢复会保存完整签名请求及其 hash；它不包含私钥，但仍应视为敏感数据。同时把
-`config.toml` 限制为 `0600`，并确保父目录只允许服务账户访问。
+## 状态与备份
 
-业务数据库必须独立备份。本地状态备份按以下流程进行：
+```text
+data/
+├── LOCK
+├── current.json
+├── current.json.bak
+└── history/
+```
 
-1. 优雅停止服务。
-2. 一起复制 `config.toml` 和完整的 `./data` 目录。
-3. 保存备份时间、版本与工作目录，并保留原权限。
-4. 恢复时先停止服务，把两者放回同一工作目录，重新确认目录 `0700`、文件
-   `0600`，再启动程序执行自动恢复。
+备份时先优雅停止服务，再一起复制 `config.toml` 和完整 `data/`，保留目录 `0700`、文件
+`0600`。恢复后先不带 `--run-on-start` 启动。不要在运行中修改 current、backup 或 history。
 
-绝不能通过删除或修改 `data/current.json` 来处理结果不明确的最终付款。请求可能已
-被 Hyperliquid 接受，只是响应丢失。程序必须联合使用已持久化的签名请求与 action
-time、发送前后余额差额，以及现实时间窗内唯一且字段精确匹配的 ledger 记录完成
-核对。`WsSpotTransfer` 的 delta 不包含请求 nonce，单条同额 ledger 记录不能脱离余额
-证据单独确认付款。如果 primary 损坏而 backup 有效，程序会从 backup 恢复并告警；
-如果两者都损坏，应停止自动操作并人工调查。
+Primary 无效时自动使用有效 backup 并告警。Primary `payout_prepared` 可以首次发送；从
+backup 恢复同一 phase 时，更新的 primary 可能已提交，因此只观察 total，不会重发。
+Schema version 当前且始终从 `1` 开始；项目没有 migration 或旧 schema fallback。
 
-## MySQL 故障
+History 只包含 `completed`、`rejected`、`blocked`、`failed_validation`。无 pending records
+不会创建 current 或 `no_data` archive。
 
-连接中断、数据库重启、死锁和锁等待超时等暂时性错误会持续重试直到进程退出，
-等待采用有上限的退避。如果最终付款已经接受，MySQL 随后中断，状态会停留在数据库
-完成阶段；恢复后只重试幂等数据库更新，不会再次付款。认证失败、权限不足、表或列
-缺失、SQL 错误、扫描错误和业务校验错误不会自动重试，应根据告警人工修复。
+## Builder 归集与普通错误
 
-## 人工升级流程
+每轮先 claim 所有 builder，再最多进行 5 轮查询与 sweep。Builder 的 available
+(`total - hold`) 为正时全部发送到 settlement；每轮检查 settlement available，仍不足就
+等待约 1 秒。有限轮次耗尽会返回普通错误，保留 `prepared` current，并约 1 分钟后自动
+恢复重试，最多重试 5 次，不需要人工清理或 builder action journal。重试全部失败后进程
+退出，current 继续保留，便于排障后人工重启恢复。
 
-1. 优雅停止旧版本，记录版本和当前工作目录。
-2. 备份配置、完整 `./data` 与数据库。
-3. 在独立发布目录构建新版本并执行全量测试与 mock 集成测试。
-4. 检查配置和状态 schema 兼容性；只有加密格式明确变化时才重新生成全部密文。
-5. 替换二进制，不删除、不编辑 `./data`。
-6. 先不带 `--run-on-start` 启动，确认已有任务恢复完毕。
-7. 只有确实需要额外新任务时，才在随后重启时加入 `--run-on-start`。
+## Payout 结果处置
 
-升级、回滚或灾难恢复过程中都不要复制明文私钥，也不要在命令行参数中传递解密
-密码。
+### 明确成功
+
+程序保存 `payout_confirmed`，随后无限重试 MySQL Complete。数据库恢复后自动继续；重启也
+只完成数据库，不再发送 payout。
+
+### 明确拒绝
+
+程序记录错误、发送 email、归档 `rejected`、清理 current，然后 fatal 退出。修复拒绝原因
+后可以重启；records 仍 pending，且已知没有发生付款。
+
+### 响应不确定
+
+程序最多观察 settlement 5 次，只比较 total：
+
+- `TotalAfter < TotalBefore`：确认成功并进入数据库完成；
+- 始终未下降或无法可靠读取：保存 `blocked`、归档现场、保留 current、告警并退出。
+
+Hold 变化不会确认 payout。Blocked 表示请求可能已经执行，禁止删除 current 后直接重启。
+人工应使用 current 中的 recipient、amount、nonce、request hash、total before 和时间核查：
+
+- 明确已付款：在停机状态下幂等完成 manifest 中 records，再归档并移走 current/backup；
+- 明确未付款：保留现场归档后，在停机状态下移走 current/backup，再允许重新运行；
+- 无法明确：继续保留 blocked，绝不重发。
+
+## MySQL 故障与通知
+
+瞬时连接错误、server shutdown、deadlock、lock wait timeout 等无限重试，退避响应进程取消。
+连续不可用达到阈值只发送一次 outage email；重试期间按合理间隔记录 progress；恢复只发送
+一次 recovery email 并重置状态。未来 outage 会重新告警。通知发送失败不会中断资金主流程。
+
+认证、权限、schema、SQL、扫描和业务完整性错误不是瞬时故障，应根据日志修复。Payout 已
+确认时 current 保持 `payout_confirmed`，因此任何 MySQL 维护或进程重启都不会造成重复付款。

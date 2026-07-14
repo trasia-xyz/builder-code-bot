@@ -1,24 +1,25 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"strings"
 
-	"github.com/spf13/viper"
+	"github.com/pelletier/go-toml/v2"
 )
 
 type Config struct {
-	MySQL        MySQLConfig        `mapstructure:"mysql"`
-	Hyperliquid  HyperliquidConfig  `mapstructure:"hyperliquid"`
-	Signing      SigningConfig      `mapstructure:"signing"`
-	Builders     []BuilderConfig    `mapstructure:"builders"`
-	Settlement   AccountConfig      `mapstructure:"settlement"`
-	Payout       PayoutConfig       `mapstructure:"payout"`
-	Logging      LoggingConfig      `mapstructure:"logging"`
-	AWS          AWSConfig          `mapstructure:"aws"`
-	Notification NotificationConfig `mapstructure:"notification"`
+	MySQL        MySQLConfig        `toml:"mysql"`
+	Hyperliquid  HyperliquidConfig  `toml:"hyperliquid"`
+	Signing      SigningConfig      `toml:"signing"`
+	Builders     []BuilderConfig    `toml:"builders"`
+	Settlement   AccountConfig      `toml:"settlement"`
+	Payout       PayoutConfig       `toml:"payout"`
+	Logging      LoggingConfig      `toml:"logging"`
+	AWS          AWSConfig          `toml:"aws"`
+	Notification NotificationConfig `toml:"notification"`
 }
 
 func Default() Config {
@@ -41,13 +42,18 @@ func LoadFile(path string) (Config, error) {
 		return Config{}, err
 	}
 
-	cfg := Default()
-	v := viper.New()
-	v.SetConfigFile(path)
-	if err := v.ReadInConfig(); err != nil {
-		return Config{}, err
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read config %s: %w", path, err)
 	}
-	if err := v.UnmarshalExact(&cfg, viper.DecodeHook(decodeHook())); err != nil {
+	cfg := Default()
+	decoder := toml.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
+		var strict *toml.StrictMissingError
+		if errors.As(err, &strict) {
+			return Config{}, fmt.Errorf("decode config %s: %s", path, strict.String())
+		}
 		return Config{}, fmt.Errorf("decode config %s: %w", path, err)
 	}
 	if err := cfg.NormalizeAndValidate(); err != nil {

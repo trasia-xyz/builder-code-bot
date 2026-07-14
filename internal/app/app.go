@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -39,20 +38,10 @@ type scheduledRunner interface {
 }
 
 type App struct {
-	logger       logging.Logger
 	orchestrator *funding.Orchestrator
 	scheduler    scheduledRunner
 	db           *sql.DB
 	processLock  *state.ProcessLock
-
-	runtimeCtx context.Context
-	cancel     context.CancelFunc
-	mu         sync.Mutex
-	running    bool
-	closed     bool
-	wait       sync.WaitGroup
-	closeOnce  sync.Once
-	closeErr   error
 }
 
 func New(ctx context.Context, opts Options) (_ *App, err error) {
@@ -127,7 +116,6 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		return nil, err
 	}
 
-	runtimeCtx, cancel := context.WithCancel(context.Background())
 	utcScheduler := scheduler.New(func(runErr error) {
 		logger.Error(context.Background(), "scheduled funding run failed",
 			slog.String("event", "scheduled_funding_run_failed"),
@@ -135,8 +123,8 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		)
 	})
 	return &App{
-		logger: logger, orchestrator: orchestrator, scheduler: utcScheduler,
-		db: db, processLock: processLock, runtimeCtx: runtimeCtx, cancel: cancel,
+		orchestrator: orchestrator, scheduler: utcScheduler,
+		db: db, processLock: processLock,
 	}, nil
 }
 
@@ -144,31 +132,10 @@ func (a *App) Run(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("app run context is nil")
 	}
-	if a == nil || a.scheduler == nil || a.orchestrator == nil || a.cancel == nil {
+	if a == nil || a.scheduler == nil || a.orchestrator == nil {
 		return fmt.Errorf("app is not initialized")
 	}
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		return fmt.Errorf("app is closed")
-	}
-	if a.running {
-		a.mu.Unlock()
-		return fmt.Errorf("app is already running")
-	}
-	a.running = true
-	a.wait.Add(1)
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.running = false
-		a.mu.Unlock()
-		a.wait.Done()
-	}()
-
-	stop := context.AfterFunc(ctx, a.cancel)
-	defer stop()
-	return a.scheduler.Run(a.runtimeCtx, func(runCtx context.Context, _ funding.Trigger) error {
+	return a.scheduler.Run(ctx, func(runCtx context.Context, _ funding.Trigger) error {
 		return a.orchestrator.Run(runCtx, funding.TriggerUTC)
 	})
 }
@@ -177,24 +144,14 @@ func (a *App) Close() error {
 	if a == nil {
 		return nil
 	}
-	a.closeOnce.Do(func() {
-		a.mu.Lock()
-		a.closed = true
-		a.mu.Unlock()
-		if a.cancel != nil {
-			a.cancel()
-		}
-		a.wait.Wait()
-		var dbErr, lockErr error
-		if a.db != nil {
-			dbErr = a.db.Close()
-		}
-		if a.processLock != nil {
-			lockErr = a.processLock.Close()
-		}
-		a.closeErr = errors.Join(dbErr, lockErr)
-	})
-	return a.closeErr
+	var dbErr, lockErr error
+	if a.db != nil {
+		dbErr = a.db.Close()
+	}
+	if a.processLock != nil {
+		lockErr = a.processLock.Close()
+	}
+	return errors.Join(dbErr, lockErr)
 }
 
 func buildNotifier(ctx context.Context, cfg config.Config) (notification.Notifier, error) {
@@ -255,8 +212,8 @@ func (c hyperliquidChain) CanonicalUSDC(ctx context.Context) (info.Token, error)
 	return c.info.CanonicalUSDC(ctx)
 }
 
-func (c hyperliquidChain) AvailableSpotBalance(ctx context.Context, address string, token info.Token) (decimal.Decimal, error) {
-	return c.info.AvailableSpotBalance(ctx, address, token)
+func (c hyperliquidChain) SpotBalance(ctx context.Context, address string, token info.Token) (info.SpotBalanceAmounts, error) {
+	return c.info.SpotBalance(ctx, address, token)
 }
 
 func (c hyperliquidChain) PrepareClaim(address string, nonce uint64) (exchange.PreparedAction, error) {
@@ -269,15 +226,6 @@ func (c hyperliquidChain) PrepareSpotSend(address, destination string, token inf
 
 func (c hyperliquidChain) Submit(ctx context.Context, action exchange.PreparedAction) (exchange.SubmitResult, error) {
 	return c.exchange.Submit(ctx, action)
-}
-
-func (c hyperliquidChain) FindSpotTransfer(ctx context.Context, query info.TransferQuery) (*info.LedgerUpdate, bool, error) {
-	updates, err := c.info.NonFundingLedger(ctx, query.Sender, query.StartTime, query.EndTime)
-	if err != nil {
-		return nil, false, err
-	}
-	update, matched := info.MatchSpotTransfer(updates, query)
-	return update, matched, nil
 }
 
 type dispatcherFundingNotifier struct{ dispatcher *notification.Dispatcher }

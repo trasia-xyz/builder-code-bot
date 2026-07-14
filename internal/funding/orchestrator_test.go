@@ -3,607 +3,432 @@ package funding
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/shopspring/decimal"
 	"hyperliquid-builder-code-bot/internal/hyperliquid/exchange"
 	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
+
+	"github.com/shopspring/decimal"
 )
 
-func TestNewOrchestratorRejectsSettlementInBuilderList(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	_, err := NewOrchestrator(OrchestratorConfig{
-		Repository: fx.repo, Store: fx.store, Chain: fx.chain,
-		Builders:   []Builder{{Name: "builder", Address: "0xSETTLEMENT"}},
-		Settlement: "0xsettlement", Recipient: "0xrecipient", Clock: fixedClock{}, Nonce: &fakeNonce{},
-	})
-	if err == nil {
-		t.Fatal("NewOrchestrator() error = nil")
-	}
-}
-
-func TestTransferQueryBoundsLedgerByActionTimeAndCurrentTime(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhasePayoutSubmitting)
-	action := prepared("spotSend", "0xsettlement", "0xrecipient", "1.25", 10_000)
-
-	query, err := fx.orchestrator.transferQuery(&state, action)
-	if err != nil {
+func TestRunNewHappyPathOnlyPersistsFinalPayout(t *testing.T) {
+	fx := newFixture(t)
+	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
-	wantStart := uint64(5_000)
-	wantEnd := uint64(fx.orchestrator.clock.Now().UnixMilli() + ledgerFutureMargin.Milliseconds())
-	if query.ActionTime != 10_000 || query.StartTime != wantStart || query.EndTime != wantEnd {
-		t.Fatalf("query times = action:%d start:%d end:%d, want action:10000 start:%d end:%d", query.ActionTime, query.StartTime, query.EndTime, wantStart, wantEnd)
+	if got := fx.chain.events; !equalStrings(got, []string{
+		"submit:claimRewards:0xbuilder", "submit:spotSend:0xbuilder", "submit:spotSend:0xsettlement",
+	}) {
+		t.Fatalf("chain events = %v", got)
 	}
-}
-
-func TestRunNewClaimsEveryBuilderBeforeSweepingAllAvailableUSDCAndPaysOnce(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	fx.repo.records = []Record{{ID: 9, Amount: "1.000000000000000001"}}
-	fx.chain.balances = map[string]decimal.Decimal{
-		"0xbuilder1":   decimal.RequireFromString("1.25"),
-		"0xbuilder2":   decimal.RequireFromString("0.75"),
-		"0xsettlement": decimal.RequireFromString("10"),
-	}
-	fx.chain.submitResults = []submitOutcome{
-		{err: errors.New("connection reset")},
-		{result: exchange.SubmitResult{Accepted: true, Response: json.RawMessage(`{"status":"ok","private_key":"leak","nested":{"privateKey":"camel-leak","accessToken":"token-leak"}}`)}},
-		{result: exchange.SubmitResult{Accepted: true}},
-		{result: exchange.SubmitResult{Accepted: true}},
-		{result: exchange.SubmitResult{Accepted: true}},
-	}
-
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerUTC); err != nil {
-		t.Fatal(err)
-	}
-	want := []string{
-		"canonical", "prepare_claim:0xbuilder1", "submit:claimRewards:0xbuilder1",
-		"prepare_claim:0xbuilder2", "submit:claimRewards:0xbuilder2",
-		"balance:0xbuilder1", "prepare_send:0xbuilder1:0xsettlement:1.25", "submit:spotSend:0xbuilder1",
-		"balance:0xbuilder2", "prepare_send:0xbuilder2:0xsettlement:0.75", "submit:spotSend:0xbuilder2",
-		"balance:0xsettlement", "prepare_send:0xsettlement:0xrecipient:1.000001", "submit:spotSend:0xsettlement",
-	}
-	if !reflect.DeepEqual(fx.chain.events, want) {
-		t.Fatalf("chain events:\n got %v\nwant %v", fx.chain.events, want)
-	}
-	if fx.repo.completeCalls != 1 || !reflect.DeepEqual(fx.repo.completedIDs, []uint64{9}) {
-		t.Fatalf("complete calls = %d, IDs = %v", fx.repo.completeCalls, fx.repo.completedIDs)
-	}
-	if strings.Contains(string(mustJSON(t, fx.store.saved)), "leak") {
-		t.Fatal("persisted state contains unsanitized private key")
-	}
-	for _, snapshot := range fx.store.saved {
-		for _, builder := range snapshot.Builders {
-			for _, action := range []*ActionProgress{&builder.Claim, &builder.Sweep} {
-				if action.Phase == ActionSubmitting && (action.Prepared == nil || len(action.Prepared.RequestBody) == 0) {
-					t.Fatalf("submitting action lacks exact persisted request: %#v", action)
-				}
-			}
-		}
-	}
-}
-
-func TestRecoverRejectsTamperedPreparedBuilderSweepBeforeSubmit(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhaseConsolidating)
-	action := prepared("spotSend", "0xbuilder1", "0xattacker", "1.25", 88)
-	action.Token = "USDC:0"
-	state.Builders = []BuilderProgress{{
-		Name: "one", Address: "0xbuilder1", Claim: ActionProgress{Phase: ActionAccepted},
-		Sweep: ActionProgress{Phase: ActionPrepared, Prepared: &action, BalanceBefore: "1.25"},
-	}}
-	fx.store.current = &state
-
-	if err := fx.orchestrator.Recover(context.Background()); err == nil {
-		t.Fatal("Recover() error = nil")
-	}
-	if slicesContainPrefix(fx.chain.events, "submit:") {
-		t.Fatalf("submitted tampered builder request: %v", fx.chain.events)
-	}
-}
-
-func TestRunNewReconcilesAmbiguousBuilderSweepWithExactLedgerAndBalance(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	fx.repo.records = []Record{{ID: 10, Amount: "1"}}
-	fx.chain.balances = map[string]decimal.Decimal{"0xbuilder2": decimal.Zero, "0xsettlement": decimal.RequireFromString("2")}
-	fx.chain.balanceQueues = map[string][]decimal.Decimal{"0xbuilder1": {decimal.NewFromInt(1), decimal.Zero}}
-	fx.chain.transferMatched = true
-	fx.chain.transfer = &info.LedgerUpdate{Time: 103, Delta: info.SpotTransferDelta{
-		Type: "spotTransfer", Token: "USDC", Amount: "1", User: "0xbuilder1", Destination: "0xsettlement",
-	}}
-	fx.chain.submitResults = []submitOutcome{
-		{result: exchange.SubmitResult{Accepted: true}},
-		{result: exchange.SubmitResult{Accepted: true}},
-		{err: errors.New("timeout")},
-		{result: exchange.SubmitResult{Accepted: true}},
-	}
-
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerUTC); err != nil {
-		t.Fatal(err)
-	}
-	if !slicesContain(fx.chain.events, "find:0xbuilder1:0xsettlement:103") {
-		t.Fatalf("events = %v", fx.chain.events)
-	}
-	foundAccepted := false
-	for _, snapshot := range fx.store.saved {
-		if len(snapshot.Builders) != 0 && snapshot.Builders[0].Sweep.Phase == ActionAccepted && snapshot.Builders[0].Sweep.Evidence != nil {
-			foundAccepted = true
-		}
-	}
-	if !foundAccepted {
-		t.Fatal("ambiguous builder sweep was not persisted as accepted with evidence")
-	}
-}
-
-func TestRunNewNegativeArchivesValidationFailureWithoutCurrentOrDBUpdate(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	fx.repo.records = []Record{{ID: 7, Amount: "-0.000000000000000001"}}
-
-	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
-	if !errors.Is(err, ErrNegativeAmount) {
-		t.Fatalf("RunNew() error = %v, want ErrNegativeAmount", err)
-	}
-	if fx.store.current != nil || fx.store.saveCalls != 0 || fx.repo.completeCalls != 0 {
-		t.Fatalf("current = %#v, saves = %d, completes = %d", fx.store.current, fx.store.saveCalls, fx.repo.completeCalls)
-	}
-	if !reflect.DeepEqual(fx.store.archives, []string{"failed_validation"}) {
-		t.Fatalf("archives = %v", fx.store.archives)
-	}
-	if fx.chain.calls != 0 {
-		t.Fatalf("chain calls = %d", fx.chain.calls)
-	}
-}
-
-func TestRunNewNoRecordsArchivesNoDataWithoutCurrentChainOrDBMutation(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerUTC); err != nil {
-		t.Fatal(err)
-	}
-	if fx.store.current != nil || fx.store.saveCalls != 0 || fx.chain.calls != 0 || fx.repo.completeCalls != 0 {
-		t.Fatalf("current = %#v, saves = %d, chain = %d, completes = %d", fx.store.current, fx.store.saveCalls, fx.chain.calls, fx.repo.completeCalls)
-	}
-	if !reflect.DeepEqual(fx.store.archives, []string{"no_data"}) {
-		t.Fatalf("archives = %v", fx.store.archives)
-	}
-}
-
-func TestRunNewInsufficientSettlementBlocksWithoutPayoutOrDatabaseUpdate(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	fx.repo.records = []Record{{ID: 8, Amount: "2"}}
-	fx.chain.balances = map[string]decimal.Decimal{}
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerUTC); err == nil {
-		t.Fatal("RunNew() error = nil")
-	}
-	if fx.repo.completeCalls != 0 || fx.store.current == nil || fx.store.current.Phase != PhaseBlocked {
-		t.Fatalf("completes = %d, current = %#v", fx.repo.completeCalls, fx.store.current)
-	}
-	if slicesContainPrefix(fx.chain.events, "prepare_send:0xsettlement") {
-		t.Fatalf("partial payout prepared: %v", fx.chain.events)
-	}
-}
-
-func TestRunNewZeroTotalPersistsRecoverableStateSkipsChainAndCompletesManifestIDs(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	fx.repo.records = []Record{{ID: 3, PeriodStartAt: 2, Amount: "0"}, {ID: 2, PeriodStartAt: 1, Amount: "0.000000000000000000"}}
-
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerUTC); err != nil {
-		t.Fatal(err)
-	}
-	if fx.chain.calls != 0 {
-		t.Fatalf("chain calls = %d", fx.chain.calls)
-	}
-	if !reflect.DeepEqual(fx.repo.completedIDs, []uint64{2, 3}) {
+	if !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
 		t.Fatalf("completed IDs = %v", fx.repo.completedIDs)
 	}
-	if fx.store.saveCalls < 3 || fx.store.current != nil || !reflect.DeepEqual(fx.store.archives, []string{"completed"}) {
-		t.Fatalf("saves = %d, current = %#v, archives = %v", fx.store.saveCalls, fx.store.current, fx.store.archives)
+	if fx.store.current != nil || fx.store.archiveResult != "completed" {
+		t.Fatalf("current = %#v, archive = %q", fx.store.current, fx.store.archiveResult)
 	}
-	if fx.store.saved[0].Phase != PhasePrepared || fx.store.saved[1].Phase != PhaseDBUpdating {
-		t.Fatalf("saved phases = %v, %v", fx.store.saved[0].Phase, fx.store.saved[1].Phase)
+	if len(fx.sleeper.delays) != 0 {
+		t.Fatalf("delays = %v, want immediate convergence", fx.sleeper.delays)
 	}
-	if fx.store.saved[0].Manifest.Token != nil {
-		t.Fatalf("zero manifest token = %#v", fx.store.saved[0].Manifest.Token)
-	}
-}
-
-func TestRecoverAcceptedPayoutOnlyCompletesDatabase(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhasePayoutAccepted)
-	state.FinalPayout = &ActionProgress{Phase: ActionAccepted, Prepared: ptrPrepared(prepared("spotSend", "0xsettlement", "0xrecipient", "1.25", 77))}
-	fx.store.current = &state
-
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if fx.chain.calls != 0 || fx.repo.completeCalls != 1 || !reflect.DeepEqual(fx.repo.completedIDs, []uint64{41}) {
-		t.Fatalf("chain calls = %d, complete calls = %d, IDs = %v", fx.chain.calls, fx.repo.completeCalls, fx.repo.completedIDs)
-	}
-}
-
-func TestRecoverDBUpdatingRetriesOnlyManifestCompletion(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhaseDBUpdating)
-	fx.store.current = &state
-	fx.repo.completeErr = errors.New("mysql unavailable")
-	if err := fx.orchestrator.Recover(context.Background()); err == nil {
-		t.Fatal("first Recover() error = nil")
-	}
-	fx.repo.completeErr = nil
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if fx.chain.calls != 0 || fx.repo.completeCalls != 2 {
-		t.Fatalf("chain calls = %d, complete calls = %d", fx.chain.calls, fx.repo.completeCalls)
-	}
-}
-
-func TestRecoverUnknownPayoutConfirmsLedgerWithoutNonceWhenBalanceDeltaMatches(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhasePayoutSubmitting)
-	action := prepared("spotSend", "0xsettlement", "0xrecipient", "1.25", 77)
-	action.Token = "USDC:0"
-	state.FinalPayout = &ActionProgress{Phase: ActionUnknown, Prepared: &action, SubmitAttempts: 2, BalanceBefore: "5"}
-	fx.store.current = &state
-	fx.chain.balances = map[string]decimal.Decimal{"0xsettlement": decimal.RequireFromString("3.75")}
-	fx.chain.transferMatched = true
-	fx.chain.transfer = &info.LedgerUpdate{Time: 77, Delta: info.SpotTransferDelta{
-		Type: "spotTransfer", Token: "USDC", Amount: "1.25", User: "0xsettlement", Destination: "0xrecipient",
-	}}
-
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if fx.repo.completeCalls != 1 || fx.chain.submitIndex != 0 {
-		t.Fatalf("completes = %d, submits = %d", fx.repo.completeCalls, fx.chain.submitIndex)
-	}
-}
-
-func TestRecoverUnknownPayoutConfirmsExactLedgerAndBalanceWithoutResubmit(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhasePayoutSubmitting)
-	action := prepared("spotSend", "0xsettlement", "0xrecipient", "1.25", 77)
-	action.Token = "USDC:0"
-	state.FinalPayout = &ActionProgress{Phase: ActionUnknown, Prepared: &action, SubmitAttempts: 1, BalanceBefore: "5"}
-	fx.store.current = &state
-	fx.chain.balances = map[string]decimal.Decimal{"0xsettlement": decimal.RequireFromString("3.75")}
-	fx.chain.transferMatched = true
-	fx.chain.transfer = &info.LedgerUpdate{Time: 77, Delta: info.SpotTransferDelta{
-		Type: "spotTransfer", Token: "USDC", Amount: "1.25", User: "0xsettlement", Destination: "0xrecipient",
-	}}
-
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if fx.chain.submitIndex != 0 || fx.repo.completeCalls != 1 {
-		t.Fatalf("submits = %d, completes = %d", fx.chain.submitIndex, fx.repo.completeCalls)
-	}
-}
-
-func TestRecoverUnknownPayoutResubmitsOnlyPersistedExactRequest(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhasePayoutSubmitting)
-	action := prepared("spotSend", "0xsettlement", "0xrecipient", "1.25", 77)
-	action.Token = "USDC:0"
-	state.FinalPayout = &ActionProgress{Phase: ActionUnknown, Prepared: &action, SubmitAttempts: 1, BalanceBefore: "5"}
-	fx.store.current = &state
-	fx.chain.balances = map[string]decimal.Decimal{"0xsettlement": decimal.RequireFromString("5")}
-	fx.chain.submitResults = []submitOutcome{{result: exchange.SubmitResult{Accepted: true}}}
-
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(fx.chain.events, []string{"find:0xsettlement:0xrecipient:77", "balance:0xsettlement", "submit:spotSend:0xsettlement"}) {
-		t.Fatalf("events = %v", fx.chain.events)
-	}
-	for _, event := range fx.chain.events {
-		if strings.HasPrefix(event, "prepare_") {
-			t.Fatalf("recovery created a replacement action: %v", fx.chain.events)
+	for _, saved := range fx.store.saved {
+		if saved.Payout == nil && saved.Phase != PhasePrepared {
+			t.Fatalf("unexpected state before payout journal: %#v", saved)
 		}
 	}
 }
 
-func TestRecoverReconcilesAgainAfterAmbiguousExactResubmit(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhasePayoutSubmitting)
-	action := prepared("spotSend", "0xsettlement", "0xrecipient", "1.25", 77)
-	action.Token = "USDC:0"
-	state.FinalPayout = &ActionProgress{Phase: ActionUnknown, Prepared: &action, SubmitAttempts: 1, BalanceBefore: "5"}
-	fx.store.current = &state
-	fx.chain.balanceQueues = map[string][]decimal.Decimal{"0xsettlement": {decimal.NewFromInt(5), decimal.RequireFromString("3.75")}}
-	evidence := &info.LedgerUpdate{Time: 77, Delta: info.SpotTransferDelta{Type: "spotTransfer", Token: "USDC", Amount: "1.25", User: "0xsettlement", Destination: "0xrecipient"}}
-	fx.chain.transferOutcomes = []transferOutcome{{}, {transfer: evidence, matched: true}}
-	fx.chain.submitResults = []submitOutcome{{err: errors.New("timeout")}}
-
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
+func TestUnknownPayoutConfirmsWhenSettlementBalanceDecreases(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.payoutResult = exchange.SubmitResult{}
+	fx.chain.applyUnknownPayout = true
+	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
-	if fx.repo.completeCalls != 1 || countPrefix(fx.chain.events, "submit:") != 1 || countPrefix(fx.chain.events, "find:") != 2 {
-		t.Fatalf("events = %v, completes = %d", fx.chain.events, fx.repo.completeCalls)
+	if fx.store.archiveResult != "completed" || len(fx.repo.completedIDs) == 0 {
+		t.Fatalf("archive = %q, completed = %v", fx.store.archiveResult, fx.repo.completedIDs)
 	}
 }
 
-func TestRecoverReconcilesAgainWhenExactResubmitIsRejected(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhasePayoutSubmitting)
-	action := prepared("spotSend", "0xsettlement", "0xrecipient", "1.25", 77)
-	action.Token = "USDC:0"
-	state.FinalPayout = &ActionProgress{Phase: ActionUnknown, Prepared: &action, SubmitAttempts: 1, BalanceBefore: "5"}
-	fx.store.current = &state
-	fx.chain.balanceQueues = map[string][]decimal.Decimal{"0xsettlement": {decimal.NewFromInt(5), decimal.RequireFromString("3.75")}}
-	evidence := &info.LedgerUpdate{Time: 77, Delta: info.SpotTransferDelta{Type: "spotTransfer", Token: "USDC", Amount: "1.25", User: "0xsettlement", Destination: "0xrecipient"}}
-	fx.chain.transferOutcomes = []transferOutcome{{}, {transfer: evidence, matched: true}}
-	fx.chain.submitResults = []submitOutcome{{result: exchange.SubmitResult{Rejected: true}}}
-
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
+func TestUnknownPayoutBlocksAfterFiniteBalanceObservations(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.payoutResult = exchange.SubmitResult{}
+	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	if err == nil || !IsFatal(err) {
+		t.Fatalf("RunNew() error = %v, want fatal", err)
 	}
-	if fx.repo.completeCalls != 1 || countPrefix(fx.chain.events, "find:") != 2 {
-		t.Fatalf("events = %v, completes = %d", fx.chain.events, fx.repo.completeCalls)
+	if fx.store.current == nil || fx.store.current.Phase != PhaseBlocked || fx.store.archiveResult != "blocked" {
+		t.Fatalf("current = %#v, archive = %q", fx.store.current, fx.store.archiveResult)
+	}
+	if got := countDelay(fx.sleeper.delays, payoutBalanceObservationInterval); got != payoutBalanceObservationAttempts-1 {
+		t.Fatalf("one-second delays = %d, want bounded observations", got)
+	}
+	if len(fx.repo.completedIDs) != 0 {
+		t.Fatalf("database completed after ambiguous payout: %v", fx.repo.completedIDs)
+	}
+	if got := fx.chain.balanceCalls["0xsettlement"]; got != 1+payoutBalanceObservationAttempts {
+		t.Fatalf("settlement balance calls = %d, want sufficiency plus %d observations", got, payoutBalanceObservationAttempts)
 	}
 }
 
-func TestRecoverPreparedPayoutSubmitsPersistedRequestWithoutPreparingReplacement(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhaseFunded)
-	action := prepared("spotSend", "0xsettlement", "0xrecipient", "1.25", 77)
-	action.Token = "USDC:0"
-	state.FinalPayout = &ActionProgress{Phase: ActionPrepared, Prepared: &action, BalanceBefore: "5"}
-	fx.store.current = &state
-	fx.chain.submitResults = []submitOutcome{{result: exchange.SubmitResult{Accepted: true}}}
+func TestUnknownPayoutIgnoresAvailableDecreaseWhenTotalIsUnchanged(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.payoutResult = exchange.SubmitResult{}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
+		{Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5")},
+		{Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("0.5")},
+	}
+	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	if err == nil || !IsFatal(err) || fx.store.current == nil || fx.store.current.Phase != PhaseBlocked {
+		t.Fatalf("RunNew() = %v, current = %#v", err, fx.store.current)
+	}
+	if len(fx.repo.completedIDs) != 0 {
+		t.Fatalf("database completed after hold-only change: %v", fx.repo.completedIDs)
+	}
+}
 
+func TestAvailableBalanceControlsBuilderSweepAndPayoutSufficiency(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xbuilder"] = decimal.NewFromInt(2)
+	fx.chain.holds["0xbuilder"] = decimal.RequireFromString("0.5")
+	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if got := fx.chain.balances["0xbuilder"]; !got.Equal(decimal.RequireFromString("0.5")) {
+		t.Fatalf("builder total after sweep = %s, want held 0.5", got)
+	}
+
+	fx = newFixture(t)
+	fx.chain.balances["0xbuilder"] = decimal.Zero
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+	fx.chain.holds["0xsettlement"] = decimal.NewFromInt(1)
+	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	if err == nil || IsFatal(err) {
+		t.Fatalf("RunNew() error = %v, want ordinary underfunded error", err)
+	}
+	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
+		t.Fatalf("payout used total instead of available: %v", fx.chain.events)
+	}
+}
+
+func TestBuilderRewardDelayedVisibilityConvergesWithinFinitePolling(t *testing.T) {
+	fx := newFixture(t)
+	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{zero, zero}
+	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if got := countDelay(fx.sleeper.delays, builderConvergenceInterval); got != 2 {
+		t.Fatalf("convergence delays = %d, want 2", got)
+	}
+	if fx.store.archiveResult != "completed" {
+		t.Fatalf("archive = %q", fx.store.archiveResult)
+	}
+}
+
+func TestBuilderConvergenceExhaustionIsOrdinaryError(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xbuilder"] = decimal.Zero
+	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	if err == nil || IsFatal(err) {
+		t.Fatalf("RunNew() error = %v, want ordinary error", err)
+	}
+	if got := countDelay(fx.sleeper.delays, builderConvergenceInterval); got != builderConvergenceAttempts-1 {
+		t.Fatalf("convergence delays = %d, want %d", got, builderConvergenceAttempts-1)
+	}
+}
+
+func TestRejectedPayoutBlocksWithoutBalanceObservation(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.payoutResult = exchange.SubmitResult{Rejected: true}
+	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	if err == nil || !IsFatal(err) || fx.store.current != nil {
+		t.Fatalf("error = %v, current = %#v", err, fx.store.current)
+	}
+	if fx.store.archiveResult != "rejected" {
+		t.Fatalf("archive = %q", fx.store.archiveResult)
+	}
+}
+
+func TestBuilderFailuresDoNotBlockPreFundedPayout(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimResult = exchange.SubmitResult{Rejected: true}
+	fx.chain.balanceErrors["0xbuilder"] = errors.New("unavailable")
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if fx.store.archiveResult != "completed" {
+		t.Fatalf("archive = %q", fx.store.archiveResult)
+	}
+	if len(fx.notifier.alerts) == 0 {
+		t.Fatal("builder failures did not alert")
+	}
+}
+
+func TestRecoverSubmittingPayoutUsesBalanceWithoutResubmitting(t *testing.T) {
+	fx := newFixture(t)
+	state := fx.positiveState(t, PhasePayoutSubmitting)
+	state.Payout = &PayoutJournal{
+		Prepared: validPayout(t, state, 900), TotalBefore: "2",
+	}
+	fx.store.current = &state
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("0.5")
+	fx.chain.events = nil
 	if err := fx.orchestrator.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
+	if len(fx.chain.events) != 0 {
+		t.Fatalf("recovery resubmitted chain action: %v", fx.chain.events)
+	}
+	if fx.store.archiveResult != "completed" {
+		t.Fatalf("archive = %q", fx.store.archiveResult)
+	}
+}
+
+func TestRecoverPrimaryPreparedPayoutSubmitsPersistedRequest(t *testing.T) {
+	fx := newFixture(t)
+	state := fx.positiveState(t, PhasePayoutPrepared)
+	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 902), TotalBefore: "2"}
+	fx.store.current = &state
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+	fx.chain.events = nil
+	if err := fx.orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
 		t.Fatalf("events = %v", fx.chain.events)
 	}
 }
 
-func TestRecoverRejectsPreparedPayoutThatDoesNotMatchImmutableManifest(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	state := positiveState(t, PhaseFunded)
-	action := prepared("spotSend", "0xsettlement", "0xattacker", "1.25", 77)
-	action.Token = "USDC:0"
-	state.FinalPayout = &ActionProgress{Phase: ActionPrepared, Prepared: &action, BalanceBefore: "5"}
+func TestRecoverBackupPreparedPayoutDoesNotResubmit(t *testing.T) {
+	fx := newFixture(t)
+	state := fx.positiveState(t, PhasePayoutPrepared)
+	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 903), TotalBefore: "2"}
 	fx.store.current = &state
-
-	if err := fx.orchestrator.Recover(context.Background()); err == nil {
-		t.Fatal("Recover() error = nil")
+	fx.store.metadata = StateLoadMetadata{RecoveredFromBackup: true, PrimaryInvalid: true}
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+	fx.chain.events = nil
+	err := fx.orchestrator.Recover(context.Background())
+	if err == nil || !IsFatal(err) {
+		t.Fatalf("Recover() error = %v, want fatal ambiguity", err)
 	}
-	if slicesContainPrefix(fx.chain.events, "submit:") {
-		t.Fatalf("submitted action that diverges from manifest: %v", fx.chain.events)
+	if len(fx.chain.events) != 0 {
+		t.Fatalf("backup recovery resubmitted payout: %v", fx.chain.events)
 	}
 }
 
-func TestRunNewDoesNotMutateChainWhenSubmittingSnapshotSaveFailsAndRecoverResumes(t *testing.T) {
-	fx := newOrchestratorFixture(t)
-	fx.repo.records = []Record{{ID: 51, Amount: "1"}}
-	fx.chain.balances = map[string]decimal.Decimal{"0xsettlement": decimal.RequireFromString("2")}
-	fx.store.failSaveAt = 4
+func TestRecoverConfirmedPayoutOnlyCompletesDatabase(t *testing.T) {
+	fx := newFixture(t)
+	state := fx.positiveState(t, PhasePayoutConfirmed)
+	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 901), TotalBefore: "2"}
+	fx.store.current = &state
+	fx.chain.events = nil
+	if err := fx.orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fx.chain.events) != 0 || len(fx.repo.completedIDs) == 0 {
+		t.Fatalf("chain = %v, completed = %v", fx.chain.events, fx.repo.completedIDs)
+	}
+}
 
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerUTC); err == nil {
+func TestPayoutIsNotSubmittedUntilBothDurableBoundariesSucceed(t *testing.T) {
+	fx := newFixture(t)
+	fx.store.failPhase = PhasePayoutSubmitting
+	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	if err == nil {
 		t.Fatal("RunNew() error = nil")
 	}
-	for _, event := range fx.chain.events {
-		if strings.HasPrefix(event, "submit:") {
-			t.Fatalf("chain mutation occurred after failed pre-submit save: %v", fx.chain.events)
-		}
+	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
+		t.Fatalf("payout submitted after state save failure: %v", fx.chain.events)
 	}
-	fx.store.failSaveAt = 0
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
+	if fx.store.current == nil || fx.store.current.Phase != PhasePayoutSubmitting || fx.store.current.Payout == nil {
+		t.Fatalf("durable current = %#v", fx.store.current)
+	}
+}
+
+func TestRunNewNoDataArchivesWithoutChainMutation(t *testing.T) {
+	fx := newFixture(t)
+	fx.repo.records = nil
+	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
-	if fx.repo.completeCalls != 1 {
-		t.Fatalf("complete calls = %d", fx.repo.completeCalls)
+	if len(fx.chain.events) != 0 || fx.store.archiveResult != "" {
+		t.Fatalf("chain = %v, archive = %q", fx.chain.events, fx.store.archiveResult)
 	}
 }
 
-type orchestratorFixture struct {
+type fixture struct {
 	orchestrator *Orchestrator
 	repo         *fakeRepository
-	store        *fakeStateStore
+	store        *fakeStore
 	chain        *fakeChain
+	sleeper      *fakeSleeper
 	notifier     *fakeNotifier
-	events       *[]string
+	clock        fixedClock
 }
 
-func newOrchestratorFixture(t *testing.T) *orchestratorFixture {
-	return newOrchestratorFixtureWithLogger(t, nil)
-}
-
-func newOrchestratorFixtureWithLogger(t *testing.T, logger Logger) *orchestratorFixture {
+func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	repo := &fakeRepository{}
-	store := &fakeStateStore{}
-	chain := &fakeChain{token: info.Token{Name: "USDC", TokenID: "0", Index: 0, WeiDecimals: 6, WireToken: "USDC:0"}}
+	repo := &fakeRepository{records: []Record{
+		{ID: 1, PeriodStartAt: 10, Amount: "1"},
+		{ID: 2, PeriodStartAt: 20, Amount: "0.5"},
+	}}
+	store := &fakeStore{}
+	chain := &fakeChain{
+		token: info.Token{Name: "USDC", TokenID: "0", WireToken: "USDC:0", WeiDecimals: 6},
+		balances: map[string]decimal.Decimal{
+			"0xbuilder": decimal.RequireFromString("1.5"), "0xsettlement": decimal.Zero,
+		},
+		holds:           map[string]decimal.Decimal{},
+		balanceErrors:   map[string]error{},
+		balanceSequence: map[string][]info.SpotBalanceAmounts{},
+		balanceCalls:    map[string]int{},
+		claimResult:     exchange.SubmitResult{Accepted: true},
+		sweepResult:     exchange.SubmitResult{Accepted: true},
+		payoutResult:    exchange.SubmitResult{Accepted: true},
+	}
+	sleeper := &fakeSleeper{}
 	notifier := &fakeNotifier{}
-	events := &[]string{}
-	repo.events = events
-	store.events = events
-	o, err := NewOrchestrator(OrchestratorConfig{
-		Repository: repo,
-		Store:      store,
-		Chain:      chain,
-		Notifier:   notifier,
-		Logger:     logger,
-		Builders:   []Builder{{Name: "one", Address: "0xbuilder1"}, {Name: "two", Address: "0xbuilder2"}},
-		Settlement: "0xsettlement",
-		Recipient:  "0xrecipient",
-		Clock:      fixedClock{time.Date(2026, 7, 11, 1, 2, 3, 0, time.UTC)},
-		Nonce:      &fakeNonce{next: 100},
-		Sleeper:    &recordingSleeper{},
+	clock := fixedClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
+	orchestrator, err := NewOrchestrator(OrchestratorConfig{
+		Repository: repo, Store: store, Chain: chain, Notifier: notifier,
+		Builders:   []Builder{{Name: "builder", Address: "0xbuilder"}},
+		Settlement: "0xsettlement", Recipient: "0xrecipient",
+		Clock: clock, Nonce: &fakeNonce{next: uint64(clock.now.UnixMilli())}, Sleeper: sleeper,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &orchestratorFixture{orchestrator: o, repo: repo, store: store, chain: chain, notifier: notifier, events: events}
+	return &fixture{orchestrator: orchestrator, repo: repo, store: store, chain: chain, sleeper: sleeper, notifier: notifier, clock: clock}
+}
+
+func (f *fixture) positiveState(t *testing.T, phase Phase) RunState {
+	t.Helper()
+	manifest, err := BuildManifest(ManifestInput{
+		Records: f.repo.records, Token: &f.chain.token,
+		Settlement: "0xsettlement", Recipient: "0xrecipient",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return RunState{RunID: "run", UTCDate: "2026-07-12", Phase: phase, Manifest: manifest}
 }
 
 type fakeRepository struct {
-	records       []Record
-	completedIDs  []uint64
-	completeCalls int
-	listCalls     int
-	completeErr   error
-	events        *[]string
+	records      []Record
+	completedIDs []uint64
 }
 
 func (r *fakeRepository) ListPending(context.Context) ([]Record, error) {
-	r.listCalls++
-	appendEvent(r.events, "repo.list_pending")
 	return append([]Record(nil), r.records...), nil
 }
 func (r *fakeRepository) Complete(_ context.Context, ids []uint64) error {
-	r.completeCalls++
-	appendEvent(r.events, "repo.complete")
 	r.completedIDs = append([]uint64(nil), ids...)
-	return r.completeErr
+	return nil
 }
 
-type fakeStateStore struct {
-	current        *RunState
-	saved          []RunState
-	archives       []string
-	archived       []RunState
-	saveCalls      int
-	loadCalls      int
-	failSaveAt     int
-	failSave       func(RunState) bool
-	crashAfterSave func(RunState) bool
-	archiveErr     error
-	clearErr       error
-	events         *[]string
-	loadErr        error
-	loadMeta       StateLoadMetadata
+type fakeStore struct {
+	current       *RunState
+	saved         []RunState
+	archived      RunState
+	archiveResult string
+	failPhase     Phase
+	metadata      StateLoadMetadata
 }
 
-func (s *fakeStateStore) Load(context.Context) (*RunState, error) {
-	s.loadCalls++
-	return s.current, s.loadErr
+func (s *fakeStore) Load(context.Context) (*RunState, error) { return cloneState(s.current), nil }
+func (s *fakeStore) LoadWithMetadata(context.Context) (*RunState, StateLoadMetadata, error) {
+	return cloneState(s.current), s.metadata, nil
 }
-func (s *fakeStateStore) LoadWithMetadata(context.Context) (*RunState, StateLoadMetadata, error) {
-	s.loadCalls++
-	return s.current, s.loadMeta, s.loadErr
-}
-func (s *fakeStateStore) Save(_ context.Context, state RunState) error {
-	s.saveCalls++
-	appendEvent(s.events, "store.save:"+string(state.Phase)+":"+actionSnapshot(state))
-	if s.failSaveAt != 0 && s.saveCalls == s.failSaveAt || s.failSave != nil && s.failSave(state) {
-		return errors.New("save failpoint")
-	}
-	copy := cloneRunState(state)
-	s.saved = append(s.saved, copy)
-	s.current = &copy
-	if s.crashAfterSave != nil && s.crashAfterSave(state) {
-		return errors.New("simulated process exit after durable save")
+func (s *fakeStore) Save(_ context.Context, state RunState) error {
+	copy := cloneState(&state)
+	s.current = copy
+	s.saved = append(s.saved, *cloneState(&state))
+	if state.Phase == s.failPhase && s.failPhase != "" {
+		return errors.New("save failed")
 	}
 	return nil
 }
-func (s *fakeStateStore) Archive(_ context.Context, state RunState, result string) error {
-	appendEvent(s.events, "store.archive:"+result)
-	s.archives = append(s.archives, result)
-	s.archived = append(s.archived, cloneRunState(state))
-	return s.archiveErr
-}
-func (s *fakeStateStore) Clear(context.Context) error {
-	appendEvent(s.events, "store.clear")
-	if s.clearErr != nil {
-		return s.clearErr
-	}
-	s.current = nil
+func (s *fakeStore) Archive(_ context.Context, state RunState, result string) error {
+	s.archived, s.archiveResult = *cloneState(&state), result
 	return nil
 }
+func (s *fakeStore) Clear(context.Context) error { s.current = nil; return nil }
 
 type fakeChain struct {
-	token            info.Token
-	calls            int
-	events           []string
-	balances         map[string]decimal.Decimal
-	balanceQueues    map[string][]decimal.Decimal
-	submitResults    []submitOutcome
-	submitIndex      int
-	transfer         *info.LedgerUpdate
-	transferMatched  bool
-	transferOutcomes []transferOutcome
-	prepareClaimErr  map[string]error
-	prepareSendErr   map[string]error
-	balanceErr       map[string]error
+	token              info.Token
+	balances           map[string]decimal.Decimal
+	holds              map[string]decimal.Decimal
+	balanceErrors      map[string]error
+	balanceSequence    map[string][]info.SpotBalanceAmounts
+	balanceCalls       map[string]int
+	claimResult        exchange.SubmitResult
+	sweepResult        exchange.SubmitResult
+	payoutResult       exchange.SubmitResult
+	applyUnknownPayout bool
+	events             []string
 }
 
-type transferOutcome struct {
-	transfer *info.LedgerUpdate
-	matched  bool
-	err      error
-}
-
-type submitOutcome struct {
-	result exchange.SubmitResult
-	err    error
-}
-
-func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) {
-	c.calls++
-	c.events = append(c.events, "canonical")
-	return c.token, nil
-}
-func (c *fakeChain) AvailableSpotBalance(_ context.Context, address string, _ info.Token) (decimal.Decimal, error) {
-	c.calls++
-	c.events = append(c.events, "balance:"+address)
-	if err := c.balanceErr[address]; err != nil {
-		return decimal.Zero, err
+func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) { return c.token, nil }
+func (c *fakeChain) SpotBalance(_ context.Context, address string, _ info.Token) (info.SpotBalanceAmounts, error) {
+	c.balanceCalls[address]++
+	if err := c.balanceErrors[address]; err != nil {
+		return info.SpotBalanceAmounts{}, err
 	}
-	if queue := c.balanceQueues[address]; len(queue) != 0 {
-		value := queue[0]
-		c.balanceQueues[address] = queue[1:]
-		return value, nil
+	if sequence := c.balanceSequence[address]; len(sequence) > 0 {
+		balance := sequence[0]
+		c.balanceSequence[address] = sequence[1:]
+		return balance, nil
 	}
-	return c.balances[address], nil
+	return info.SpotBalanceAmounts{Total: c.balances[address], Available: c.balances[address].Sub(c.holds[address])}, nil
 }
 func (c *fakeChain) PrepareClaim(address string, nonce uint64) (exchange.PreparedAction, error) {
-	c.calls++
-	c.events = append(c.events, "prepare_claim:"+address)
-	if err := c.prepareClaimErr[address]; err != nil {
-		return exchange.PreparedAction{}, err
-	}
-	return prepared("claimRewards", address, "", "", nonce), nil
+	return preparedAction(tinyTB{}, "claimRewards", address, "", "", "", nonce), nil
 }
 func (c *fakeChain) PrepareSpotSend(address, destination string, token info.Token, amount decimal.Decimal, nonce uint64) (exchange.PreparedAction, error) {
-	c.calls++
-	c.events = append(c.events, "prepare_send:"+address+":"+destination+":"+amount.String())
-	if err := c.prepareSendErr[address]; err != nil {
-		return exchange.PreparedAction{}, err
-	}
-	action := prepared("spotSend", address, destination, amount.String(), nonce)
-	action.Token = token.WireToken
-	return action, nil
+	return preparedAction(tinyTB{}, "spotSend", address, destination, token.WireToken, amount.String(), nonce), nil
 }
 func (c *fakeChain) Submit(_ context.Context, action exchange.PreparedAction) (exchange.SubmitResult, error) {
-	c.calls++
 	c.events = append(c.events, "submit:"+action.Kind+":"+action.Signer)
-	if c.submitIndex >= len(c.submitResults) {
-		return exchange.SubmitResult{Accepted: true}, nil
+	if action.Kind == "claimRewards" {
+		return c.claimResult, nil
 	}
-	outcome := c.submitResults[c.submitIndex]
-	c.submitIndex++
-	return outcome.result, outcome.err
-}
-func (c *fakeChain) FindSpotTransfer(_ context.Context, query info.TransferQuery) (*info.LedgerUpdate, bool, error) {
-	c.calls++
-	c.events = append(c.events, fmt.Sprintf("find:%s:%s:%d", query.Sender, query.Destination, query.ActionTime))
-	if len(c.transferOutcomes) != 0 {
-		outcome := c.transferOutcomes[0]
-		c.transferOutcomes = c.transferOutcomes[1:]
-		return outcome.transfer, outcome.matched, outcome.err
+	amount := decimal.RequireFromString(action.Amount)
+	if action.Signer == "0xsettlement" {
+		if c.payoutResult.Accepted || c.applyUnknownPayout {
+			c.balances[action.Signer] = c.balances[action.Signer].Sub(amount)
+		}
+		return c.payoutResult, nil
 	}
-	return c.transfer, c.transferMatched, nil
+	if c.sweepResult.Accepted {
+		c.balances[action.Signer] = c.balances[action.Signer].Sub(amount)
+		c.balances[action.Destination] = c.balances[action.Destination].Add(amount)
+	}
+	return c.sweepResult, nil
 }
+
+type fakeSleeper struct{ delays []time.Duration }
+
+func (s *fakeSleeper) Sleep(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.delays = append(s.delays, delay)
+	return nil
+}
+
+type fakeNotifier struct{ alerts []string }
+
+func (n *fakeNotifier) Alert(_ context.Context, key, _ string) error {
+	n.alerts = append(n.alerts, key)
+	return nil
+}
+func (n *fakeNotifier) Report(context.Context, string, string) error { return nil }
 
 type fixedClock struct{ now time.Time }
 
@@ -613,86 +438,70 @@ type fakeNonce struct{ next uint64 }
 
 func (n *fakeNonce) Next() uint64 { n.next++; return n.next }
 
-type fakeNotifier struct {
-	keys     []string
-	messages []string
-	reports  []string
+// tinyTB lets fake preparation share the same deterministic request builder.
+type tinyTB struct{}
+
+func (tinyTB) Helper()           {}
+func (tinyTB) Fatal(args ...any) { panic(fmt.Sprint(args...)) }
+
+type testTB interface {
+	Helper()
+	Fatal(...any)
 }
 
-func (n *fakeNotifier) Alert(_ context.Context, key, message string) error {
-	n.keys = append(n.keys, key)
-	n.messages = append(n.messages, message)
-	return nil
-}
-
-func (n *fakeNotifier) Report(_ context.Context, subject, message string) error {
-	n.reports = append(n.reports, subject+"\n"+message)
-	return nil
-}
-
-func appendEvent(events *[]string, event string) {
-	if events != nil {
-		*events = append(*events, event)
-	}
-}
-
-func actionSnapshot(state RunState) string {
-	if state.FinalPayout != nil {
-		return "payout=" + string(state.FinalPayout.Phase)
-	}
-	for _, builder := range state.Builders {
-		if builder.Sweep.Phase != "" {
-			return "sweep=" + string(builder.Sweep.Phase)
-		}
-		if builder.Claim.Phase != "" {
-			return "claim=" + string(builder.Claim.Phase)
-		}
-	}
-	return "none"
-}
-
-func prepared(kind, signer, destination, amount string, nonce uint64) exchange.PreparedAction {
-	var body json.RawMessage
+func preparedAction(t testTB, kind, signer, destination, token, amount string, nonce uint64) exchange.PreparedAction {
+	t.Helper()
+	body := map[string]any{"action": map[string]any{"type": kind}, "nonce": nonce}
 	if kind == "spotSend" {
-		body = json.RawMessage(fmt.Sprintf(`{"action":{"type":"spotSend","destination":%q,"token":"USDC:0","amount":%q,"time":%d},"nonce":%d}`, destination, amount, nonce, nonce))
-	} else {
-		body = json.RawMessage(fmt.Sprintf(`{"action":{"type":"claimRewards"},"nonce":%d}`, nonce))
+		body["action"] = map[string]any{"type": kind, "destination": destination, "token": token, "amount": amount, "time": nonce}
 	}
-	digest := sha256.Sum256(body)
-	return exchange.PreparedAction{Kind: kind, Signer: signer, Destination: destination, Amount: amount, Nonce: nonce, RequestHash: fmt.Sprintf("%x", digest), RequestBody: body}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(raw)
+	return exchange.PreparedAction{Kind: kind, Signer: signer, Destination: destination, Token: token, Amount: amount,
+		Nonce: nonce, RequestBody: raw, RequestHash: hex.EncodeToString(digest[:])}
 }
 
-func cloneRunState(state RunState) RunState {
-	data, _ := json.Marshal(state)
+func validPayout(t *testing.T, state RunState, nonce uint64) exchange.PreparedAction {
+	return preparedAction(t, "spotSend", state.Manifest.Settlement, state.Manifest.Recipient,
+		state.Manifest.Token.WireToken, state.Manifest.PayoutTotal, nonce)
+}
+
+func cloneState(state *RunState) *RunState {
+	if state == nil {
+		return nil
+	}
+	raw, _ := json.Marshal(state)
 	var copy RunState
-	_ = json.Unmarshal(data, &copy)
-	return copy
+	_ = json.Unmarshal(raw, &copy)
+	return &copy
 }
 
-func mustJSON(t *testing.T, value any) []byte {
-	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
 	}
-	return data
-}
-
-func positiveState(t *testing.T, phase Phase) RunState {
-	t.Helper()
-	token := info.Token{Name: "USDC", TokenID: "0", Index: 0, WeiDecimals: 6, WireToken: "USDC:0"}
-	manifest, err := BuildManifest(ManifestInput{
-		Records: []Record{{ID: 41, Amount: "1.25"}}, Token: &token,
-		Builders: []string{"0xbuilder1", "0xbuilder2"}, Settlement: "0xsettlement", Recipient: "0xrecipient",
-	})
-	if err != nil {
-		t.Fatal(err)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
 	}
-	now := time.Date(2026, 7, 11, 1, 2, 3, 0, time.UTC)
-	return RunState{RunID: "run", Trigger: TriggerUTC, UTCDate: "2026-07-11", Phase: phase, Manifest: manifest, CreatedAt: now, UpdatedAt: now}
+	return true
 }
-
-func slicesContain(values []string, want string) bool {
+func equalUint64(left, right []uint64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
 			return true
@@ -700,20 +509,10 @@ func slicesContain(values []string, want string) bool {
 	}
 	return false
 }
-
-func slicesContainPrefix(values []string, prefix string) bool {
-	for _, value := range values {
-		if strings.HasPrefix(value, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func countPrefix(values []string, prefix string) int {
+func countDelay(values []time.Duration, want time.Duration) int {
 	count := 0
 	for _, value := range values {
-		if strings.HasPrefix(value, prefix) {
+		if value == want {
 			count++
 		}
 	}

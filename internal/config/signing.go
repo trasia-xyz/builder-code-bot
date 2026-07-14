@@ -11,22 +11,22 @@ import (
 var addressPattern = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
 
 type SigningConfig struct {
-	DecryptPassword secret.SecretString `mapstructure:"decrypt_password"`
+	DecryptPassword secret.SecretString `toml:"decrypt_password"`
 }
 
 type BuilderConfig struct {
-	Name                string              `mapstructure:"name"`
-	Address             string              `mapstructure:"address"`
-	EncryptedPrivateKey secret.SecretString `mapstructure:"encrypted_private_key"`
+	Name                string              `toml:"name"`
+	Address             string              `toml:"address"`
+	EncryptedPrivateKey secret.SecretString `toml:"encrypted_private_key"`
 }
 
 type AccountConfig struct {
-	Address             string              `mapstructure:"address"`
-	EncryptedPrivateKey secret.SecretString `mapstructure:"encrypted_private_key"`
+	Address             string              `toml:"address"`
+	EncryptedPrivateKey secret.SecretString `toml:"encrypted_private_key"`
 }
 
 type PayoutConfig struct {
-	RecipientAddress string `mapstructure:"recipient_address"`
+	RecipientAddress string `toml:"recipient_address"`
 }
 
 func (*SigningConfig) NormalizeAndValidate() error {

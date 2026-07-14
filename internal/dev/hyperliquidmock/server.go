@@ -49,9 +49,8 @@ type RecordedRequest struct {
 type Option func(*serverConfig)
 
 type serverConfig struct {
-	network     hyperliquid.Network
-	token       info.SpotToken
-	ledgerDelay int
+	network hyperliquid.Network
+	token   info.SpotToken
 }
 
 // WithNetwork selects the signature domain used for request recovery.
@@ -66,29 +65,20 @@ func WithToken(name, tokenID string, index, weiDecimals int) Option {
 	}
 }
 
-// WithLedgerDelay hides new ledger entries for the requested number of queries.
-func WithLedgerDelay(queries int) Option {
-	return func(cfg *serverConfig) {
-		if queries > 0 {
-			cfg.ledgerDelay = queries
-		}
-	}
-}
-
 type balanceKey struct {
 	address string
 	token   string
-}
-
-type ledgerRecord struct {
-	update       info.LedgerUpdate
-	visibleAfter int
 }
 
 type exchangeOutcome struct {
 	hash       string
 	statusCode int
 	body       []byte
+}
+
+type spotBalance struct {
+	total decimal.Decimal
+	hold  decimal.Decimal
 }
 
 // Server is an in-process Hyperliquid HTTP server with mutable account state.
@@ -99,10 +89,8 @@ type Server struct {
 	mu     sync.Mutex
 	cfg    serverConfig
 
-	balances     map[balanceKey]decimal.Decimal
+	balances     map[balanceKey]spotBalance
 	claimRewards map[balanceKey]decimal.Decimal
-	ledger       map[string][]ledgerRecord
-	ledgerReads  int
 	requests     []RecordedRequest
 	nextFailure  FailureMode
 	outcomes     map[string]exchangeOutcome
@@ -123,9 +111,9 @@ func New(t testing.TB, options ...Option) *Server {
 		}
 	}
 	s := &Server{
-		cfg: cfg, balances: make(map[balanceKey]decimal.Decimal),
-		claimRewards: make(map[balanceKey]decimal.Decimal), ledger: make(map[string][]ledgerRecord),
-		outcomes: make(map[string]exchangeOutcome),
+		cfg: cfg, balances: make(map[balanceKey]spotBalance),
+		claimRewards: make(map[balanceKey]decimal.Decimal),
+		outcomes:     make(map[string]exchangeOutcome),
 	}
 	s.server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
 	s.URL = s.server.URL
@@ -135,12 +123,21 @@ func New(t testing.TB, options ...Option) *Server {
 
 // SetSpotBalance sets an exact spot balance for an account and wire token.
 func (s *Server) SetSpotBalance(address, token, amount string) {
-	value, err := decimal.NewFromString(amount)
+	s.SetSpotBalanceWithHold(address, token, amount, "0")
+}
+
+// SetSpotBalanceWithHold sets exact total and held spot balances.
+func (s *Server) SetSpotBalanceWithHold(address, token, total, hold string) {
+	totalValue, err := decimal.NewFromString(total)
 	if err != nil {
-		panic(fmt.Sprintf("invalid mock spot balance %q: %v", amount, err))
+		panic(fmt.Sprintf("invalid mock total spot balance %q: %v", total, err))
+	}
+	holdValue, err := decimal.NewFromString(hold)
+	if err != nil {
+		panic(fmt.Sprintf("invalid mock held spot balance %q: %v", hold, err))
 	}
 	s.mu.Lock()
-	s.balances[balanceKey{address: normalizeAddress(address), token: token}] = value
+	s.balances[balanceKey{address: normalizeAddress(address), token: token}] = spotBalance{total: totalValue, hold: holdValue}
 	s.mu.Unlock()
 }
 
@@ -215,23 +212,9 @@ func (s *Server) handleInfo(w http.ResponseWriter, body []byte) {
 		value := s.balances[key]
 		response := struct {
 			Balances []info.SpotBalance `json:"balances"`
-		}{Balances: []info.SpotBalance{{Coin: s.cfg.token.Name, Token: s.cfg.token.Index, Total: value.String(), Hold: "0"}}}
+		}{Balances: []info.SpotBalance{{Coin: s.cfg.token.Name, Token: s.cfg.token.Index, Total: value.total.String(), Hold: value.hold.String()}}}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
-	case "userNonFundingLedgerUpdates":
-		s.ledgerReads++
-		var updates []info.LedgerUpdate
-		for _, record := range s.ledger[normalizeAddress(request.User)] {
-			if record.visibleAfter > s.ledgerReads || record.update.Time < request.StartTime || record.update.Time >= request.EndTime {
-				continue
-			}
-			updates = append(updates, record.update)
-		}
-		s.mu.Unlock()
-		if updates == nil {
-			updates = []info.LedgerUpdate{}
-		}
-		writeJSON(w, http.StatusOK, updates)
 	default:
 		s.mu.Unlock()
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported info type"})
@@ -276,7 +259,9 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 			wireToken := s.cfg.token.Name + ":" + s.cfg.token.TokenID
 			key := balanceKey{address: normalizeAddress(signerAddress), token: wireToken}
 			if reward := s.claimRewards[key]; !reward.IsZero() {
-				s.balances[key] = s.balances[key].Add(reward)
+				balance := s.balances[key]
+				balance.total = balance.total.Add(reward)
+				s.balances[key] = balance
 				delete(s.claimRewards, key)
 			}
 			return nil
@@ -298,7 +283,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 			return
 		}
 		record.Destination, record.Token, record.Amount = action.Destination, action.Token, action.Amount
-		apply = func() error { return s.applySpotSend(signerAddress, action, request.Nonce) }
+		apply = func() error { return s.applySpotSend(signerAddress, action) }
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"status": "err", "response": "unsupported action"})
 		return
@@ -343,28 +328,22 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 	writeRaw(w, statusCode, response)
 }
 
-func (s *Server) applySpotSend(signerAddress string, action signing.SpotSendAction, nonce uint64) error {
+func (s *Server) applySpotSend(signerAddress string, action signing.SpotSendAction) error {
 	amount, err := decimal.NewFromString(action.Amount)
 	if err != nil || !amount.IsPositive() {
 		return fmt.Errorf("invalid amount")
 	}
 	source := balanceKey{address: normalizeAddress(signerAddress), token: action.Token}
 	destination := balanceKey{address: normalizeAddress(action.Destination), token: action.Token}
-	if s.balances[source].LessThan(amount) {
+	sourceBalance := s.balances[source]
+	if sourceBalance.total.Sub(sourceBalance.hold).LessThan(amount) {
 		return fmt.Errorf("insufficient balance")
 	}
-	s.balances[source] = s.balances[source].Sub(amount)
-	s.balances[destination] = s.balances[destination].Add(amount)
-	update := info.LedgerUpdate{
-		Time: nonce + 1_000, Hash: fmt.Sprintf("0x%s", hashBytes([]byte(fmt.Sprintf("%s:%d", signerAddress, nonce)))),
-		Delta: info.SpotTransferDelta{
-			Type: "spotTransfer", Token: strings.SplitN(action.Token, ":", 2)[0], Amount: info.DecimalText(amount.String()),
-			User: signerAddress, Destination: action.Destination,
-		},
-	}
-	s.ledger[normalizeAddress(signerAddress)] = append(s.ledger[normalizeAddress(signerAddress)], ledgerRecord{
-		update: update, visibleAfter: s.ledgerReads + s.cfg.ledgerDelay + 1,
-	})
+	sourceBalance.total = sourceBalance.total.Sub(amount)
+	s.balances[source] = sourceBalance
+	destinationBalance := s.balances[destination]
+	destinationBalance.total = destinationBalance.total.Add(amount)
+	s.balances[destination] = destinationBalance
 	return nil
 }
 

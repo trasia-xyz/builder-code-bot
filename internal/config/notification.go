@@ -6,20 +6,20 @@ import (
 )
 
 type AWSConfig struct {
-	Region  string `mapstructure:"region"`
-	Profile string `mapstructure:"profile"`
+	Region  string `toml:"region"`
+	Profile string `toml:"profile"`
 }
 
 type NotificationConfig struct {
-	Enabled bool      `mapstructure:"enabled"`
-	SES     SESConfig `mapstructure:"ses"`
+	Enabled bool      `toml:"enabled"`
+	SES     SESConfig `toml:"ses"`
 }
 
 type SESConfig struct {
-	From          string   `mapstructure:"from"`
-	To            []string `mapstructure:"to"`
-	ReplyTo       []string `mapstructure:"reply_to"`
-	SubjectPrefix string   `mapstructure:"subject_prefix"`
+	From          string   `toml:"from"`
+	To            []string `toml:"to"`
+	ReplyTo       []string `toml:"reply_to"`
+	SubjectPrefix string   `toml:"subject_prefix"`
 }
 
 func (cfg *AWSConfig) NormalizeAndValidate() error {

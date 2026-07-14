@@ -51,7 +51,7 @@ func parseOptions(args []string) (app.Options, error) {
 	fs := flag.NewFlagSet("builder-code-bot", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&opts.ConfigPath, "config", opts.ConfigPath, "configuration file path")
-	fs.Var((*presenceFlag)(&opts.RunOnStart), "run-on-start", "run one funding cycle during startup")
+	fs.BoolVar(&opts.RunOnStart, "run-on-start", false, "run one funding cycle during startup")
 	if err := fs.Parse(args); err != nil {
 		return app.Options{}, err
 	}
@@ -60,19 +60,3 @@ func parseOptions(args []string) (app.Options, error) {
 	}
 	return opts, nil
 }
-
-type presenceFlag bool
-
-func (f *presenceFlag) Set(string) error {
-	*f = true
-	return nil
-}
-
-func (f *presenceFlag) String() string {
-	if f != nil && bool(*f) {
-		return "true"
-	}
-	return "false"
-}
-
-func (*presenceFlag) IsBoolFlag() bool { return true }

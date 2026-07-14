@@ -67,6 +67,13 @@ func TestActionHashMatchesKnownVectors(t *testing.T) {
 	}
 }
 
+func TestActionHashRejectsNonWireModelInput(t *testing.T) {
+	_, err := signing.ActionHash(signing.ActionHashInput{Action: map[string]any{"type": "claimRewards"}, Nonce: 1})
+	if err == nil || !strings.Contains(err.Error(), "signing.Object") {
+		t.Fatalf("ActionHash() error = %v", err)
+	}
+}
+
 func TestSignL1ActionMatchesKnownVectors(t *testing.T) {
 	t.Parallel()
 

@@ -22,6 +22,12 @@ func TestStoreLoadReturnsNilWhenNoSnapshotExists(t *testing.T) {
 	}
 }
 
+func TestEnvelopeSchemaVersionRemainsOne(t *testing.T) {
+	if schemaVersion != 1 {
+		t.Fatalf("schemaVersion = %d, want 1", schemaVersion)
+	}
+}
+
 func TestStoreFallsBackToValidBackup(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
@@ -88,30 +94,6 @@ func TestStoreRejectsChecksumMismatch(t *testing.T) {
 
 	if got, err := store.Load(context.Background()); err == nil || got != nil || !strings.Contains(err.Error(), "checksum") {
 		t.Fatalf("Load() = %#v, %v; want checksum error", got, err)
-	}
-}
-
-func TestStoreRejectsManifestHashMismatch(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStore(dir)
-	state := testRunState(t, "tampered-manifest")
-	state.Manifest.ManifestHash = strings.Repeat("0", 64)
-	writeTestEnvelope(t, filepath.Join(dir, "current.json"), state)
-
-	if got, err := store.Load(context.Background()); err == nil || got != nil || !strings.Contains(err.Error(), "manifest hash") {
-		t.Fatalf("Load() = %#v, %v; want manifest hash error", got, err)
-	}
-}
-
-func TestStoreRejectsMissingManifestHash(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStore(dir)
-	state := testRunState(t, "missing-manifest-hash")
-	state.Manifest.ManifestHash = ""
-	writeTestEnvelope(t, filepath.Join(dir, "current.json"), state)
-
-	if got, err := store.Load(context.Background()); err == nil || got != nil || !strings.Contains(err.Error(), "manifest hash") {
-		t.Fatalf("Load() = %#v, %v; want manifest hash error", got, err)
 	}
 }
 
@@ -203,50 +185,21 @@ func TestStoreArchivesBeforeClear(t *testing.T) {
 	assertMode(t, archive, 0o600)
 }
 
-func TestStoreTerminalArchivesRemainEnvelopeReadable(t *testing.T) {
-	tests := []struct {
-		name     string
-		result   string
-		manifest funding.Manifest
-	}{
-		{name: "no data", result: "no_data", manifest: func() funding.Manifest {
-			manifest, err := funding.BuildManifest(funding.ManifestInput{
-				Builders: []string{"0xBuilder"}, Settlement: "0xSettlement", Recipient: "0xRecipient",
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			return manifest
-		}()},
-		{name: "failed validation", result: "failed_validation", manifest: func() funding.Manifest {
-			manifest := funding.Manifest{
-				Records:  []funding.Record{{ID: 1, Amount: "-0.01"}},
-				RawTotal: "unavailable", PayoutTotal: "unavailable",
-				Builders: []string{"0xBuilder"}, Settlement: "0xSettlement", Recipient: "0xRecipient",
-			}
-			hash, err := funding.HashManifest(manifest)
-			if err != nil {
-				t.Fatal(err)
-			}
-			manifest.ManifestHash = hash
-			return manifest
-		}()},
+func TestStoreTerminalArchiveRemainsEnvelopeReadable(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	state := testRunState(t, "terminal")
+	state.Manifest = funding.Manifest{
+		Records: []funding.Record{{ID: 1, Amount: "-0.01"}}, RawTotal: "unavailable",
+		PayoutTotal: "unavailable", Settlement: "0xSettlement", Recipient: "0xRecipient",
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			store := NewStore(dir)
-			state := testRunState(t, "terminal")
-			state.Manifest = tt.manifest
-			if err := store.Archive(context.Background(), state, tt.result); err != nil {
-				t.Fatal(err)
-			}
-			path := filepath.Join(dir, "history", "2026-07-11-terminal-"+tt.result+".json")
-			loaded, exists, err := loadSnapshot(path)
-			if err != nil || !exists || loaded == nil || loaded.Manifest.ManifestHash != tt.manifest.ManifestHash {
-				t.Fatalf("loadSnapshot() = %#v, %v, %v", loaded, exists, err)
-			}
-		})
+	if err := store.Archive(context.Background(), state, "failed_validation"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "history", "2026-07-11-terminal-failed_validation.json")
+	loaded, exists, err := loadSnapshot(path)
+	if err != nil || !exists || loaded == nil || loaded.Manifest.Records[0].ID != 1 {
+		t.Fatalf("loadSnapshot() = %#v, %v, %v", loaded, exists, err)
 	}
 }
 
@@ -281,7 +234,6 @@ func testRunState(t *testing.T, runID string) funding.RunState {
 	t.Helper()
 	manifest, err := funding.BuildManifest(funding.ManifestInput{
 		Records:    []funding.Record{{ID: 1, PeriodStartAt: 1, Amount: "0.000000000000000000"}},
-		Builders:   []string{"0xBuilder"},
 		Settlement: "0xSettlement",
 		Recipient:  "0xRecipient",
 	})
@@ -293,10 +245,6 @@ func testRunState(t *testing.T, runID string) funding.RunState {
 		RunID: runID, Trigger: funding.TriggerUTC, UTCDate: "2026-07-11",
 		Phase: funding.PhasePrepared, Manifest: manifest, CreatedAt: now, UpdatedAt: now,
 	}
-}
-
-func writeTestEnvelope(t *testing.T, path string, state funding.RunState) {
-	writeTestEnvelopeVersion(t, path, state, 1)
 }
 
 func writeTestEnvelopeVersion(t *testing.T, path string, state funding.RunState, version int) {

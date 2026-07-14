@@ -22,49 +22,6 @@ import (
 // Masked is the placeholder rendered in place of any secret value.
 const Masked = "[MASKED]"
 
-// Secret wraps a value of any type so it redacts itself when logged, formatted,
-// or serialized. Retrieve the underlying value explicitly with Reveal when
-// business logic genuinely needs it.
-type Secret[T any] struct {
-	value T
-}
-
-// New wraps value in a Secret.
-func New[T any](value T) Secret[T] {
-	return Secret[T]{value: value}
-}
-
-// Reveal returns the underlying value. Each call is an explicit, greppable
-// signal that a secret is being used in the clear.
-func (s Secret[T]) Reveal() T {
-	return s.value
-}
-
-// LogValue implements slog.LogValuer.
-func (Secret[T]) LogValue() slog.Value {
-	return slog.StringValue(Masked)
-}
-
-// String implements fmt.Stringer.
-func (Secret[T]) String() string {
-	return Masked
-}
-
-// GoString implements fmt.GoStringer.
-func (Secret[T]) GoString() string {
-	return Masked
-}
-
-// MarshalJSON implements json.Marshaler.
-func (Secret[T]) MarshalJSON() ([]byte, error) {
-	return []byte(strconv.Quote(Masked)), nil
-}
-
-// MarshalText implements encoding.TextMarshaler.
-func (Secret[T]) MarshalText() ([]byte, error) {
-	return []byte(Masked), nil
-}
-
 // SecretString carries a sensitive string and redacts itself when logged,
 // formatted, or serialized.
 type SecretString struct {
@@ -106,12 +63,13 @@ func (SecretString) MarshalText() ([]byte, error) {
 	return []byte(Masked), nil
 }
 
-var (
-	_ slog.LogValuer = Secret[any]{}
-	_ fmt.Stringer   = Secret[any]{}
-	_ fmt.GoStringer = Secret[any]{}
-	_ json.Marshaler = Secret[any]{}
+// UnmarshalText decodes a secret from strict text-based configuration formats.
+func (s *SecretString) UnmarshalText(value []byte) error {
+	s.value = string(value)
+	return nil
+}
 
+var (
 	_ slog.LogValuer = SecretString{}
 	_ fmt.Stringer   = SecretString{}
 	_ fmt.GoStringer = SecretString{}

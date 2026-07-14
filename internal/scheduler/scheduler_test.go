@@ -105,7 +105,7 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 
 	delaysMu.Lock()
 	defer delaysMu.Unlock()
-	want := []time.Duration{time.Hour, 23*time.Hour + 59*time.Minute + 30*time.Second}
+	want := []time.Duration{time.Hour, NonfatalRetryDelay}
 	if len(delays) != len(want) {
 		t.Fatalf("delays = %v, want %v", delays, want)
 	}
@@ -146,6 +146,72 @@ func TestRunStopsActiveTimerWhenContextIsCanceled(t *testing.T) {
 	}
 	if !timer.stopped() {
 		t.Fatal("active timer was not stopped")
+	}
+}
+
+func TestRunReturnsFatalFundingError(t *testing.T) {
+	timer := newFakeTimer()
+	s := &Scheduler{
+		now:      func() time.Time { return time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC) },
+		newTimer: func(time.Duration) Timer { return timer },
+	}
+	want := &funding.FatalError{Err: errors.New("payout blocked")}
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Run(context.Background(), func(context.Context, funding.Trigger) error { return want })
+	}()
+	timer.fire()
+	if err := <-done; !errors.Is(err, want) {
+		t.Fatalf("Run() error = %v, want fatal payout error", err)
+	}
+}
+
+func TestRunExitsAfterFiveNonfatalRetries(t *testing.T) {
+	timers := make(chan *fakeTimer, MaxNonfatalRetries+1)
+	var (
+		mu     sync.Mutex
+		delays []time.Duration
+	)
+	s := &Scheduler{
+		now: func() time.Time { return time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC) },
+		newTimer: func(delay time.Duration) Timer {
+			timer := newFakeTimer()
+			mu.Lock()
+			delays = append(delays, delay)
+			mu.Unlock()
+			timers <- timer
+			return timer
+		},
+	}
+	want := errors.New("temporary funding failure")
+	done := make(chan error, 1)
+	calls := 0
+	go func() {
+		done <- s.Run(context.Background(), func(context.Context, funding.Trigger) error {
+			calls++
+			return want
+		})
+	}()
+	for range MaxNonfatalRetries + 1 {
+		(<-timers).fire()
+	}
+	err := <-done
+	var exhausted *RetryExhaustedError
+	if !errors.As(err, &exhausted) || !errors.Is(err, want) {
+		t.Fatalf("Run() error = %v, want retry exhausted wrapping callback error", err)
+	}
+	if exhausted.Retries != MaxNonfatalRetries || calls != MaxNonfatalRetries+1 {
+		t.Fatalf("retries = %d, calls = %d", exhausted.Retries, calls)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delays) != MaxNonfatalRetries+1 || delays[0] != 12*time.Hour {
+		t.Fatalf("delays = %v", delays)
+	}
+	for index, delay := range delays[1:] {
+		if delay != NonfatalRetryDelay {
+			t.Errorf("retry delay[%d] = %s", index, delay)
+		}
 	}
 }
 

@@ -18,10 +18,8 @@ const (
 )
 
 type Dispatcher struct {
-	mu       sync.Mutex
 	notifier Notifier
 	logger   logging.Logger
-	active   map[string]struct{}
 }
 
 func NewDispatcher(notifier Notifier, loggers ...logging.Logger) *Dispatcher {
@@ -32,25 +30,15 @@ func NewDispatcher(notifier Notifier, loggers ...logging.Logger) *Dispatcher {
 	if len(loggers) > 0 {
 		logger = loggers[0]
 	}
-	return &Dispatcher{
-		notifier: notifier,
-		logger:   logger,
-		active:   make(map[string]struct{}),
-	}
+	return &Dispatcher{notifier: notifier, logger: logger}
 }
 
-// Alert sends at most one notification for a key until Resolve closes its
-// active window. Delivery failures are contained and do not reopen the window.
+// Alert sends a funding or operational alert. Callers own any incident-specific
+// deduplication state.
 func (d *Dispatcher) Alert(ctx context.Context, key string, message Message) {
 	if d == nil || key == "" {
 		return
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if _, ok := d.active[key]; ok {
-		return
-	}
-	d.active[key] = struct{}{}
 	if err := d.notifier.Notify(ctx, message); err != nil {
 		d.logger.Error(ctx, "notification delivery failed",
 			logging.String("event", "notification_delivery_failed"),
@@ -73,37 +61,15 @@ func (d *Dispatcher) Report(ctx context.Context, message Message) {
 	}
 }
 
-// Resolve sends a recovery notification only for an active key and then
-// closes that key's window, allowing a later incident to alert again.
-func (d *Dispatcher) Resolve(ctx context.Context, key string, message Message) {
-	if d == nil || key == "" {
-		return
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if _, ok := d.active[key]; !ok {
-		return
-	}
-	delete(d.active, key)
-	if err := d.notifier.Notify(ctx, message); err != nil {
-		d.logger.Error(ctx, "notification delivery failed",
-			logging.String("event", "notification_delivery_failed"),
-			logging.String("alert_key", key),
-		)
-	}
-}
-
-type retryWindow struct {
-	lastProgress time.Duration
-}
-
 // MySQLRetryObserver adapts repository retry events into throttled logs and a
-// deduplicated outage/recovery notification window.
 type MySQLRetryObserver struct {
-	mu         sync.Mutex
-	dispatcher *Dispatcher
-	logger     logging.Logger
-	windows    map[string]retryWindow
+	mu sync.Mutex
+
+	dispatcher   *Dispatcher
+	logger       logging.Logger
+	outage       bool
+	alerted      bool
+	lastProgress time.Duration
 }
 
 var _ mysql.RetryObserver = (*MySQLRetryObserver)(nil)
@@ -115,11 +81,7 @@ func NewMySQLRetryObserver(
 	if dispatcher == nil {
 		dispatcher = NewDispatcher(Noop{}, logger)
 	}
-	return &MySQLRetryObserver{
-		dispatcher: dispatcher,
-		logger:     logger,
-		windows:    make(map[string]retryWindow),
-	}
+	return &MySQLRetryObserver{dispatcher: dispatcher, logger: logger}
 }
 
 func (o *MySQLRetryObserver) RetryStarted(operation string, _ error) {
@@ -127,7 +89,13 @@ func (o *MySQLRetryObserver) RetryStarted(operation string, _ error) {
 		return
 	}
 	o.mu.Lock()
-	o.windows[operation] = retryWindow{}
+	if o.outage {
+		o.mu.Unlock()
+		return
+	}
+	o.outage = true
+	o.alerted = false
+	o.lastProgress = 0
 	o.mu.Unlock()
 	o.logger.Warn(context.Background(), "MySQL retry started",
 		logging.String("event", "mysql_retry_started"),
@@ -140,19 +108,21 @@ func (o *MySQLRetryObserver) RetryProgress(operation string, attempts int, unava
 		return
 	}
 	o.mu.Lock()
-	window := o.windows[operation]
-	shouldLog := unavailableFor >= window.lastProgress+mysqlProgressInterval
-	if shouldLog {
-		window.lastProgress = unavailableFor
-		o.windows[operation] = window
+	if !o.outage {
+		o.outage = true
 	}
-	// Keep the observer and dispatcher transitions under one fixed lock order
-	// so a recovery or a newly started operation cannot split this global
-	// outage window between its state check and Alert.
-	if unavailableFor >= mysqlAlertThreshold {
-		o.dispatcher.Alert(context.Background(), mysqlAlertKey, mysqlMessage("MySQL unavailable", operation, attempts, unavailableFor))
+	shouldLog := unavailableFor >= o.lastProgress+mysqlProgressInterval
+	if shouldLog {
+		o.lastProgress = unavailableFor
+	}
+	shouldAlert := unavailableFor >= mysqlAlertThreshold && !o.alerted
+	if shouldAlert {
+		o.alerted = true
 	}
 	o.mu.Unlock()
+	if shouldAlert {
+		o.dispatcher.Alert(context.Background(), mysqlAlertKey, mysqlMessage("MySQL unavailable", operation, attempts, unavailableFor))
+	}
 	if shouldLog {
 		o.logger.Warn(context.Background(), "MySQL retry in progress",
 			logging.String("event", "mysql_retry_progress"),
@@ -168,20 +138,18 @@ func (o *MySQLRetryObserver) Recovered(operation string, attempts int, unavailab
 		return
 	}
 	o.mu.Lock()
-	_, known := o.windows[operation]
-	delete(o.windows, operation)
-	allRecovered := len(o.windows) == 0
-	if !known {
+	if !o.outage {
 		o.mu.Unlock()
 		return
 	}
-	// The final window removal and Dispatcher resolution are one transition.
-	// Dispatcher never calls back into the observer, so observer -> dispatcher
-	// is the only lock order.
-	if allRecovered {
-		o.dispatcher.Resolve(context.Background(), mysqlAlertKey, mysqlMessage("MySQL recovered", operation, attempts, unavailableFor))
-	}
+	wasAlerted := o.alerted
+	o.outage = false
+	o.alerted = false
+	o.lastProgress = 0
 	o.mu.Unlock()
+	if wasAlerted {
+		o.dispatcher.Alert(context.Background(), mysqlAlertKey, mysqlMessage("MySQL recovered", operation, attempts, unavailableFor))
+	}
 	o.logger.Info(context.Background(), "MySQL connection recovered",
 		logging.String("event", "mysql_connection_recovered"),
 		logging.String("operation", operation),

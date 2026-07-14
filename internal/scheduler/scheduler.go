@@ -8,6 +8,24 @@ import (
 	"hyperliquid-builder-code-bot/internal/funding"
 )
 
+const (
+	NonfatalRetryDelay = time.Minute
+	MaxNonfatalRetries = 5
+)
+
+// RetryExhaustedError terminates the service after a scheduled funding task
+// has used all automatic retries without succeeding.
+type RetryExhaustedError struct {
+	Retries int
+	Err     error
+}
+
+func (e *RetryExhaustedError) Error() string {
+	return fmt.Sprintf("scheduled funding task failed after %d retries: %v", e.Retries, e.Err)
+}
+
+func (e *RetryExhaustedError) Unwrap() error { return e.Err }
+
 type Timer interface {
 	Chan() <-chan time.Time
 	Stop() bool
@@ -42,12 +60,16 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context, funding.T
 	if run == nil {
 		return fmt.Errorf("scheduler callback is nil")
 	}
+	retries := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		now := s.now()
 		delay := NextUTCMidnight(now).Sub(now)
+		if retries > 0 {
+			delay = NonfatalRetryDelay
+		}
 		if delay < 0 {
 			return fmt.Errorf("next UTC midnight precedes current time")
 		}
@@ -62,9 +84,20 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context, funding.T
 		case <-timer.Chan():
 			timer.Stop()
 		}
-		if err := run(ctx, funding.TriggerUTC); err != nil && s.onError != nil {
-			s.onError(err)
+		if err := run(ctx, funding.TriggerUTC); err != nil {
+			if s.onError != nil {
+				s.onError(err)
+			}
+			if funding.IsFatal(err) {
+				return err
+			}
+			if retries >= MaxNonfatalRetries {
+				return &RetryExhaustedError{Retries: retries, Err: err}
+			}
+			retries++
+			continue
 		}
+		retries = 0
 	}
 }
 

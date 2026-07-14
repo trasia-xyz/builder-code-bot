@@ -8,11 +8,11 @@ import (
 )
 
 type MySQLConfig struct {
-	Host     string              `mapstructure:"host"`
-	Port     int                 `mapstructure:"port"`
-	Database string              `mapstructure:"database"`
-	User     string              `mapstructure:"user"`
-	Password secret.SecretString `mapstructure:"password"`
+	Host     string              `toml:"host"`
+	Port     int                 `toml:"port"`
+	Database string              `toml:"database"`
+	User     string              `toml:"user"`
+	Password secret.SecretString `toml:"password"`
 }
 
 func (cfg *MySQLConfig) NormalizeAndValidate() error {

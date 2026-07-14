@@ -2,48 +2,19 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
-	"github.com/shopspring/decimal"
+	"github.com/DATA-DOG/go-sqlmock"
+
 	"hyperliquid-builder-code-bot/internal/config"
 	"hyperliquid-builder-code-bot/internal/crypt/keycipher"
 	"hyperliquid-builder-code-bot/internal/funding"
-	httpclient "hyperliquid-builder-code-bot/internal/hyperliquid/client"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
 	"hyperliquid-builder-code-bot/internal/hyperliquid/signing"
 	"hyperliquid-builder-code-bot/internal/secret"
+	"hyperliquid-builder-code-bot/internal/state"
 )
-
-func TestHyperliquidChainQueriesConfiguredLedgerReconciliationWindow(t *testing.T) {
-	transport := &ledgerRecordingTransport{response: json.RawMessage(`[{"time":1100,"delta":{"type":"spotTransfer","token":"USDC","amount":"1.25","user":"0xsender","destination":"0xdestination"}}]`)}
-	chain := hyperliquidChain{info: info.New(transport)}
-	query := info.TransferQuery{
-		Sender: "0xsender", Destination: "0xdestination", TokenName: "USDC",
-		Amount: decimal.RequireFromString("1.25"), ActionTime: 1000,
-		StartTime: 500, EndTime: 5_000,
-	}
-
-	update, matched, err := chain.FindSpotTransfer(context.Background(), query)
-	if err != nil || !matched || update == nil {
-		t.Fatalf("FindSpotTransfer() = %#v, %v, %v", update, matched, err)
-	}
-	if transport.request["startTime"] != uint64(500) || transport.request["endTime"] != uint64(5_000) {
-		t.Fatalf("ledger request = %#v", transport.request)
-	}
-}
-
-type ledgerRecordingTransport struct {
-	request  map[string]any
-	response json.RawMessage
-}
-
-func (t *ledgerRecordingTransport) Info(_ context.Context, request any, out any) (httpclient.Response, error) {
-	t.request, _ = request.(map[string]any)
-	return httpclient.Response{Body: t.response}, json.Unmarshal(t.response, out)
-}
 
 const testPrivateKey = "0x0000000000000000000000000000000000000000000000000000000000000001"
 
@@ -174,6 +145,42 @@ func TestRuntimeWithoutRunOnStartOnlyRecovers(t *testing.T) {
 	}
 }
 
+func TestAppRunUsesCallerContextAndReturnsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	scheduler := &recordingScheduler{}
+	app := &App{orchestrator: &funding.Orchestrator{}, scheduler: scheduler}
+	err := app.Run(ctx)
+	if !errors.Is(err, context.Canceled) || scheduler.ctx != ctx {
+		t.Fatalf("Run() = %v, context forwarded = %v", err, scheduler.ctx == ctx)
+	}
+}
+
+func TestAppCloseReleasesDatabaseAndProcessLock(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectClose()
+	dir := t.TempDir()
+	lock, err := state.AcquireProcessLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{db: db, processLock: lock}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+	reacquired, err := state.AcquireProcessLock(dir)
+	if err != nil {
+		t.Fatalf("process lock was not released: %v", err)
+	}
+	_ = reacquired.Close()
+}
+
 type fakeSecretPrompt struct {
 	value secret.SecretString
 	err   error
@@ -186,6 +193,13 @@ func (p *fakeSecretPrompt) ReadSecret(string) (secret.SecretString, error) {
 }
 
 type recordingRunner struct{ calls []string }
+
+type recordingScheduler struct{ ctx context.Context }
+
+func (s *recordingScheduler) Run(ctx context.Context, _ func(context.Context, funding.Trigger) error) error {
+	s.ctx = ctx
+	return ctx.Err()
+}
 
 func (r *recordingRunner) Recover(context.Context) error {
 	r.calls = append(r.calls, "recover")

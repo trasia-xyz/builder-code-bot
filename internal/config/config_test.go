@@ -43,6 +43,18 @@ func TestLoadFileDecodesMultipleBuildersAndSeparateSettlement(t *testing.T) {
 	}
 }
 
+func TestLoadFileDecodesSecretStrings(t *testing.T) {
+	content := strings.Replace(validConfig(), `password = ""`, `password = "database-secret"`, 1)
+	content = strings.Replace(content, `decrypt_password = ""`, `decrypt_password = "signing-secret"`, 1)
+	cfg, err := LoadFile(writeConfig(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MySQL.Password.Reveal() != "database-secret" || cfg.Signing.DecryptPassword.Reveal() != "signing-secret" {
+		t.Fatal("secret strings were not decoded")
+	}
+}
+
 func TestLoadFileAppliesLoggingDefaults(t *testing.T) {
 	cfg, err := LoadFile(writeConfig(t, validConfig()))
 	if err != nil {

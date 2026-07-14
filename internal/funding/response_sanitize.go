@@ -1,16 +1,25 @@
 package funding
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
+
+	"hyperliquid-builder-code-bot/internal/hyperliquid/exchange"
 )
 
-func sanitizeError(err error) json.RawMessage {
-	if err == nil {
-		return nil
+func (o *Orchestrator) logSubmitResult(ctx context.Context, runID string, result exchange.SubmitResult) {
+	attrs := []slog.Attr{
+		slog.String("event", "funding_payout_submit_result"),
+		slog.String("run_id", runID),
+		slog.Bool("accepted", result.Accepted),
+		slog.Bool("rejected", result.Rejected),
 	}
-	data, _ := json.Marshal(map[string]string{"error": "operation failed"})
-	return data
+	if response := sanitizeJSON(result.Response); len(response) != 0 {
+		attrs = append(attrs, slog.String("response", string(response)))
+	}
+	o.info(ctx, "final payout submission returned", attrs...)
 }
 
 func sanitizeJSON(raw json.RawMessage) json.RawMessage {

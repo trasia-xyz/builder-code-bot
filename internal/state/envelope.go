@@ -51,12 +51,5 @@ func unmarshalEnvelope(data []byte) (*funding.RunState, error) {
 	if saved.Checksum != wantChecksum {
 		return nil, fmt.Errorf("state checksum mismatch")
 	}
-	manifestHash, err := funding.HashManifest(saved.State.Manifest)
-	if err != nil {
-		return nil, fmt.Errorf("validate manifest hash: %w", err)
-	}
-	if saved.State.Manifest.ManifestHash != manifestHash {
-		return nil, fmt.Errorf("manifest hash mismatch")
-	}
 	return &saved.State, nil
 }

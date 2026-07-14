@@ -15,14 +15,20 @@ func TestParseOptionsDefaults(t *testing.T) {
 	}
 }
 
-func TestParseOptionsUsesRunOnStartFlagPresence(t *testing.T) {
-	for _, args := range [][]string{{"-run-on-start"}, {"-run-on-start=false"}} {
-		opts, err := parseOptions(args)
+func TestParseOptionsUsesRunOnStartBooleanValue(t *testing.T) {
+	for _, tt := range []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{"-run-on-start"}, want: true},
+		{args: []string{"-run-on-start=false"}, want: false},
+	} {
+		opts, err := parseOptions(tt.args)
 		if err != nil {
-			t.Fatalf("parseOptions(%v) error = %v", args, err)
+			t.Fatalf("parseOptions(%v) error = %v", tt.args, err)
 		}
-		if !opts.RunOnStart {
-			t.Fatalf("parseOptions(%v) RunOnStart = false, want true for present flag", args)
+		if opts.RunOnStart != tt.want {
+			t.Fatalf("parseOptions(%v) RunOnStart = %v, want %v", tt.args, opts.RunOnStart, tt.want)
 		}
 	}
 }

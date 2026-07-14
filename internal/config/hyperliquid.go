@@ -12,8 +12,8 @@ const (
 )
 
 type HyperliquidConfig struct {
-	Network string `mapstructure:"network"`
-	BaseURL string `mapstructure:"base_url"`
+	Network string `toml:"network"`
+	BaseURL string `toml:"base_url"`
 }
 
 func (cfg *HyperliquidConfig) NormalizeAndValidate() error {

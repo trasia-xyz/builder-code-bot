@@ -36,7 +36,6 @@ type Config struct {
 }
 
 type Client struct {
-	network          hyperliquid.Network
 	baseURL          *url.URL
 	httpClient       *http.Client
 	maxResponseBytes int64
@@ -97,7 +96,6 @@ func New(cfg Config) (*Client, error) {
 		cfg.MaxResponseBytes = DefaultMaxResponseBytes
 	}
 	return &Client{
-		network:          network,
 		baseURL:          baseURL,
 		httpClient:       httpClient,
 		maxResponseBytes: cfg.MaxResponseBytes,
@@ -116,26 +114,8 @@ func BaseURLForNetwork(network hyperliquid.Network) (string, error) {
 	}
 }
 
-func (c *Client) Network() hyperliquid.Network {
-	if c == nil {
-		return ""
-	}
-	return c.network
-}
-
-func (c *Client) BaseURL() string {
-	if c == nil || c.baseURL == nil {
-		return ""
-	}
-	return c.baseURL.String()
-}
-
 func (c *Client) Info(ctx context.Context, request any, out any) (Response, error) {
 	return c.post(ctx, endpointInfo, request, nil, out)
-}
-
-func (c *Client) Exchange(ctx context.Context, request any, out any) (Response, error) {
-	return c.post(ctx, endpointExchange, request, nil, out)
 }
 
 func (c *Client) ExchangeRaw(ctx context.Context, request json.RawMessage, out any) (Response, error) {

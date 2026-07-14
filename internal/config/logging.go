@@ -8,10 +8,10 @@ import (
 )
 
 type LoggingConfig struct {
-	Format    string `mapstructure:"format"`
-	Level     string `mapstructure:"level"`
-	Color     string `mapstructure:"color"`
-	AddSource bool   `mapstructure:"add_source"`
+	Format    string `toml:"format"`
+	Level     string `toml:"level"`
+	Color     string `toml:"color"`
+	AddSource bool   `toml:"add_source"`
 }
 
 func (cfg *LoggingConfig) NormalizeAndValidate() error {
