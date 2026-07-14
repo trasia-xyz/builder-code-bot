@@ -5,7 +5,9 @@
 
 ## 1. 系统目标与边界
 
-服务在 UTC 00:00 运行，也可在启动恢复完成后用 `--run-on-start` 立即运行：
+服务在 UTC 00:00 运行，也可用 `--run-on-start` 在启动时立即运行。一次触发最多处理一个
+funding run：存在 current 时只恢复该 run，不再连续创建新 run；没有 current 时才读取
+pending records 并创建新 run。
 
 1. 从 MySQL 冻结全部 `status = 0` records。
 2. 对所有 builder 执行 `claimRewards`。
@@ -51,8 +53,8 @@ settlement -> recipient 是唯一对外资金边界，也是唯一需要 exactly
 Builder 列表来自当前配置，不属于 payout 恢复数据。
 
 金额按 decimal 文本精确汇总，再执行一次 `ceil(raw_total × 10^6) / 10^6`。负金额使本轮
-归档为 `failed_validation` 并停止；零总额不执行链上动作，直接完成冻结 records。无待处理
-records 时只记录并报告，不创建 current 或 `no_data` history。
+归档一次 `failed_validation` 并 fatal 退出，不进入自动重试；零总额不执行链上动作，直接
+完成冻结 records。无待处理 records 时只记录并报告，不创建 current 或 `no_data` history。
 
 ## 5. Payout 的两道持久化边界
 
@@ -63,8 +65,8 @@ records 时只记录并报告，不创建 current 或 `no_data` history。
 2. 请求可能离开进程前，再保存 `payout_submitting`。
 3. 只有第二次保存成功后才调用 submit。
 
-这保证 primary 与 backup 至少各持有一份完整付款意图。Submit response 只以脱敏结构化
-日志记录，不写入 durable state。
+这保证 primary 与 backup 至少各持有一份完整付款意图。Submit response body 会完整写入
+结构化日志，但不写入 durable state；完整签名请求始终不写日志。
 
 提交结果分三类：
 
@@ -118,7 +120,8 @@ ListPending 和 Complete 对瞬时 MySQL 错误无限重试，退避响应 conte
 
 成功 funding run 等待下一 UTC 00:00。普通错误（API 暂时失败、reward 未可见、归集不足）
 约 1 分钟后重试，最多重试 5 次；全部失败则返回 retry-exhausted 错误并退出。Fatal payout
-错误立即退出；context 取消立即退出且不会忙循环。MySQL 自身的维护恢复仍无限重试。
+错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL 自身
+的维护恢复仍无限重试。
 
 ## 9. 安全与测试不变量
 

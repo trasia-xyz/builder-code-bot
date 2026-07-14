@@ -34,7 +34,7 @@ type Options struct {
 }
 
 type scheduledRunner interface {
-	Run(context.Context, func(context.Context, funding.Trigger) error) error
+	Run(context.Context, func(context.Context) error) error
 }
 
 type App struct {
@@ -135,7 +135,7 @@ func (a *App) Run(ctx context.Context) error {
 	if a == nil || a.scheduler == nil || a.orchestrator == nil {
 		return fmt.Errorf("app is not initialized")
 	}
-	return a.scheduler.Run(ctx, func(runCtx context.Context, _ funding.Trigger) error {
+	return a.scheduler.Run(ctx, func(runCtx context.Context) error {
 		return a.orchestrator.Run(runCtx, funding.TriggerUTC)
 	})
 }
@@ -185,9 +185,9 @@ func assembleOrchestrator(
 	}
 	retryObserver := notification.NewMySQLRetryObserver(dispatcher, logger)
 	repository := mysql.NewRepository(db, mysql.NewRetryer(retryObserver))
-	builders := make([]funding.Builder, len(cfg.Builders))
+	builders := make([]string, len(cfg.Builders))
 	for index, builder := range cfg.Builders {
-		builders[index] = funding.Builder{Name: builder.Name, Address: builder.Address}
+		builders[index] = builder.Address
 	}
 	return funding.NewOrchestrator(funding.OrchestratorConfig{
 		Repository: repository,
@@ -230,18 +230,16 @@ func (c hyperliquidChain) Submit(ctx context.Context, action exchange.PreparedAc
 
 type dispatcherFundingNotifier struct{ dispatcher *notification.Dispatcher }
 
-func (n dispatcherFundingNotifier) Alert(ctx context.Context, key, message string) error {
+func (n dispatcherFundingNotifier) Alert(ctx context.Context, key, message string) {
 	if n.dispatcher != nil {
 		n.dispatcher.Alert(ctx, key, notification.Message{Subject: "Funding service alert", Body: message})
 	}
-	return nil
 }
 
-func (n dispatcherFundingNotifier) Report(ctx context.Context, subject, message string) error {
+func (n dispatcherFundingNotifier) Report(ctx context.Context, subject, message string) {
 	if n.dispatcher != nil {
 		n.dispatcher.Report(ctx, notification.Message{Subject: subject, Body: message})
 	}
-	return nil
 }
 
 type systemClock struct{}

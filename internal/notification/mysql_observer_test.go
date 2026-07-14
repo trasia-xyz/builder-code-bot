@@ -12,7 +12,7 @@ import (
 
 func TestMySQLRetryObserverAlertsAndRecoversOncePerOutage(t *testing.T) {
 	n := &recordingNotifier{}
-	o := NewMySQLRetryObserver(NewDispatcher(n), logging.Logger{})
+	o := NewMySQLRetryObserver(NewDispatcher(n, logging.Logger{}), logging.Logger{})
 
 	for incident := 0; incident < 2; incident++ {
 		o.RetryStarted("list_pending", errors.New("password=hidden"))
@@ -61,7 +61,7 @@ func TestMySQLRetryObserverThrottlesProgressLogs(t *testing.T) {
 
 func TestMySQLRetryObserverNoRecoveryEmailBeforeAlertThreshold(t *testing.T) {
 	n := &recordingNotifier{}
-	o := NewMySQLRetryObserver(NewDispatcher(n), logging.Logger{})
+	o := NewMySQLRetryObserver(NewDispatcher(n, logging.Logger{}), logging.Logger{})
 	o.RetryStarted("complete", errors.New("unavailable"))
 	o.RetryProgress("complete", 2, time.Minute, errors.New("unavailable"))
 	o.Recovered("complete", 2, time.Minute)

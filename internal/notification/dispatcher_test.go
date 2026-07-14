@@ -32,7 +32,7 @@ func (n *recordingNotifier) snapshot() []Message {
 
 func TestDispatcherSendsEveryFundingAlertAndReport(t *testing.T) {
 	n := &recordingNotifier{}
-	d := NewDispatcher(n)
+	d := NewDispatcher(n, logging.Logger{})
 	d.Alert(context.Background(), "first", Message{Subject: "alert"})
 	d.Alert(context.Background(), "first", Message{Subject: "alert again"})
 	d.Report(context.Background(), Message{Subject: "report"})

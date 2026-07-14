@@ -24,7 +24,7 @@ import (
 type FailureMode int
 
 const (
-	FailureNone FailureMode = iota
+	failureNone FailureMode = iota
 	FailureRejected
 	FailureAmbiguous
 	FailureAmbiguousApplied
@@ -34,35 +34,8 @@ const (
 
 // RecordedRequest is a sanitized, decoded request record.
 type RecordedRequest struct {
-	Endpoint    string
-	InfoType    string
 	ActionType  string
-	Signer      string
 	Destination string
-	Token       string
-	Amount      string
-	Nonce       uint64
-	BodyHash    string
-}
-
-// Option configures a Server.
-type Option func(*serverConfig)
-
-type serverConfig struct {
-	network hyperliquid.Network
-	token   info.SpotToken
-}
-
-// WithNetwork selects the signature domain used for request recovery.
-func WithNetwork(network hyperliquid.Network) Option {
-	return func(cfg *serverConfig) { cfg.network = network }
-}
-
-// WithToken replaces the default canonical USDC metadata.
-func WithToken(name, tokenID string, index, weiDecimals int) Option {
-	return func(cfg *serverConfig) {
-		cfg.token = info.SpotToken{Name: name, TokenID: tokenID, Index: index, WeiDecimals: weiDecimals, IsCanonical: true}
-	}
 }
 
 type balanceKey struct {
@@ -87,7 +60,6 @@ type Server struct {
 
 	server *httptest.Server
 	mu     sync.Mutex
-	cfg    serverConfig
 
 	balances     map[balanceKey]spotBalance
 	claimRewards map[balanceKey]decimal.Decimal
@@ -97,21 +69,10 @@ type Server struct {
 }
 
 // New starts a mock server and registers its cleanup with t.
-func New(t testing.TB, options ...Option) *Server {
+func New(t testing.TB) *Server {
 	t.Helper()
-	cfg := serverConfig{
-		network: hyperliquid.NetworkTestnet,
-		token: info.SpotToken{
-			Name: "USDC", TokenID: "0", Index: 0, WeiDecimals: 6, IsCanonical: true,
-		},
-	}
-	for _, option := range options {
-		if option != nil {
-			option(&cfg)
-		}
-	}
 	s := &Server{
-		cfg: cfg, balances: make(map[balanceKey]spotBalance),
+		balances:     make(map[balanceKey]spotBalance),
 		claimRewards: make(map[balanceKey]decimal.Decimal),
 		outcomes:     make(map[string]exchangeOutcome),
 	}
@@ -198,21 +159,22 @@ func (s *Server) handleInfo(w http.ResponseWriter, body []byte) {
 		return
 	}
 	s.mu.Lock()
-	s.requests = append(s.requests, RecordedRequest{Endpoint: "/info", InfoType: request.Type, BodyHash: hashBytes(body)})
 	switch request.Type {
 	case "spotMeta":
+		token := canonicalToken()
 		response := struct {
 			Tokens []info.SpotToken `json:"tokens"`
-		}{Tokens: []info.SpotToken{s.cfg.token}}
+		}{Tokens: []info.SpotToken{token}}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
 	case "spotClearinghouseState":
-		wireToken := s.cfg.token.Name + ":" + s.cfg.token.TokenID
+		token := canonicalToken()
+		wireToken := token.Name + ":" + token.TokenID
 		key := balanceKey{address: normalizeAddress(request.User), token: wireToken}
 		value := s.balances[key]
 		response := struct {
 			Balances []info.SpotBalance `json:"balances"`
-		}{Balances: []info.SpotBalance{{Coin: s.cfg.token.Name, Token: s.cfg.token.Index, Total: value.total.String(), Hold: value.hold.String()}}}
+		}{Balances: []info.SpotBalance{{Coin: token.Name, Token: token.Index, Total: value.total.String(), Hold: value.hold.String()}}}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
 	default:
@@ -239,7 +201,8 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 		return
 	}
 
-	record := RecordedRequest{Endpoint: "/exchange", ActionType: actionType.Type, Nonce: request.Nonce, BodyHash: hashBytes(body)}
+	record := RecordedRequest{ActionType: actionType.Type}
+	bodyHash := hashBytes(body)
 	var (
 		signerAddress string
 		apply         func() error
@@ -249,14 +212,15 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 		action := signing.Object{signing.F("type", "claimRewards")}
 		var err error
 		signerAddress, err = signing.RecoverL1ActionSigner(signing.L1ActionRecoverInput{
-			Action: action, Nonce: request.Nonce, Network: s.cfg.network, Signature: request.Signature,
+			Action: action, Nonce: request.Nonce, Network: hyperliquid.NetworkTestnet, Signature: request.Signature,
 		})
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"status": "err", "response": "invalid signature"})
 			return
 		}
 		apply = func() error {
-			wireToken := s.cfg.token.Name + ":" + s.cfg.token.TokenID
+			token := canonicalToken()
+			wireToken := token.Name + ":" + token.TokenID
 			key := balanceKey{address: normalizeAddress(signerAddress), token: wireToken}
 			if reward := s.claimRewards[key]; !reward.IsZero() {
 				balance := s.balances[key]
@@ -272,7 +236,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"status": "err", "response": "invalid spot send"})
 			return
 		}
-		if action.HyperliquidChain != configuredChainLabel(s.cfg.network) {
+		if action.HyperliquidChain != "Testnet" {
 			writeJSON(w, http.StatusOK, map[string]string{"status": "err", "response": "wrong signing network"})
 			return
 		}
@@ -282,19 +246,17 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"status": "err", "response": "invalid signature"})
 			return
 		}
-		record.Destination, record.Token, record.Amount = action.Destination, action.Token, action.Amount
+		record.Destination = action.Destination
 		apply = func() error { return s.applySpotSend(signerAddress, action) }
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"status": "err", "response": "unsupported action"})
 		return
 	}
-	record.Signer = signerAddress
-
 	s.mu.Lock()
 	s.requests = append(s.requests, record)
 	idempotencyKey := normalizeAddress(signerAddress) + ":" + fmt.Sprint(request.Nonce)
 	if prior, exists := s.outcomes[idempotencyKey]; exists {
-		if prior.hash != record.BodyHash {
+		if prior.hash != bodyHash {
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]string{"status": "err", "response": "nonce already used"})
 			return
@@ -304,7 +266,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 		return
 	}
 	mode := s.nextFailure
-	s.nextFailure = FailureNone
+	s.nextFailure = failureNone
 	statusCode := http.StatusOK
 	response := []byte(`{"status":"ok","response":{"type":"default"}}`)
 	shouldApply := mode != FailureRejected && mode != FailureAmbiguous && mode != FailureHTTPError
@@ -323,7 +285,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 			statusCode = http.StatusOK
 		}
 	}
-	s.outcomes[idempotencyKey] = exchangeOutcome{hash: record.BodyHash, statusCode: statusCode, body: append([]byte(nil), response...)}
+	s.outcomes[idempotencyKey] = exchangeOutcome{hash: bodyHash, statusCode: statusCode, body: append([]byte(nil), response...)}
 	s.mu.Unlock()
 	writeRaw(w, statusCode, response)
 }
@@ -354,11 +316,10 @@ func hashBytes(value []byte) string {
 
 func normalizeAddress(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
 
-func configuredChainLabel(network hyperliquid.Network) string {
-	if hyperliquid.NormalizeNetwork(network) == hyperliquid.NetworkMainnet {
-		return "Mainnet"
+func canonicalToken() info.SpotToken {
+	return info.SpotToken{
+		Name: "USDC", TokenID: "0", Index: 0, WeiDecimals: 6, IsCanonical: true,
 	}
-	return "Testnet"
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

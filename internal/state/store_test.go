@@ -16,7 +16,7 @@ import (
 )
 
 func TestStoreLoadReturnsNilWhenNoSnapshotExists(t *testing.T) {
-	got, err := NewStore(t.TempDir()).Load(context.Background())
+	got, err := load(context.Background(), NewStore(t.TempDir()))
 	if err != nil || got != nil {
 		t.Fatalf("Load() = %#v, %v; want nil, nil", got, err)
 	}
@@ -43,7 +43,7 @@ func TestStoreFallsBackToValidBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := store.Load(context.Background())
+	got, err := load(context.Background(), store)
 	if err != nil || got == nil || got.RunID != "first" {
 		t.Fatalf("Load() = %#v, %v; want backup run first", got, err)
 	}
@@ -92,7 +92,7 @@ func TestStoreRejectsChecksumMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, err := store.Load(context.Background()); err == nil || got != nil || !strings.Contains(err.Error(), "checksum") {
+	if got, err := load(context.Background(), store); err == nil || got != nil || !strings.Contains(err.Error(), "checksum") {
 		t.Fatalf("Load() = %#v, %v; want checksum error", got, err)
 	}
 }
@@ -103,7 +103,7 @@ func TestStoreRejectsUnsupportedSchemaVersion(t *testing.T) {
 	path := filepath.Join(dir, "current.json")
 	writeTestEnvelopeVersion(t, path, state, 2)
 
-	if got, err := NewStore(dir).Load(context.Background()); err == nil || got != nil || !strings.Contains(err.Error(), "unsupported state schema version 2") {
+	if got, err := load(context.Background(), NewStore(dir)); err == nil || got != nil || !strings.Contains(err.Error(), "unsupported state schema version 2") {
 		t.Fatalf("Load() = %#v, %v", got, err)
 	}
 }
@@ -116,7 +116,7 @@ func TestStoreReportsErrorWhenPrimaryAndBackupAreInvalid(t *testing.T) {
 		}
 	}
 
-	got, err := NewStore(dir).Load(context.Background())
+	got, err := load(context.Background(), NewStore(dir))
 	if err == nil || got != nil || !strings.Contains(err.Error(), "current.json") || !strings.Contains(err.Error(), "current.json.bak") {
 		t.Fatalf("Load() = %#v, %v; want both snapshot errors", got, err)
 	}
@@ -219,9 +219,14 @@ func TestStoreMethodsHonorCanceledContext(t *testing.T) {
 			}
 		})
 	}
-	if got, err := store.Load(ctx); err != context.Canceled || got != nil {
+	if got, err := load(ctx, store); err != context.Canceled || got != nil {
 		t.Fatalf("Load() = %#v, %v; want nil, context.Canceled", got, err)
 	}
+}
+
+func load(ctx context.Context, store *Store) (*funding.RunState, error) {
+	state, _, err := store.LoadWithMetadata(ctx)
+	return state, err
 }
 
 type testEnvelope struct {

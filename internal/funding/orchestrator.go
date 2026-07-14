@@ -1,11 +1,9 @@
 package funding
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -16,18 +14,13 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-type Builder struct {
-	Name    string
-	Address string
-}
-
 type OrchestratorConfig struct {
 	Repository Repository
 	Store      StateStore
 	Chain      Chain
 	Notifier   Notifier
 	Logger     Logger
-	Builders   []Builder
+	Builders   []string
 	Settlement string
 	Recipient  string
 	Clock      Clock
@@ -41,7 +34,7 @@ type Orchestrator struct {
 	chain      Chain
 	notifier   Notifier
 	logger     Logger
-	builders   []Builder
+	builders   []string
 	settlement string
 	recipient  string
 	clock      Clock
@@ -65,15 +58,15 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 	}
 	seen := make(map[string]struct{}, len(cfg.Builders))
 	for _, builder := range cfg.Builders {
-		address := strings.ToLower(strings.TrimSpace(builder.Address))
-		if strings.TrimSpace(builder.Name) == "" || address == "" {
-			return nil, fmt.Errorf("builder name and address are required")
+		address := strings.ToLower(strings.TrimSpace(builder))
+		if address == "" {
+			return nil, fmt.Errorf("builder address is required")
 		}
 		if strings.EqualFold(address, strings.TrimSpace(cfg.Settlement)) {
 			return nil, fmt.Errorf("settlement account must not be a builder")
 		}
 		if _, duplicate := seen[address]; duplicate {
-			return nil, fmt.Errorf("duplicate builder address %q", builder.Address)
+			return nil, fmt.Errorf("duplicate builder address %q", builder)
 		}
 		seen[address] = struct{}{}
 	}
@@ -87,7 +80,7 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 	return &Orchestrator{
 		repository: cfg.Repository, store: cfg.Store, chain: cfg.Chain,
 		notifier: cfg.Notifier, logger: cfg.Logger,
-		builders:   append([]Builder(nil), cfg.Builders...),
+		builders:   append([]string(nil), cfg.Builders...),
 		settlement: cfg.Settlement, recipient: cfg.Recipient,
 		clock: cfg.Clock, nonce: cfg.Nonce, sleeper: sleeper,
 		alerts: make(map[string]struct{}),
@@ -102,20 +95,7 @@ type runReport struct {
 	outcome     string
 }
 
-func (o *Orchestrator) RunNew(ctx context.Context, trigger Trigger) (err error) {
-	report := runReport{trigger: trigger}
-	defer func() { o.reportRun(ctx, report, err) }()
-	return o.runNew(ctx, trigger, &report)
-}
-
 func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runReport) error {
-	current, _, err := o.loadCurrent(ctx)
-	if err != nil {
-		return err
-	}
-	if current != nil {
-		return fmt.Errorf("current funding run %s must be recovered before starting a new run", current.RunID)
-	}
 	records, err := o.repository.ListPending(ctx)
 	if err != nil {
 		return err
@@ -136,26 +116,23 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 		slog.String("trigger", string(trigger)))
 
 	input := ManifestInput{Records: records, Settlement: o.settlement, Recipient: o.recipient}
-	_, payout, validationErr := CalculateTotals(records)
+	manifest, validationErr := buildManifest(input, false)
+	run.Manifest = manifest
 	if validationErr != nil {
 		report.outcome = "failed_validation"
-		run.Manifest = buildValidationArchiveManifest(input)
 		if archiveErr := o.store.Archive(ctx, run, "failed_validation"); archiveErr != nil {
-			return fmt.Errorf("validate records: %w; archive failure: %v", validationErr, archiveErr)
+			return &FatalError{Err: fmt.Errorf("validate records: %w; archive failure: %v", validationErr, archiveErr)}
 		}
 		o.alertOnce(ctx, run.RunID, "validation_failed", "funding snapshot validation failed")
-		return validationErr
+		return &FatalError{Err: validationErr}
 	}
+	payout := run.Manifest.PayoutTotal
 	if payout != "0" {
 		token, tokenErr := o.chain.CanonicalUSDC(ctx)
 		if tokenErr != nil {
 			return tokenErr
 		}
-		input.Token = &token
-	}
-	run.Manifest, err = BuildManifest(input)
-	if err != nil {
-		return err
+		run.Manifest.Token = &token
 	}
 	report.outcome = "completed"
 	if err := o.save(ctx, &run, PhasePrepared); err != nil {
@@ -167,26 +144,12 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 	return o.runPositive(ctx, &run)
 }
 
-func buildValidationArchiveManifest(input ManifestInput) Manifest {
-	records := append([]Record(nil), input.Records...)
-	slices.SortFunc(records, func(a, b Record) int {
-		if a.PeriodStartAt != b.PeriodStartAt {
-			return cmp.Compare(a.PeriodStartAt, b.PeriodStartAt)
-		}
-		return cmp.Compare(a.ID, b.ID)
-	})
-	return Manifest{
-		Records: records, RawTotal: "unavailable", PayoutTotal: "unavailable",
-		Settlement: input.Settlement, Recipient: input.Recipient,
-	}
-}
-
 func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 	for _, builder := range o.builders {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		prepared, err := o.chain.PrepareClaim(builder.Address, o.nonce.Next())
+		prepared, err := o.chain.PrepareClaim(builder, o.nonce.Next())
 		if err != nil {
 			o.builderFailure(ctx, state, "claimRewards", "prepare")
 			continue
@@ -210,7 +173,7 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			balance, balanceErr := o.chain.SpotBalance(ctx, builder.Address, token)
+			balance, balanceErr := o.chain.SpotBalance(ctx, builder, token)
 			if balanceErr != nil {
 				o.builderFailure(ctx, state, "spotBalance", "query")
 				continue
@@ -218,7 +181,7 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 			if !balance.Available.IsPositive() {
 				continue
 			}
-			prepared, prepareErr := o.chain.PrepareSpotSend(builder.Address, state.Manifest.Settlement, token, balance.Available, o.nonce.Next())
+			prepared, prepareErr := o.chain.PrepareSpotSend(builder, state.Manifest.Settlement, token, balance.Available, o.nonce.Next())
 			if prepareErr != nil {
 				o.builderFailure(ctx, state, "spotSend", "prepare")
 				continue
@@ -330,14 +293,12 @@ func (o *Orchestrator) reportRun(ctx context.Context, report runReport, runErr e
 			lines = append(lines, "payout total: "+report.state.Manifest.PayoutTotal)
 		}
 	}
-	if err := o.notifier.Report(ctx, subject, strings.Join(lines, "\n")); err != nil {
-		o.error(ctx, "funding report delivery failed", slog.String("event", "funding_report_delivery_failed"))
-	}
+	o.notifier.Report(ctx, subject, strings.Join(lines, "\n"))
 }
 
 func (o *Orchestrator) alert(ctx context.Context, key, message string) {
 	if o.notifier != nil {
-		_ = o.notifier.Alert(ctx, key, message)
+		o.notifier.Alert(ctx, key, message)
 	}
 }
 

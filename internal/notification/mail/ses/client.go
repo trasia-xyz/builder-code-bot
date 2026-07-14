@@ -33,5 +33,8 @@ func New(ctx context.Context, awsCfg config.AWSConfig, sesCfg config.SESConfig) 
 	if err != nil {
 		return nil, err
 	}
-	return NewNotifier(client, OptionsFromConfig(sesCfg))
+	return NewNotifier(client, Options{
+		Source: sesCfg.From, To: cloneStrings(sesCfg.To), ReplyTo: cloneStrings(sesCfg.ReplyTo),
+		SubjectPrefix: sesCfg.SubjectPrefix,
+	})
 }

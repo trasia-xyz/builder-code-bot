@@ -9,13 +9,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsses "github.com/aws/aws-sdk-go-v2/service/ses"
 
-	"hyperliquid-builder-code-bot/internal/config"
 	"hyperliquid-builder-code-bot/internal/notification"
 )
 
-func TestNotifierSendBuildsUTF8PlainTextEmail(t *testing.T) {
+func TestNotifierBuildsUTF8PlainTextEmail(t *testing.T) {
 	t.Parallel()
-	fake := &fakeSES{messageID: "message-1"}
+	fake := &fakeSES{}
 	n, err := NewNotifier(fake, Options{
 		Source: " Trasia <alerts@example.com> ", To: []string{" ops@example.com ", "dev@example.com"},
 		ReplyTo: []string{" support@example.com "}, SubjectPrefix: " [prod] ",
@@ -23,12 +22,9 @@ func TestNotifierSendBuildsUTF8PlainTextEmail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNotifier() error = %v", err)
 	}
-	id, err := n.Send(context.Background(), notification.Message{Subject: "mysql down", Body: "attempts: 9"})
+	err = n.Notify(context.Background(), notification.Message{Subject: "mysql down", Body: "attempts: 9"})
 	if err != nil {
-		t.Fatalf("Send() error = %v", err)
-	}
-	if id != "message-1" {
-		t.Fatalf("message ID = %q", id)
+		t.Fatalf("Notify() error = %v", err)
 	}
 	got := fake.input
 	if aws.ToString(got.Source) != "Trasia <alerts@example.com>" {
@@ -50,16 +46,6 @@ func TestNotifierSendBuildsUTF8PlainTextEmail(t *testing.T) {
 	}
 	if aws.ToString(got.Message.Body.Text.Charset) != charset {
 		t.Fatalf("body charset = %q", aws.ToString(got.Message.Body.Text.Charset))
-	}
-}
-
-func TestOptionsFromConfigCopiesSESSettings(t *testing.T) {
-	t.Parallel()
-	cfg := config.SESConfig{From: "sender@example.com", To: []string{"one@example.com"}, ReplyTo: []string{"reply@example.com"}, SubjectPrefix: "[bot]"}
-	opts := OptionsFromConfig(cfg)
-	cfg.To[0] = "changed@example.com"
-	if opts.Source != "sender@example.com" || opts.To[0] != "one@example.com" || opts.ReplyTo[0] != "reply@example.com" || opts.SubjectPrefix != "[bot]" {
-		t.Fatalf("OptionsFromConfig() = %+v", opts)
 	}
 }
 
@@ -103,7 +89,7 @@ func TestNotifierRejectsInvalidInputs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			n, err := NewNotifier(tt.client, tt.opts)
 			if err == nil {
-				_, err = n.Send(tt.ctx, tt.msg)
+				err = n.Notify(tt.ctx, tt.msg)
 			}
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("error = %v, want containing %q", err, tt.want)
@@ -118,9 +104,9 @@ func TestNotifierRejectsNilResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = n.Send(context.Background(), notification.Message{Subject: "s", Body: "b"})
+	err = n.Notify(context.Background(), notification.Message{Subject: "s", Body: "b"})
 	if !errors.Is(err, ErrNilResponse) {
-		t.Fatalf("Send() error = %v", err)
+		t.Fatalf("Notify() error = %v", err)
 	}
 }
 
@@ -142,7 +128,6 @@ func assertStringSlice(t *testing.T, got, want []string) {
 
 type fakeSES struct {
 	input     *awsses.SendEmailInput
-	messageID string
 	err       error
 	nilOutput bool
 }
@@ -155,5 +140,5 @@ func (f *fakeSES) SendEmail(_ context.Context, input *awsses.SendEmailInput, _ .
 	if f.nilOutput {
 		return nil, nil
 	}
-	return &awsses.SendEmailOutput{MessageId: aws.String(f.messageID)}, nil
+	return &awsses.SendEmailOutput{}, nil
 }

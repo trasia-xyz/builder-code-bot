@@ -162,7 +162,7 @@ func TestServerFailureModesControlWhetherMutationApplies(t *testing.T) {
 }
 
 func TestServerRejectsSpotSendForDifferentConfiguredNetwork(t *testing.T) {
-	server := New(t, WithNetwork(hyperliquid.NetworkTestnet))
+	server := New(t)
 	client, signer := newExchangeClientForNetwork(t, server.URL, hyperliquid.NetworkMainnet)
 	server.SetSpotBalance(signer, "USDC:0", "5")
 	action, err := client.PrepareSpotSend(signer, "0x00000000000000000000000000000000000000aa", testToken(), decimal.NewFromInt(1), 1007)

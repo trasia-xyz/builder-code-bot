@@ -22,13 +22,9 @@ type Dispatcher struct {
 	logger   logging.Logger
 }
 
-func NewDispatcher(notifier Notifier, loggers ...logging.Logger) *Dispatcher {
+func NewDispatcher(notifier Notifier, logger logging.Logger) *Dispatcher {
 	if notifier == nil {
 		notifier = Noop{}
-	}
-	var logger logging.Logger
-	if len(loggers) > 0 {
-		logger = loggers[0]
 	}
 	return &Dispatcher{notifier: notifier, logger: logger}
 }

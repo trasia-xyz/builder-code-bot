@@ -2,10 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
-
-	"hyperliquid-builder-code-bot/internal/funding"
 )
 
 const (
@@ -50,7 +49,7 @@ func NextUTCMidnight(now time.Time) time.Time {
 	return time.Date(utc.Year(), utc.Month(), utc.Day()+1, 0, 0, 0, 0, time.UTC)
 }
 
-func (s *Scheduler) Run(ctx context.Context, run func(context.Context, funding.Trigger) error) error {
+func (s *Scheduler) Run(ctx context.Context, run func(context.Context) error) error {
 	if ctx == nil {
 		return fmt.Errorf("scheduler context is nil")
 	}
@@ -84,11 +83,11 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context, funding.T
 		case <-timer.Chan():
 			timer.Stop()
 		}
-		if err := run(ctx, funding.TriggerUTC); err != nil {
+		if err := run(ctx); err != nil {
 			if s.onError != nil {
 				s.onError(err)
 			}
-			if funding.IsFatal(err) {
+			if isFatal(err) {
 				return err
 			}
 			if retries >= MaxNonfatalRetries {
@@ -99,6 +98,13 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context, funding.T
 		}
 		retries = 0
 	}
+}
+
+type fatalError interface{ Fatal() }
+
+func isFatal(err error) bool {
+	var fatal fatalError
+	return errors.As(err, &fatal)
 }
 
 type systemTimer struct{ *time.Timer }

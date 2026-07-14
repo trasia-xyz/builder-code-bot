@@ -9,7 +9,7 @@ import (
 
 type fundingRunner interface {
 	Recover(context.Context) error
-	RunNew(context.Context, funding.Trigger) error
+	Run(context.Context, funding.Trigger) error
 }
 
 func startRuntime(ctx context.Context, runner fundingRunner, runOnStart bool) error {
@@ -19,13 +19,14 @@ func startRuntime(ctx context.Context, runner fundingRunner, runOnStart bool) er
 	if runner == nil {
 		return fmt.Errorf("funding runner is nil")
 	}
-	if err := runner.Recover(ctx); err != nil {
-		return fmt.Errorf("recover current funding run: %w", err)
-	}
 	if runOnStart {
-		if err := runner.RunNew(ctx, funding.TriggerRunOnStart); err != nil {
+		if err := runner.Run(ctx, funding.TriggerRunOnStart); err != nil {
 			return fmt.Errorf("run funding on start: %w", err)
 		}
+		return nil
+	}
+	if err := runner.Recover(ctx); err != nil {
+		return fmt.Errorf("recover current funding run: %w", err)
 	}
 	return nil
 }

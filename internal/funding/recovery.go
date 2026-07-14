@@ -14,9 +14,11 @@ func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) (err error) {
 		return err
 	}
 	if current != nil {
-		if err := o.recoverState(ctx, *current, metadata); err != nil {
-			return err
-		}
+		report.state = current
+		report.recordCount = len(current.Manifest.Records)
+		report.recordsRead = true
+		report.outcome = "completed"
+		return o.recoverState(ctx, *current, metadata)
 	}
 	return o.runNew(ctx, trigger, &report)
 }

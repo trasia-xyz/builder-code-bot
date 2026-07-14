@@ -71,13 +71,13 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 	callbackErr := errors.New("run failed")
 	errorsSeen := make(chan error, 1)
 	s.onError = func(err error) { errorsSeen <- err }
-	calls := make(chan funding.Trigger, 2)
+	calls := make(chan struct{}, 2)
 	callCount := 0
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Run(ctx, func(_ context.Context, trigger funding.Trigger) error {
+		done <- s.Run(ctx, func(context.Context) error {
 			callCount++
-			calls <- trigger
+			calls <- struct{}{}
 			if callCount == 1 {
 				return callbackErr
 			}
@@ -88,17 +88,13 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 
 	first := <-timers
 	first.fire()
-	if got := <-calls; got != funding.TriggerUTC {
-		t.Fatalf("first trigger = %q", got)
-	}
+	<-calls
 	if got := <-errorsSeen; !errors.Is(got, callbackErr) {
 		t.Fatalf("onError = %v", got)
 	}
 	second := <-timers
 	second.fire()
-	if got := <-calls; got != funding.TriggerUTC {
-		t.Fatalf("second trigger = %q", got)
-	}
+	<-calls
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context canceled", err)
 	}
@@ -129,7 +125,7 @@ func TestRunStopsActiveTimerWhenContextIsCanceled(t *testing.T) {
 	done := make(chan error, 1)
 	callbackCalled := make(chan struct{}, 1)
 	go func() {
-		done <- s.Run(ctx, func(context.Context, funding.Trigger) error {
+		done <- s.Run(ctx, func(context.Context) error {
 			callbackCalled <- struct{}{}
 			return nil
 		})
@@ -158,7 +154,7 @@ func TestRunReturnsFatalFundingError(t *testing.T) {
 	want := &funding.FatalError{Err: errors.New("payout blocked")}
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Run(context.Background(), func(context.Context, funding.Trigger) error { return want })
+		done <- s.Run(context.Background(), func(context.Context) error { return want })
 	}()
 	timer.fire()
 	if err := <-done; !errors.Is(err, want) {
@@ -187,7 +183,7 @@ func TestRunExitsAfterFiveNonfatalRetries(t *testing.T) {
 	done := make(chan error, 1)
 	calls := 0
 	go func() {
-		done <- s.Run(context.Background(), func(context.Context, funding.Trigger) error {
+		done <- s.Run(context.Background(), func(context.Context) error {
 			calls++
 			return want
 		})

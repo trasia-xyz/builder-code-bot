@@ -29,11 +29,6 @@ func NewStore(dataDir string) *Store {
 	return &Store{dataDir: dataDir}
 }
 
-func (s *Store) Load(ctx context.Context) (*funding.RunState, error) {
-	state, _, err := s.LoadWithMetadata(ctx)
-	return state, err
-}
-
 func (s *Store) LoadWithMetadata(ctx context.Context) (*funding.RunState, funding.StateLoadMetadata, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, funding.StateLoadMetadata{}, err

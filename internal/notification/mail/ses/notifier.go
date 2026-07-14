@@ -10,7 +10,6 @@ import (
 	awsses "github.com/aws/aws-sdk-go-v2/service/ses"
 	"github.com/aws/aws-sdk-go-v2/service/ses/types"
 
-	"hyperliquid-builder-code-bot/internal/config"
 	"hyperliquid-builder-code-bot/internal/notification"
 	notificationmail "hyperliquid-builder-code-bot/internal/notification/mail"
 )
@@ -40,13 +39,6 @@ type Notifier struct {
 
 var _ notification.Notifier = (*Notifier)(nil)
 
-func OptionsFromConfig(cfg config.SESConfig) Options {
-	return Options{
-		Source: cfg.From, To: cloneStrings(cfg.To), ReplyTo: cloneStrings(cfg.ReplyTo),
-		SubjectPrefix: cfg.SubjectPrefix,
-	}
-}
-
 func NewNotifier(client api, opts Options) (*Notifier, error) {
 	if client == nil {
 		return nil, ErrNilClient
@@ -59,19 +51,14 @@ func NewNotifier(client api, opts Options) (*Notifier, error) {
 }
 
 func (n *Notifier) Notify(ctx context.Context, msg notification.Message) error {
-	_, err := n.Send(ctx, msg)
-	return err
-}
-
-func (n *Notifier) Send(ctx context.Context, msg notification.Message) (string, error) {
 	if ctx == nil {
-		return "", fmt.Errorf("context is nil")
+		return fmt.Errorf("context is nil")
 	}
 	if n == nil || n.client == nil {
-		return "", ErrNilClient
+		return ErrNilClient
 	}
 	if err := msg.Validate(); err != nil {
-		return "", err
+		return err
 	}
 	input := &awsses.SendEmailInput{
 		Source:      aws.String(n.opts.Source),
@@ -86,12 +73,12 @@ func (n *Notifier) Send(ctx context.Context, msg notification.Message) (string, 
 	}
 	out, err := n.client.SendEmail(ctx, input)
 	if err != nil {
-		return "", fmt.Errorf("send ses email: %w", err)
+		return fmt.Errorf("send ses email: %w", err)
 	}
 	if out == nil {
-		return "", ErrNilResponse
+		return ErrNilResponse
 	}
-	return aws.ToString(out.MessageId), nil
+	return nil
 }
 
 func normalizeOptions(opts Options) Options {

@@ -22,6 +22,7 @@ type FatalError struct{ Err error }
 
 func (e *FatalError) Error() string { return e.Err.Error() }
 func (e *FatalError) Unwrap() error { return e.Err }
+func (*FatalError) Fatal()          {}
 
 func IsFatal(err error) bool {
 	var fatal *FatalError
@@ -60,7 +61,16 @@ func (o *Orchestrator) submitPreparedPayout(ctx context.Context, state *RunState
 	}
 
 	result, _ := o.chain.Submit(ctx, clonePrepared(state.Payout.Prepared))
-	o.logSubmitResult(ctx, state.RunID, result)
+	attrs := []slog.Attr{
+		slog.String("event", "funding_payout_submit_result"),
+		slog.String("run_id", state.RunID),
+		slog.Bool("accepted", result.Accepted),
+		slog.Bool("rejected", result.Rejected),
+	}
+	if len(result.Response) != 0 {
+		attrs = append(attrs, slog.String("response", string(result.Response)))
+	}
+	o.info(ctx, "final payout submission returned", attrs...)
 	switch {
 	case result.Accepted:
 		return o.confirmPayout(ctx, state, "exchange_response")

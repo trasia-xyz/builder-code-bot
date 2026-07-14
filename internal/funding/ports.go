@@ -58,8 +58,8 @@ func (timerSleeper) Sleep(ctx context.Context, delay time.Duration) error {
 }
 
 type Notifier interface {
-	Alert(context.Context, string, string) error
-	Report(context.Context, string, string) error
+	Alert(context.Context, string, string)
+	Report(context.Context, string, string)
 }
 
 type Logger interface {

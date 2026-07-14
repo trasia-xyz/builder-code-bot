@@ -12,6 +12,10 @@ import (
 )
 
 func BuildManifest(input ManifestInput) (Manifest, error) {
+	return buildManifest(input, true)
+}
+
+func buildManifest(input ManifestInput, requireToken bool) (Manifest, error) {
 	records := append([]Record(nil), input.Records...)
 	sort.Slice(records, func(i, j int) bool {
 		if records[i].PeriodStartAt != records[j].PeriodStartAt {
@@ -20,26 +24,23 @@ func BuildManifest(input ManifestInput) (Manifest, error) {
 		return records[i].ID < records[j].ID
 	})
 
+	manifest := Manifest{
+		Records: records, Settlement: input.Settlement, Recipient: input.Recipient,
+	}
 	rawTotal, payoutTotal, err := CalculateTotals(records)
 	if err != nil {
-		return Manifest{}, err
+		return manifest, err
 	}
 	payout, err := decimal.NewFromString(payoutTotal)
 	if err != nil {
-		return Manifest{}, fmt.Errorf("parse payout total: %w", err)
+		return manifest, fmt.Errorf("parse payout total: %w", err)
 	}
-	if payout.IsPositive() && input.Token == nil {
-		return Manifest{}, fmt.Errorf("canonical token is required for a positive payout")
+	if requireToken && payout.IsPositive() && input.Token == nil {
+		return manifest, fmt.Errorf("canonical token is required for a positive payout")
 	}
-
-	manifest := Manifest{
-		Records:     records,
-		RawTotal:    rawTotal,
-		PayoutTotal: payoutTotal,
-		Token:       cloneToken(input.Token),
-		Settlement:  input.Settlement,
-		Recipient:   input.Recipient,
-	}
+	manifest.RawTotal = rawTotal
+	manifest.PayoutTotal = payoutTotal
+	manifest.Token = cloneToken(input.Token)
 	return manifest, nil
 }
 

@@ -124,12 +124,12 @@ func TestBuildSignersRejectsAnyDerivedAddressMismatch(t *testing.T) {
 	}
 }
 
-func TestRuntimeRecoversBeforeOptionalRunOnStart(t *testing.T) {
+func TestRuntimeRunOnStartUsesCombinedRun(t *testing.T) {
 	runner := &recordingRunner{}
 	if err := startRuntime(context.Background(), runner, true); err != nil {
 		t.Fatalf("startRuntime() error = %v", err)
 	}
-	want := []string{"recover", "run:run_on_start"}
+	want := []string{"run:run_on_start"}
 	if strings.Join(runner.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v, want %v", runner.calls, want)
 	}
@@ -196,7 +196,7 @@ type recordingRunner struct{ calls []string }
 
 type recordingScheduler struct{ ctx context.Context }
 
-func (s *recordingScheduler) Run(ctx context.Context, _ func(context.Context, funding.Trigger) error) error {
+func (s *recordingScheduler) Run(ctx context.Context, _ func(context.Context) error) error {
 	s.ctx = ctx
 	return ctx.Err()
 }
@@ -206,7 +206,7 @@ func (r *recordingRunner) Recover(context.Context) error {
 	return nil
 }
 
-func (r *recordingRunner) RunNew(_ context.Context, trigger funding.Trigger) error {
+func (r *recordingRunner) Run(_ context.Context, trigger funding.Trigger) error {
 	r.calls = append(r.calls, "run:"+string(trigger))
 	return nil
 }

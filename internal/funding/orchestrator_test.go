@@ -16,9 +16,9 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-func TestRunNewHappyPathOnlyPersistsFinalPayout(t *testing.T) {
+func TestRunHappyPathOnlyPersistsFinalPayout(t *testing.T) {
 	fx := newFixture(t)
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
 	if got := fx.chain.events; !equalStrings(got, []string{
@@ -46,7 +46,7 @@ func TestUnknownPayoutConfirmsWhenSettlementBalanceDecreases(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.payoutResult = exchange.SubmitResult{}
 	fx.chain.applyUnknownPayout = true
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
 	if fx.store.archiveResult != "completed" || len(fx.repo.completedIDs) == 0 {
@@ -57,9 +57,9 @@ func TestUnknownPayoutConfirmsWhenSettlementBalanceDecreases(t *testing.T) {
 func TestUnknownPayoutBlocksAfterFiniteBalanceObservations(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.payoutResult = exchange.SubmitResult{}
-	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil || !IsFatal(err) {
-		t.Fatalf("RunNew() error = %v, want fatal", err)
+		t.Fatalf("Run() error = %v, want fatal", err)
 	}
 	if fx.store.current == nil || fx.store.current.Phase != PhaseBlocked || fx.store.archiveResult != "blocked" {
 		t.Fatalf("current = %#v, archive = %q", fx.store.current, fx.store.archiveResult)
@@ -82,9 +82,9 @@ func TestUnknownPayoutIgnoresAvailableDecreaseWhenTotalIsUnchanged(t *testing.T)
 		{Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5")},
 		{Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("0.5")},
 	}
-	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil || !IsFatal(err) || fx.store.current == nil || fx.store.current.Phase != PhaseBlocked {
-		t.Fatalf("RunNew() = %v, current = %#v", err, fx.store.current)
+		t.Fatalf("Run() = %v, current = %#v", err, fx.store.current)
 	}
 	if len(fx.repo.completedIDs) != 0 {
 		t.Fatalf("database completed after hold-only change: %v", fx.repo.completedIDs)
@@ -95,7 +95,7 @@ func TestAvailableBalanceControlsBuilderSweepAndPayoutSufficiency(t *testing.T) 
 	fx := newFixture(t)
 	fx.chain.balances["0xbuilder"] = decimal.NewFromInt(2)
 	fx.chain.holds["0xbuilder"] = decimal.RequireFromString("0.5")
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
 	if got := fx.chain.balances["0xbuilder"]; !got.Equal(decimal.RequireFromString("0.5")) {
@@ -106,9 +106,9 @@ func TestAvailableBalanceControlsBuilderSweepAndPayoutSufficiency(t *testing.T) 
 	fx.chain.balances["0xbuilder"] = decimal.Zero
 	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
 	fx.chain.holds["0xsettlement"] = decimal.NewFromInt(1)
-	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil || IsFatal(err) {
-		t.Fatalf("RunNew() error = %v, want ordinary underfunded error", err)
+		t.Fatalf("Run() error = %v, want ordinary underfunded error", err)
 	}
 	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
 		t.Fatalf("payout used total instead of available: %v", fx.chain.events)
@@ -119,7 +119,7 @@ func TestBuilderRewardDelayedVisibilityConvergesWithinFinitePolling(t *testing.T
 	fx := newFixture(t)
 	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
 	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{zero, zero}
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
 	if got := countDelay(fx.sleeper.delays, builderConvergenceInterval); got != 2 {
@@ -133,19 +133,40 @@ func TestBuilderRewardDelayedVisibilityConvergesWithinFinitePolling(t *testing.T
 func TestBuilderConvergenceExhaustionIsOrdinaryError(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.balances["0xbuilder"] = decimal.Zero
-	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil || IsFatal(err) {
-		t.Fatalf("RunNew() error = %v, want ordinary error", err)
+		t.Fatalf("Run() error = %v, want ordinary error", err)
 	}
 	if got := countDelay(fx.sleeper.delays, builderConvergenceInterval); got != builderConvergenceAttempts-1 {
 		t.Fatalf("convergence delays = %d, want %d", got, builderConvergenceAttempts-1)
 	}
 }
 
+func TestRecordValidationFailureArchivesOnceAndIsFatal(t *testing.T) {
+	fx := newFixture(t)
+	fx.repo.records = []Record{
+		{ID: 2, PeriodStartAt: 20, Amount: "1"},
+		{ID: 1, PeriodStartAt: 10, Amount: "-0.1"},
+	}
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
+	if err == nil || !IsFatal(err) {
+		t.Fatalf("Run() error = %v, want fatal validation error", err)
+	}
+	if fx.store.archiveResult != "failed_validation" || fx.store.current != nil {
+		t.Fatalf("archive = %q, current = %#v", fx.store.archiveResult, fx.store.current)
+	}
+	if got := fx.store.archived.Manifest.Records; len(got) != 2 || got[0].ID != 1 || got[1].ID != 2 {
+		t.Fatalf("archived records = %#v", got)
+	}
+	if len(fx.chain.events) != 0 {
+		t.Fatalf("chain events after validation failure = %v", fx.chain.events)
+	}
+}
+
 func TestRejectedPayoutBlocksWithoutBalanceObservation(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.payoutResult = exchange.SubmitResult{Rejected: true}
-	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil || !IsFatal(err) || fx.store.current != nil {
 		t.Fatalf("error = %v, current = %#v", err, fx.store.current)
 	}
@@ -159,7 +180,7 @@ func TestBuilderFailuresDoNotBlockPreFundedPayout(t *testing.T) {
 	fx.chain.claimResult = exchange.SubmitResult{Rejected: true}
 	fx.chain.balanceErrors["0xbuilder"] = errors.New("unavailable")
 	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
 	if fx.store.archiveResult != "completed" {
@@ -236,12 +257,40 @@ func TestRecoverConfirmedPayoutOnlyCompletesDatabase(t *testing.T) {
 	}
 }
 
+func TestRunRecoversCurrentWithoutStartingAnotherRun(t *testing.T) {
+	fx := newFixture(t)
+	manifest, err := BuildManifest(ManifestInput{
+		Records:    []Record{{ID: 99, PeriodStartAt: 1, Amount: "0"}},
+		Settlement: "0xsettlement", Recipient: "0xrecipient",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.store.current = &RunState{
+		RunID: "existing", Trigger: TriggerUTC, UTCDate: "2026-07-11",
+		Phase: PhasePrepared, Manifest: manifest,
+	}
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if fx.repo.listCalls != 0 {
+		t.Fatalf("ListPending() calls = %d, want 0", fx.repo.listCalls)
+	}
+	if !equalUint64(fx.repo.completedIDs, []uint64{99}) {
+		t.Fatalf("completed IDs = %v, want recovered record only", fx.repo.completedIDs)
+	}
+	if len(fx.chain.events) != 0 {
+		t.Fatalf("chain events = %v, want no second run", fx.chain.events)
+	}
+}
+
 func TestPayoutIsNotSubmittedUntilBothDurableBoundariesSucceed(t *testing.T) {
 	fx := newFixture(t)
 	fx.store.failPhase = PhasePayoutSubmitting
-	err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart)
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil {
-		t.Fatal("RunNew() error = nil")
+		t.Fatal("Run() error = nil")
 	}
 	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
 		t.Fatalf("payout submitted after state save failure: %v", fx.chain.events)
@@ -251,10 +300,10 @@ func TestPayoutIsNotSubmittedUntilBothDurableBoundariesSucceed(t *testing.T) {
 	}
 }
 
-func TestRunNewNoDataArchivesWithoutChainMutation(t *testing.T) {
+func TestRunNoDataArchivesWithoutChainMutation(t *testing.T) {
 	fx := newFixture(t)
 	fx.repo.records = nil
-	if err := fx.orchestrator.RunNew(context.Background(), TriggerRunOnStart); err != nil {
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
 	if len(fx.chain.events) != 0 || fx.store.archiveResult != "" {
@@ -297,7 +346,7 @@ func newFixture(t *testing.T) *fixture {
 	clock := fixedClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
 		Repository: repo, Store: store, Chain: chain, Notifier: notifier,
-		Builders:   []Builder{{Name: "builder", Address: "0xbuilder"}},
+		Builders:   []string{"0xbuilder"},
 		Settlement: "0xsettlement", Recipient: "0xrecipient",
 		Clock: clock, Nonce: &fakeNonce{next: uint64(clock.now.UnixMilli())}, Sleeper: sleeper,
 	})
@@ -322,9 +371,11 @@ func (f *fixture) positiveState(t *testing.T, phase Phase) RunState {
 type fakeRepository struct {
 	records      []Record
 	completedIDs []uint64
+	listCalls    int
 }
 
 func (r *fakeRepository) ListPending(context.Context) ([]Record, error) {
+	r.listCalls++
 	return append([]Record(nil), r.records...), nil
 }
 func (r *fakeRepository) Complete(_ context.Context, ids []uint64) error {
@@ -341,7 +392,6 @@ type fakeStore struct {
 	metadata      StateLoadMetadata
 }
 
-func (s *fakeStore) Load(context.Context) (*RunState, error) { return cloneState(s.current), nil }
 func (s *fakeStore) LoadWithMetadata(context.Context) (*RunState, StateLoadMetadata, error) {
 	return cloneState(s.current), s.metadata, nil
 }
@@ -424,11 +474,10 @@ func (s *fakeSleeper) Sleep(ctx context.Context, delay time.Duration) error {
 
 type fakeNotifier struct{ alerts []string }
 
-func (n *fakeNotifier) Alert(_ context.Context, key, _ string) error {
+func (n *fakeNotifier) Alert(_ context.Context, key, _ string) {
 	n.alerts = append(n.alerts, key)
-	return nil
 }
-func (n *fakeNotifier) Report(context.Context, string, string) error { return nil }
+func (n *fakeNotifier) Report(context.Context, string, string) {}
 
 type fixedClock struct{ now time.Time }
 

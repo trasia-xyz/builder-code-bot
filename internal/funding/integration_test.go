@@ -38,13 +38,13 @@ func TestIntegrationFundingFlow(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			env := newIntegrationEnvironment(t, test.ambiguousPayout)
-			if err := env.orchestrator.RunNew(context.Background(), funding.TriggerRunOnStart); err != nil {
+			if err := env.orchestrator.Run(context.Background(), funding.TriggerRunOnStart); err != nil {
 				t.Fatal(err)
 			}
 			if !env.repository.completed {
 				t.Fatal("repository was not completed")
 			}
-			current, err := env.store.Load(context.Background())
+			current, _, err := env.store.LoadWithMetadata(context.Background())
 			if err != nil || current != nil {
 				t.Fatalf("current state = %#v, error = %v", current, err)
 			}
@@ -130,7 +130,7 @@ func newIntegrationEnvironment(t *testing.T, ambiguousPayout bool) *integrationE
 	clock := fixedIntegrationClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	orchestrator, err := funding.NewOrchestrator(funding.OrchestratorConfig{
 		Repository: repository, Store: store, Chain: chain,
-		Builders:   []funding.Builder{{Name: "one", Address: addresses[0]}, {Name: "two", Address: addresses[1]}},
+		Builders:   []string{addresses[0], addresses[1]},
 		Settlement: addresses[2], Recipient: integrationRecipient,
 		Clock: clock, Nonce: signing.NewNonceGenerator(), Sleeper: noWaitSleeper{},
 	})

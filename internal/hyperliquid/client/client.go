@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -16,64 +15,33 @@ import (
 )
 
 const (
-	MainnetBaseURL = "https://api.hyperliquid.xyz"
-	TestnetBaseURL = "https://api.hyperliquid-testnet.xyz"
+	mainnetBaseURL = "https://api.hyperliquid.xyz"
+	testnetBaseURL = "https://api.hyperliquid-testnet.xyz"
 
-	DefaultTimeout          = 10 * time.Second
-	DefaultMaxResponseBytes = 2 << 20
+	defaultTimeout          = 10 * time.Second
+	defaultMaxResponseBytes = 2 << 20
 
 	endpointExchange = "/exchange"
 	endpointInfo     = "/info"
 )
 
 type Config struct {
-	Network          hyperliquid.Network
-	BaseURL          string
-	HTTPClient       *http.Client
-	Timeout          time.Duration
-	MaxResponseBytes int64
-	UserAgent        string
+	Network hyperliquid.Network
+	BaseURL string
 }
 
 type Client struct {
-	baseURL          *url.URL
-	httpClient       *http.Client
-	maxResponseBytes int64
-	userAgent        string
+	baseURL    *url.URL
+	httpClient *http.Client
 }
 
 type Response struct {
-	Endpoint   string
-	StatusCode int
-	Header     http.Header
-	Body       []byte
-}
-
-type StatusError struct {
-	Endpoint   string
-	StatusCode int
-	Status     string
-	Body       []byte
-	RetryAfter time.Duration
-}
-
-func (e *StatusError) Error() string {
-	if e == nil {
-		return ""
-	}
-	if e.RetryAfter > 0 {
-		return fmt.Sprintf("hyperliquid %s returned %s, retry_after=%s", e.Endpoint, e.Status, e.RetryAfter)
-	}
-	return fmt.Sprintf("hyperliquid %s returned %s", e.Endpoint, e.Status)
-}
-
-func (e *StatusError) RateLimited() bool {
-	return e != nil && e.StatusCode == http.StatusTooManyRequests
+	Body []byte
 }
 
 func New(cfg Config) (*Client, error) {
 	network := hyperliquid.NormalizeNetwork(cfg.Network)
-	defaultURL, err := BaseURLForNetwork(network)
+	defaultURL, err := baseURLForNetwork(network)
 	if err != nil {
 		return nil, err
 	}
@@ -85,30 +53,17 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = DefaultTimeout
-	}
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: cfg.Timeout}
-	}
-	if cfg.MaxResponseBytes <= 0 {
-		cfg.MaxResponseBytes = DefaultMaxResponseBytes
-	}
 	return &Client{
-		baseURL:          baseURL,
-		httpClient:       httpClient,
-		maxResponseBytes: cfg.MaxResponseBytes,
-		userAgent:        strings.TrimSpace(cfg.UserAgent),
+		baseURL: baseURL, httpClient: &http.Client{Timeout: defaultTimeout},
 	}, nil
 }
 
-func BaseURLForNetwork(network hyperliquid.Network) (string, error) {
+func baseURLForNetwork(network hyperliquid.Network) (string, error) {
 	switch hyperliquid.NormalizeNetwork(network) {
 	case hyperliquid.NetworkMainnet:
-		return MainnetBaseURL, nil
+		return mainnetBaseURL, nil
 	case hyperliquid.NetworkTestnet:
-		return TestnetBaseURL, nil
+		return testnetBaseURL, nil
 	default:
 		return "", fmt.Errorf("unsupported hyperliquid network %q", network)
 	}
@@ -149,21 +104,18 @@ func (c *Client) post(ctx context.Context, endpoint string, request any, raw jso
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if c.userAgent != "" {
-		req.Header.Set("User-Agent", c.userAgent)
-	}
 	httpResponse, err := c.httpClient.Do(req)
 	if err != nil {
 		return Response{}, fmt.Errorf("post hyperliquid %s: %w", endpoint, err)
 	}
 	defer httpResponse.Body.Close()
-	body, err := readResponseBody(httpResponse.Body, c.maxResponseBytes)
+	body, err := readResponseBody(httpResponse.Body)
 	if err != nil {
 		return Response{}, fmt.Errorf("read hyperliquid %s response: %w", endpoint, err)
 	}
-	response := Response{Endpoint: endpoint, StatusCode: httpResponse.StatusCode, Header: httpResponse.Header.Clone(), Body: body}
+	response := Response{Body: body}
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
-		return response, &StatusError{Endpoint: endpoint, StatusCode: httpResponse.StatusCode, Status: httpResponse.Status, Body: body, RetryAfter: parseRetryAfter(httpResponse.Header.Get("Retry-After"))}
+		return response, fmt.Errorf("hyperliquid %s returned %s", endpoint, httpResponse.Status)
 	}
 	if out != nil {
 		if err := json.Unmarshal(body, out); err != nil {
@@ -194,32 +146,13 @@ func parseBaseURL(value string) (*url.URL, error) {
 	return u, nil
 }
 
-func readResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
-	if maxBytes <= 0 {
-		maxBytes = DefaultMaxResponseBytes
-	}
-	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+func readResponseBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, defaultMaxResponseBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("body exceeds %d bytes", maxBytes)
+	if int64(len(data)) > defaultMaxResponseBytes {
+		return nil, fmt.Errorf("body exceeds %d bytes", defaultMaxResponseBytes)
 	}
 	return data, nil
-}
-
-func parseRetryAfter(value string) time.Duration {
-	value = strings.TrimSpace(value)
-	seconds, err := strconv.ParseInt(value, 10, 64)
-	if err == nil && seconds > 0 {
-		return time.Duration(seconds) * time.Second
-	}
-	when, err := http.ParseTime(value)
-	if err == nil {
-		delay := time.Until(when)
-		if delay > 0 {
-			return delay
-		}
-	}
-	return 0
 }
