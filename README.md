@@ -67,6 +67,19 @@ Always use the same working directory because state is stored in `./data`.
 ./bin/builder-code-bot -config ./config.toml --run-on-start
 ```
 
+To verify EC2 credentials, network access, and SES delivery without starting
+the funding runtime, send one test email and exit:
+
+```sh
+./bin/builder-code-bot -config ./config.toml --test-ses
+```
+
+The test always uses `[aws]` and `[notification.ses]` and intentionally ignores
+`notification.enabled`, so SES can be verified before runtime notifications are
+enabled. It does not decrypt private keys, initialize MySQL, acquire the funding
+process lock, or start the scheduler. `--test-ses` and `--run-on-start` cannot be
+used together.
+
 Startup always recovers `data/current.json` before starting a new run. The data
 directory retains `LOCK`, checksummed current and backup snapshots, and history
 archives. Confirmed payouts enter unlimited MySQL retry and are never sent

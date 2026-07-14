@@ -13,6 +13,33 @@ func TestParseOptionsDefaults(t *testing.T) {
 	if opts.RunOnStart {
 		t.Fatal("run-on-start default = true, want false")
 	}
+	if opts.TestSES {
+		t.Fatal("test-ses default = true, want false")
+	}
+}
+
+func TestParseOptionsUsesTestSESBooleanValue(t *testing.T) {
+	for _, tt := range []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{"-test-ses"}, want: true},
+		{args: []string{"-test-ses=false"}, want: false},
+	} {
+		opts, err := parseOptions(tt.args)
+		if err != nil {
+			t.Fatalf("parseOptions(%v) error = %v", tt.args, err)
+		}
+		if opts.TestSES != tt.want {
+			t.Fatalf("parseOptions(%v) TestSES = %v, want %v", tt.args, opts.TestSES, tt.want)
+		}
+	}
+}
+
+func TestParseOptionsRejectsTestSESWithRunOnStart(t *testing.T) {
+	if _, err := parseOptions([]string{"-test-ses", "-run-on-start"}); err == nil {
+		t.Fatal("parseOptions() error = nil, want mutually exclusive flag error")
+	}
 }
 
 func TestParseOptionsUsesRunOnStartBooleanValue(t *testing.T) {

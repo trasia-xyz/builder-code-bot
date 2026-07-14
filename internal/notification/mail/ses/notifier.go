@@ -43,11 +43,20 @@ func NewNotifier(client api, opts Options) (*Notifier, error) {
 	if client == nil {
 		return nil, ErrNilClient
 	}
-	opts = normalizeOptions(opts)
-	if err := validateOptions(opts); err != nil {
+	var err error
+	opts, err = validateAndNormalizeOptions(opts)
+	if err != nil {
 		return nil, err
 	}
 	return &Notifier{client: client, opts: opts}, nil
+}
+
+func validateAndNormalizeOptions(opts Options) (Options, error) {
+	opts = normalizeOptions(opts)
+	if err := validateOptions(opts); err != nil {
+		return Options{}, err
+	}
+	return opts, nil
 }
 
 func (n *Notifier) Notify(ctx context.Context, msg notification.Message) error {

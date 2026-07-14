@@ -17,6 +17,9 @@ func NewClient(ctx context.Context, cfg config.AWSConfig) (*awsses.Client, error
 	if err := cfg.NormalizeAndValidate(); err != nil {
 		return nil, err
 	}
+	if cfg.Region == "" {
+		return nil, fmt.Errorf("AWS region is required for SES")
+	}
 	loadOptions := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(cfg.Region)}
 	if cfg.Profile != "" {
 		loadOptions = append(loadOptions, awsconfig.WithSharedConfigProfile(cfg.Profile))
@@ -29,12 +32,16 @@ func NewClient(ctx context.Context, cfg config.AWSConfig) (*awsses.Client, error
 }
 
 func New(ctx context.Context, awsCfg config.AWSConfig, sesCfg config.SESConfig) (*Notifier, error) {
+	opts, err := validateAndNormalizeOptions(Options{
+		Source: sesCfg.From, To: cloneStrings(sesCfg.To), ReplyTo: cloneStrings(sesCfg.ReplyTo),
+		SubjectPrefix: sesCfg.SubjectPrefix,
+	})
+	if err != nil {
+		return nil, err
+	}
 	client, err := NewClient(ctx, awsCfg)
 	if err != nil {
 		return nil, err
 	}
-	return NewNotifier(client, Options{
-		Source: sesCfg.From, To: cloneStrings(sesCfg.To), ReplyTo: cloneStrings(sesCfg.ReplyTo),
-		SubjectPrefix: sesCfg.SubjectPrefix,
-	})
+	return &Notifier{client: client, opts: opts}, nil
 }

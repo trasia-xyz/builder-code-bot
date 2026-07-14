@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsses "github.com/aws/aws-sdk-go-v2/service/ses"
 
+	"builder-code-bot/internal/config"
 	"builder-code-bot/internal/notification"
 )
 
@@ -54,6 +55,25 @@ func TestNewNotifierRejectsEmptyRecipients(t *testing.T) {
 	_, err := NewNotifier(&fakeSES{}, Options{Source: "sender@example.com", To: []string{" ", ""}})
 	if err == nil || !strings.Contains(err.Error(), "to recipients") {
 		t.Fatalf("NewNotifier() error = %v", err)
+	}
+}
+
+func TestNewValidatesEmailOptionsBeforeLoadingAWSConfig(t *testing.T) {
+	t.Parallel()
+	_, err := New(context.Background(), config.AWSConfig{}, config.SESConfig{})
+	if err == nil || !strings.Contains(err.Error(), "ses source") {
+		t.Fatalf("New() error = %v, want SES source validation error", err)
+	}
+}
+
+func TestNewRequiresAWSRegion(t *testing.T) {
+	t.Parallel()
+	_, err := New(context.Background(), config.AWSConfig{}, config.SESConfig{
+		From: "sender@example.com",
+		To:   []string{"ops@example.com"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "AWS region") {
+		t.Fatalf("New() error = %v, want AWS region validation error", err)
 	}
 }
 

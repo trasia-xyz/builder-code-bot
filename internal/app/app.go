@@ -31,6 +31,7 @@ const defaultConfigPath = "./config.toml"
 type Options struct {
 	ConfigPath string
 	RunOnStart bool
+	TestSES    bool
 }
 
 type scheduledRunner interface {
@@ -57,16 +58,7 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		return nil, fmt.Errorf("load configuration: %w", err)
 	}
 
-	logger := logging.New(logging.Config{
-		Format:    cfg.Logging.Format,
-		Level:     cfg.Logging.Level,
-		Color:     cfg.Logging.Color,
-		AddSource: cfg.Logging.AddSource,
-		SensitiveKeys: []string{
-			"decrypt_password", "private_key", "encrypted_private_key", "signature", "signed_request",
-		},
-	})
-	logging.SetDefault(logger)
+	logger := configureLogger(cfg)
 
 	notifier, err := buildNotifier(ctx, cfg)
 	if err != nil {
@@ -150,6 +142,20 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		orchestrator: orchestrator, scheduler: utcScheduler,
 		db: db, processLock: processLock,
 	}, nil
+}
+
+func configureLogger(cfg config.Config) logging.Logger {
+	logger := logging.New(logging.Config{
+		Format:    cfg.Logging.Format,
+		Level:     cfg.Logging.Level,
+		Color:     cfg.Logging.Color,
+		AddSource: cfg.Logging.AddSource,
+		SensitiveKeys: []string{
+			"decrypt_password", "private_key", "encrypted_private_key", "signature", "signed_request",
+		},
+	})
+	logging.SetDefault(logger)
+	return logger
 }
 
 func (a *App) Run(ctx context.Context) error {

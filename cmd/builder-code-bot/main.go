@@ -31,6 +31,9 @@ func run(args []string) (err error) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if opts.TestSES {
+		return app.SendSESTestEmail(ctx, opts.ConfigPath)
+	}
 
 	service, err := app.New(ctx, opts)
 	if err != nil {
@@ -52,11 +55,15 @@ func parseOptions(args []string) (app.Options, error) {
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&opts.ConfigPath, "config", opts.ConfigPath, "configuration file path")
 	fs.BoolVar(&opts.RunOnStart, "run-on-start", false, "run one funding cycle during startup")
+	fs.BoolVar(&opts.TestSES, "test-ses", false, "send one SES test email and exit")
 	if err := fs.Parse(args); err != nil {
 		return app.Options{}, err
 	}
 	if fs.NArg() != 0 {
 		return app.Options{}, fmt.Errorf("unexpected positional arguments: %v", fs.Args())
+	}
+	if opts.TestSES && opts.RunOnStart {
+		return app.Options{}, fmt.Errorf("-test-ses and -run-on-start cannot be used together")
 	}
 	return opts, nil
 }
