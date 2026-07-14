@@ -34,13 +34,15 @@ type Scheduler struct {
 	now      func() time.Time
 	newTimer func(time.Duration) Timer
 	onError  func(error)
+	onWait   func(time.Time)
 }
 
-func New(onError func(error)) *Scheduler {
+func New(onError func(error), onWait func(time.Time)) *Scheduler {
 	return &Scheduler{
 		now:      time.Now,
 		newTimer: func(delay time.Duration) Timer { return systemTimer{Timer: time.NewTimer(delay)} },
 		onError:  onError,
+		onWait:   onWait,
 	}
 }
 
@@ -65,16 +67,20 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context) error) er
 			return err
 		}
 		now := s.now()
-		delay := NextUTCMidnight(now).Sub(now)
+		nextRunAt := NextUTCMidnight(now)
 		if retries > 0 {
-			delay = NonfatalRetryDelay
+			nextRunAt = now.UTC().Add(NonfatalRetryDelay)
 		}
+		delay := nextRunAt.Sub(now)
 		if delay < 0 {
-			return fmt.Errorf("next UTC midnight precedes current time")
+			return fmt.Errorf("next scheduled run precedes current time")
 		}
 		timer := s.newTimer(delay)
 		if timer == nil || timer.Chan() == nil {
 			return fmt.Errorf("scheduler timer is not initialized")
+		}
+		if s.onWait != nil {
+			s.onWait(nextRunAt)
 		}
 		select {
 		case <-ctx.Done():

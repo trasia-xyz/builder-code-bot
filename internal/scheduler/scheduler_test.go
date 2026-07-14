@@ -57,6 +57,7 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 	timers := make(chan *fakeTimer, 2)
 	var delaysMu sync.Mutex
 	var delays []time.Duration
+	var nextRuns []time.Time
 	s := &Scheduler{
 		now: now,
 		newTimer: func(delay time.Duration) Timer {
@@ -66,6 +67,11 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 			delaysMu.Unlock()
 			timers <- timer
 			return timer
+		},
+		onWait: func(nextRunAt time.Time) {
+			delaysMu.Lock()
+			nextRuns = append(nextRuns, nextRunAt)
+			delaysMu.Unlock()
 		},
 	}
 	callbackErr := errors.New("run failed")
@@ -108,6 +114,18 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 	for i := range want {
 		if delays[i] != want[i] {
 			t.Errorf("delay[%d] = %s, want %s", i, delays[i], want[i])
+		}
+	}
+	wantNextRuns := []time.Time{
+		time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 11, 0, 1, 30, 0, time.UTC),
+	}
+	if len(nextRuns) != len(wantNextRuns) {
+		t.Fatalf("next runs = %v, want %v", nextRuns, wantNextRuns)
+	}
+	for i := range wantNextRuns {
+		if !nextRuns[i].Equal(wantNextRuns[i]) {
+			t.Errorf("next run[%d] = %s, want %s", i, nextRuns[i], wantNextRuns[i])
 		}
 	}
 }

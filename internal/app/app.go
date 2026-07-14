@@ -132,12 +132,20 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		return nil, err
 	}
 
-	utcScheduler := scheduler.New(func(runErr error) {
-		logger.Error(context.Background(), "scheduled funding run failed",
-			slog.String("event", "scheduled_funding_run_failed"),
-			slog.String("error", sanitizeRuntimeError(runErr)),
-		)
-	})
+	utcScheduler := scheduler.New(
+		func(runErr error) {
+			logger.Error(context.Background(), "scheduled funding run failed",
+				slog.String("event", "scheduled_funding_run_failed"),
+				slog.String("error", sanitizeRuntimeError(runErr)),
+			)
+		},
+		func(nextRunAt time.Time) {
+			logger.Info(context.Background(), "next funding run scheduled",
+				slog.String("event", "funding_next_run_scheduled"),
+				slog.Time("next_run_at", nextRunAt),
+			)
+		},
+	)
 	return &App{
 		orchestrator: orchestrator, scheduler: utcScheduler,
 		db: db, processLock: processLock,
