@@ -7,7 +7,9 @@
 ```sh
 go test ./... -count=1
 go test -race ./... -count=1
+go vet ./...
 staticcheck ./...
+unparam ./...
 ```
 
 集成测试使用本地 HTTP Hyperliquid mock 和真实签名，覆盖明确成功、拒绝、响应不确定但已
