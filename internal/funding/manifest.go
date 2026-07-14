@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sort"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/hyperliquid/info"
 
 	"github.com/shopspring/decimal"
 )

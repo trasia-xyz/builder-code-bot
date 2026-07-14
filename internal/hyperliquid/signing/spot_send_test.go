@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/secret"
 )
 
 const spotSendTestPrivateKey = "0x822e9959e022b78423eb653a62ea0020cd283e71a2a8133a6ff2aeffaf373cff"

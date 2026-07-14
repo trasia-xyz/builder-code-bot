@@ -15,9 +15,9 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/signing"
+	"builder-code-bot/internal/hyperliquid"
+	"builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/hyperliquid/signing"
 )
 
 // FailureMode controls the response to the next exchange request.

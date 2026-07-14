@@ -9,7 +9,7 @@ import (
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/secret"
 )
 
 // PrivateKey wraps an Ethereum secp256k1 private key and masks itself when

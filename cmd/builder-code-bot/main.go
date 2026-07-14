@@ -10,8 +10,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"hyperliquid-builder-code-bot/internal/app"
-	"hyperliquid-builder-code-bot/internal/logging"
+	"builder-code-bot/internal/app"
+	"builder-code-bot/internal/logging"
 )
 
 func main() {

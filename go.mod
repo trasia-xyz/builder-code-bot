@@ -1,4 +1,4 @@
-module hyperliquid-builder-code-bot
+module builder-code-bot
 
 go 1.25.0
 

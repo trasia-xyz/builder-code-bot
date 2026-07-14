@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"hyperliquid-builder-code-bot/internal/crypt/keycipher"
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/crypt/keycipher"
+	"builder-code-bot/internal/secret"
 )
 
 const testPrivateKeyHex = "0x0000000000000000000000000000000000000000000000000000000000000001"

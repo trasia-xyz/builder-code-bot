@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/secret"
 )
 
 func TestLoggerWritesStructuredJSON(t *testing.T) {
@@ -745,7 +745,7 @@ func TestConsoleSourceUsesRepoRelativePath(t *testing.T) {
 }
 
 func TestTrimSourceFileRemovesProjectRoot(t *testing.T) {
-	got := trimSourceFile(filepath.Join("/tmp/build", "hyperliquid-builder-code-bot", "internal", "logging", "logging.go"))
+	got := trimSourceFile(filepath.Join("/tmp/build", "builder-code-bot", "internal", "logging", "logging.go"))
 	if got != "internal/logging/logging.go" {
 		t.Fatalf("unexpected trimmed source path: %q", got)
 	}
@@ -756,8 +756,8 @@ func TestModuleDirectoryName(t *testing.T) {
 		modulePath string
 		want       string
 	}{
-		{modulePath: "hyperliquid-builder-code-bot", want: "hyperliquid-builder-code-bot"},
-		{modulePath: "github.com/org/hyperliquid-builder-code-bot", want: "hyperliquid-builder-code-bot"},
+		{modulePath: "builder-code-bot", want: "builder-code-bot"},
+		{modulePath: "github.com/org/builder-code-bot", want: "builder-code-bot"},
 		{modulePath: "  github.com/org/service  ", want: "service"},
 		{modulePath: "", want: ""},
 		{modulePath: "command-line-arguments", want: ""},
@@ -779,7 +779,7 @@ func TestTrimSourceFileFallbacks(t *testing.T) {
 		want string
 	}{
 		{name: "empty", file: "", want: ""},
-		{name: "already relative with repo", file: "hyperliquid-builder-code-bot/internal/logging/logging.go", want: "internal/logging/logging.go"},
+		{name: "already relative with repo", file: "builder-code-bot/internal/logging/logging.go", want: "internal/logging/logging.go"},
 		{name: "unrelated absolute", file: "/tmp/other/logging.go", want: "/tmp/other/logging.go"},
 	}
 
@@ -840,7 +840,7 @@ func TestSourceRootDirectoryDoesNotCacheMiss(t *testing.T) {
 
 func TestTrimSourceAttr(t *testing.T) {
 	attr := trimSourceAttr(slog.Any(slog.SourceKey, &slog.Source{
-		File: "/tmp/build/hyperliquid-builder-code-bot/internal/logging/logging.go",
+		File: "/tmp/build/builder-code-bot/internal/logging/logging.go",
 		Line: 12,
 	}))
 

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/secret"
 )
 
 const testKey = "0x0000000000000000000000000000000000000000000000000000000000000001"

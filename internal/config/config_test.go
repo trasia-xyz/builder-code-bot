@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"hyperliquid-builder-code-bot/internal/logging"
+	"builder-code-bot/internal/logging"
 )
 
 const (

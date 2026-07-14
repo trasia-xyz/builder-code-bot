@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"strings"
 
+	"builder-code-bot/internal/hyperliquid"
+	httpclient "builder-code-bot/internal/hyperliquid/client"
+	"builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/hyperliquid/signing"
+
 	"github.com/shopspring/decimal"
-	"hyperliquid-builder-code-bot/internal/hyperliquid"
-	httpclient "hyperliquid-builder-code-bot/internal/hyperliquid/client"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/signing"
 )
 
 type Transport interface {

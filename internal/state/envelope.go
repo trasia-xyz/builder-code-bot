@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"hyperliquid-builder-code-bot/internal/funding"
+	"builder-code-bot/internal/funding"
 )
 
 const schemaVersion = 1

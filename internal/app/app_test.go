@@ -8,12 +8,12 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"hyperliquid-builder-code-bot/internal/config"
-	"hyperliquid-builder-code-bot/internal/crypt/keycipher"
-	"hyperliquid-builder-code-bot/internal/funding"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/signing"
-	"hyperliquid-builder-code-bot/internal/secret"
-	"hyperliquid-builder-code-bot/internal/state"
+	"builder-code-bot/internal/config"
+	"builder-code-bot/internal/crypt/keycipher"
+	"builder-code-bot/internal/funding"
+	"builder-code-bot/internal/hyperliquid/signing"
+	"builder-code-bot/internal/secret"
+	"builder-code-bot/internal/state"
 )
 
 const testPrivateKey = "0x0000000000000000000000000000000000000000000000000000000000000001"

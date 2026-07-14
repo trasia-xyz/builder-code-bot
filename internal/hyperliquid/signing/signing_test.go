@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/signing"
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/hyperliquid"
+	"builder-code-bot/internal/hyperliquid/signing"
+	"builder-code-bot/internal/secret"
 )
 
 const (

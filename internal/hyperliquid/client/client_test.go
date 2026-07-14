@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid"
+	"builder-code-bot/internal/hyperliquid"
 )
 
 func TestInfoPostsJSONAndDecodesResponse(t *testing.T) {

@@ -1,6 +1,6 @@
 package signing
 
-import "hyperliquid-builder-code-bot/internal/hyperliquid/wire"
+import "builder-code-bot/internal/hyperliquid/wire"
 
 type Field = wire.Field
 type Object = wire.Object

@@ -3,7 +3,7 @@ package funding
 import (
 	"testing"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/hyperliquid/info"
 )
 
 func TestBuildManifestNormalizesRecordOrderAndTotals(t *testing.T) {

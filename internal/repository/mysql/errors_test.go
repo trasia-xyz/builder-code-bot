@@ -12,8 +12,8 @@ import (
 
 	drivermysql "github.com/go-sql-driver/mysql"
 
-	"hyperliquid-builder-code-bot/internal/config"
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/config"
+	"builder-code-bot/internal/secret"
 )
 
 func TestIsRetryable(t *testing.T) {

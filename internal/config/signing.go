@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"strings"
 
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/secret"
 )
 
 var addressPattern = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)

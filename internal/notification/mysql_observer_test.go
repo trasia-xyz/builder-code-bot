@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/logging"
+	"builder-code-bot/internal/logging"
 )
 
 func TestMySQLRetryObserverAlertsAndRecoversOncePerOutage(t *testing.T) {

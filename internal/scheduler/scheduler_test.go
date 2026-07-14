@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/funding"
+	"builder-code-bot/internal/funding"
 )
 
 func TestNextUTCMidnight(t *testing.T) {

@@ -10,8 +10,8 @@ import (
 	awsses "github.com/aws/aws-sdk-go-v2/service/ses"
 	"github.com/aws/aws-sdk-go-v2/service/ses/types"
 
-	"hyperliquid-builder-code-bot/internal/notification"
-	notificationmail "hyperliquid-builder-code-bot/internal/notification/mail"
+	"builder-code-bot/internal/notification"
+	notificationmail "builder-code-bot/internal/notification/mail"
 )
 
 const charset = "UTF-8"

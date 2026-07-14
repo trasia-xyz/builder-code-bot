@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"hyperliquid-builder-code-bot/internal/funding"
+	"builder-code-bot/internal/funding"
 )
 
 type fundingRunner interface {

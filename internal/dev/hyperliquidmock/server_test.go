@@ -6,12 +6,12 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid"
-	httpclient "hyperliquid-builder-code-bot/internal/hyperliquid/client"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/exchange"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/signing"
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/hyperliquid"
+	httpclient "builder-code-bot/internal/hyperliquid/client"
+	"builder-code-bot/internal/hyperliquid/exchange"
+	"builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/hyperliquid/signing"
+	"builder-code-bot/internal/secret"
 )
 
 const mockPrivateKey = "0x0000000000000000000000000000000000000000000000000000000000000001"

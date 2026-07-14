@@ -7,7 +7,7 @@ import (
 	"sync"
 	"unicode"
 
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/secret"
 )
 
 const redactedValue = secret.Masked

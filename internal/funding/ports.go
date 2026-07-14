@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid/exchange"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/hyperliquid/exchange"
+	"builder-code-bot/internal/hyperliquid/info"
 
 	"github.com/shopspring/decimal"
 )

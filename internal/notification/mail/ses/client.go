@@ -7,7 +7,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awsses "github.com/aws/aws-sdk-go-v2/service/ses"
 
-	"hyperliquid-builder-code-bot/internal/config"
+	"builder-code-bot/internal/config"
 )
 
 func NewClient(ctx context.Context, cfg config.AWSConfig) (*awsses.Client, error) {

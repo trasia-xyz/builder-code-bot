@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	httpclient "builder-code-bot/internal/hyperliquid/client"
+
 	"github.com/shopspring/decimal"
-	httpclient "hyperliquid-builder-code-bot/internal/hyperliquid/client"
 )
 
 type Transport interface {

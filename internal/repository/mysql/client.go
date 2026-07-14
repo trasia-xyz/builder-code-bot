@@ -8,7 +8,7 @@ import (
 
 	drivermysql "github.com/go-sql-driver/mysql"
 
-	"hyperliquid-builder-code-bot/internal/config"
+	"builder-code-bot/internal/config"
 )
 
 const (

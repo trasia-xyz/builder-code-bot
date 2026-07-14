@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"hyperliquid-builder-code-bot/internal/logging"
+	"builder-code-bot/internal/logging"
 )
 
 type LoggingConfig struct {

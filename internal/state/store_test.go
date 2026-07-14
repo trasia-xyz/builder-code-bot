@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/funding"
+	"builder-code-bot/internal/funding"
 )
 
 func TestStoreLoadReturnsNilWhenNoSnapshotExists(t *testing.T) {

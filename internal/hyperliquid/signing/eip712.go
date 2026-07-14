@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math/big"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid"
+	"builder-code-bot/internal/hyperliquid"
 )
 
 var (

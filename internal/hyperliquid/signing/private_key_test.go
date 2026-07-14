@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/secret"
 )
 
 func TestPrivateKeyAddress(t *testing.T) {

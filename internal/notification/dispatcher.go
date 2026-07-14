@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/logging"
-	"hyperliquid-builder-code-bot/internal/repository/mysql"
+	"builder-code-bot/internal/logging"
+	"builder-code-bot/internal/repository/mysql"
 )
 
 const (

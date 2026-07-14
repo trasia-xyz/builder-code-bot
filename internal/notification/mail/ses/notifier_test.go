@@ -9,7 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsses "github.com/aws/aws-sdk-go-v2/service/ses"
 
-	"hyperliquid-builder-code-bot/internal/notification"
+	"builder-code-bot/internal/notification"
 )
 
 func TestNotifierBuildsUTF8PlainTextEmail(t *testing.T) {

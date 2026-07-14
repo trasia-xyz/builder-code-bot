@@ -8,7 +8,7 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid"
+	"builder-code-bot/internal/hyperliquid"
 )
 
 type Signature struct {

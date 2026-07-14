@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid"
+	"builder-code-bot/internal/hyperliquid"
 )
 
 const (

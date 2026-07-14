@@ -3,8 +3,8 @@ package funding
 import (
 	"time"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid/exchange"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/hyperliquid/exchange"
+	"builder-code-bot/internal/hyperliquid/info"
 )
 
 type Record struct {

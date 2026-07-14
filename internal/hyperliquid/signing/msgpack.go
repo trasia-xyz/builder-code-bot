@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 
-	"hyperliquid-builder-code-bot/internal/hyperliquid/wire"
+	"builder-code-bot/internal/hyperliquid/wire"
 )
 
 func packMsgpack(value any) ([]byte, error) {

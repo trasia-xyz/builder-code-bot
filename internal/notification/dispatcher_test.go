@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"hyperliquid-builder-code-bot/internal/logging"
+	"builder-code-bot/internal/logging"
 )
 
 type recordingNotifier struct {

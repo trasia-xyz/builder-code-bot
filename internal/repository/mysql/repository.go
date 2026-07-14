@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"hyperliquid-builder-code-bot/internal/funding"
+	"builder-code-bot/internal/funding"
 )
 
 const (

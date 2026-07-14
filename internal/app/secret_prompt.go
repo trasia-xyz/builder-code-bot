@@ -8,10 +8,10 @@ import (
 
 	"github.com/charmbracelet/x/term"
 
-	"hyperliquid-builder-code-bot/internal/config"
-	"hyperliquid-builder-code-bot/internal/crypt/keycipher"
-	"hyperliquid-builder-code-bot/internal/hyperliquid/signing"
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/config"
+	"builder-code-bot/internal/crypt/keycipher"
+	"builder-code-bot/internal/hyperliquid/signing"
+	"builder-code-bot/internal/secret"
 )
 
 type SecretPrompt interface {

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"hyperliquid-builder-code-bot/internal/secret"
+	"builder-code-bot/internal/secret"
 )
 
 type MySQLConfig struct {
