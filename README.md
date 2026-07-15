@@ -55,8 +55,9 @@ Configuration is decoded as strict TOML; unknown fields are rejected.
 
 Verify that every configured address matches the address printed by `keytool`.
 Builders, settlement, and recipient must satisfy the separation checks in the
-configuration. Keep `signing.decrypt_password` empty in production to read it
-once from a controlling TTY at startup.
+configuration: recipient must be non-zero and differ from every builder and
+settlement. Keep `signing.decrypt_password` empty in production to read it once
+from a controlling TTY at startup.
 
 ## Run
 

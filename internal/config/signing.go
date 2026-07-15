@@ -8,6 +8,8 @@ import (
 	"builder-code-bot/internal/secret"
 )
 
+const zeroAddress = "0x0000000000000000000000000000000000000000"
+
 var addressPattern = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
 
 type SigningConfig struct {
@@ -79,8 +81,15 @@ func (cfg *Config) normalizeAndValidateAccounts() error {
 	if !addressPattern.MatchString(cfg.Payout.RecipientAddress) {
 		return fmt.Errorf("recipient address must match %s", addressPattern)
 	}
+	recipientAddress := strings.ToLower(cfg.Payout.RecipientAddress)
+	if recipientAddress == zeroAddress {
+		return fmt.Errorf("recipient address must not be the zero address")
+	}
 	if strings.EqualFold(cfg.Payout.RecipientAddress, cfg.Settlement.Address) {
 		return fmt.Errorf("recipient address must differ from settlement address")
+	}
+	if _, exists := addresses[recipientAddress]; exists {
+		return fmt.Errorf("recipient address must differ from builder addresses")
 	}
 	return nil
 }

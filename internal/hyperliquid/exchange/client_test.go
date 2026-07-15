@@ -103,15 +103,20 @@ func TestSubmitClassifiesExplicitExchangeRejection(t *testing.T) {
 	}
 }
 
-func TestSubmitClassifiesRejectionBodyReturnedWithTransportError(t *testing.T) {
-	transport := &recordingTransport{
-		response: json.RawMessage(`{"status":"err","response":"bad nonce"}`),
-		err:      errors.New("exchange returned HTTP 422"),
-	}
-	c, _ := newTestClient(t, hyperliquid.NetworkTestnet, transport)
-	result, err := c.Submit(context.Background(), PreparedAction{RequestBody: json.RawMessage(`{"nonce":1}`)})
-	if err == nil || !result.Rejected || result.Accepted {
-		t.Fatalf("result = %#v, error = %v", result, err)
+func TestSubmitTreatsBodyReturnedWithTransportErrorAsUncertain(t *testing.T) {
+	for _, status := range []string{"ok", "err"} {
+		t.Run(status, func(t *testing.T) {
+			body := json.RawMessage(`{"status":"` + status + `","response":"gateway body"}`)
+			transport := &recordingTransport{
+				response: body,
+				err:      errors.New("exchange returned HTTP 503"),
+			}
+			c, _ := newTestClient(t, hyperliquid.NetworkTestnet, transport)
+			result, err := c.Submit(context.Background(), PreparedAction{RequestBody: json.RawMessage(`{"nonce":1}`)})
+			if err == nil || result.Accepted || result.Rejected || string(result.Response) != string(body) {
+				t.Fatalf("result = %#v, error = %v", result, err)
+			}
+		})
 	}
 }
 

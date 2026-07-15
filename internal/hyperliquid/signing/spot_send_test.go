@@ -10,6 +10,40 @@ import (
 
 const spotSendTestPrivateKey = "0x822e9959e022b78423eb653a62ea0020cd283e71a2a8133a6ff2aeffaf373cff"
 
+func TestSignSpotSendMatchesOfficialPythonSDKVectors(t *testing.T) {
+	// Generated with hyperliquid-python-sdk commit
+	// 2fdb18f9517675ea03695a0962bd19eece9c83f0 and eth-account 0.13.5.
+	tests := []struct {
+		chain string
+		want  Signature
+	}{
+		{chain: "Mainnet", want: Signature{
+			R: "0x8c62a0f4d31d07b48b3abf3b522baecd0580650b2993811fc2677f031d0ed709",
+			S: "0x7cb40b3b2f236222afe6f83d7bfe5200cfeb53e2f8f67b7dc696ef9e149c8008",
+			V: 27,
+		}},
+		{chain: "Testnet", want: Signature{
+			R: "0xab20adb87d454931f60d069620d13a31a17d5a0be2d99b26c7096ab1783213b4",
+			S: "0x154423ba62674549cbd857173173b204a18b55e855f0621fa56e2743516b5270",
+			V: 27,
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.chain, func(t *testing.T) {
+			action := testSpotSendAction()
+			action.HyperliquidChain = test.chain
+			got, err := SignSpotSend(testSpotSendPrivateKey(t), action)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("SignSpotSend() = %+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSignSpotSendRecoversSigner(t *testing.T) {
 	action := testSpotSendAction()
 	key := testSpotSendPrivateKey(t)

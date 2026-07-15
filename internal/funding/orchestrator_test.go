@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -316,6 +317,37 @@ func TestRunRecoversCurrentWithoutStartingAnotherRun(t *testing.T) {
 	}
 }
 
+func TestRunRecoveryReportUsesFinalPhase(t *testing.T) {
+	fx := newFixture(t)
+	state := fx.positiveState(t, PhasePayoutSubmitting)
+	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 904), TotalBefore: "2"}
+	fx.store.current = &state
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("0.5")
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if len(fx.notifier.reports) != 1 || !strings.Contains(fx.notifier.reports[0], "phase: payout_confirmed") {
+		t.Fatalf("reports = %#v", fx.notifier.reports)
+	}
+}
+
+func TestNewOrchestratorRejectsUnsafeRecipient(t *testing.T) {
+	fx := newFixture(t)
+	for _, recipient := range []string{"0xbuilder", zeroEthereumAddress} {
+		t.Run(recipient, func(t *testing.T) {
+			_, err := NewOrchestrator(OrchestratorConfig{
+				Repository: fx.repo, Store: fx.store, Chain: fx.chain,
+				Builders: []string{"0xbuilder"}, Settlement: "0xsettlement", Recipient: recipient,
+				Clock: fx.clock, Nonce: &fakeNonce{next: 1}, Sleeper: fx.sleeper,
+			})
+			if err == nil || !strings.Contains(err.Error(), "recipient") {
+				t.Fatalf("NewOrchestrator() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestPayoutIsNotSubmittedUntilBothDurableBoundariesSucceed(t *testing.T) {
 	fx := newFixture(t)
 	fx.store.failPhase = PhasePayoutSubmitting
@@ -508,12 +540,17 @@ func (s *fakeSleeper) Sleep(ctx context.Context, delay time.Duration) error {
 	return nil
 }
 
-type fakeNotifier struct{ alerts []string }
+type fakeNotifier struct {
+	alerts  []string
+	reports []string
+}
 
 func (n *fakeNotifier) Alert(_ context.Context, key, _ string) {
 	n.alerts = append(n.alerts, key)
 }
-func (n *fakeNotifier) Report(context.Context, string, string) {}
+func (n *fakeNotifier) Report(_ context.Context, _ string, message string) {
+	n.reports = append(n.reports, message)
+}
 
 type fakeLogEntry struct {
 	level string

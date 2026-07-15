@@ -47,6 +47,7 @@ type Orchestrator struct {
 const (
 	builderConvergenceAttempts = 5
 	builderConvergenceInterval = time.Second
+	zeroEthereumAddress        = "0x0000000000000000000000000000000000000000"
 )
 
 func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
@@ -70,8 +71,15 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 		}
 		seen[address] = struct{}{}
 	}
-	if strings.EqualFold(strings.TrimSpace(cfg.Settlement), strings.TrimSpace(cfg.Recipient)) {
+	recipient := strings.TrimSpace(cfg.Recipient)
+	if strings.EqualFold(recipient, zeroEthereumAddress) {
+		return nil, fmt.Errorf("recipient account must not be the zero address")
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.Settlement), recipient) {
 		return nil, fmt.Errorf("settlement and recipient accounts must differ")
+	}
+	if _, controlled := seen[strings.ToLower(recipient)]; controlled {
+		return nil, fmt.Errorf("recipient account must not be a builder")
 	}
 	sleeper := cfg.Sleeper
 	if sleeper == nil {

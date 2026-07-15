@@ -160,6 +160,22 @@ func TestLoadFileRejectsRecipientSettlementAddress(t *testing.T) {
 	}
 }
 
+func TestLoadFileRejectsRecipientBuilderAddress(t *testing.T) {
+	content := strings.Replace(validConfig(), recipientAddress, builderOneAddress, 1)
+	_, err := LoadFile(writeConfig(t, content))
+	if err == nil || !strings.Contains(err.Error(), "recipient") {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+}
+
+func TestLoadFileRejectsZeroRecipientAddress(t *testing.T) {
+	content := strings.Replace(validConfig(), recipientAddress, zeroAddress, 1)
+	_, err := LoadFile(writeConfig(t, content))
+	if err == nil || !strings.Contains(err.Error(), "zero address") {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+}
+
 func TestLoadFileRequiresBuilder(t *testing.T) {
 	content := validConfig()
 	start := strings.Index(content, "[[builders]]")

@@ -27,7 +27,7 @@ func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) (err error) {
 		report.recordCount = len(current.Manifest.Records)
 		report.recordsRead = true
 		report.outcome = "completed"
-		return o.recoverState(ctx, *current, metadata)
+		return o.recoverState(ctx, current, metadata)
 	}
 	return o.runNew(ctx, trigger, &report)
 }
@@ -41,10 +41,10 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 	if err != nil || current == nil {
 		return err
 	}
-	return o.recoverState(ctx, *current, metadata)
+	return o.recoverState(ctx, current, metadata)
 }
 
-func (o *Orchestrator) recoverState(ctx context.Context, state RunState, metadata StateLoadMetadata) (err error) {
+func (o *Orchestrator) recoverState(ctx context.Context, state *RunState, metadata StateLoadMetadata) (err error) {
 	o.info(ctx, "funding recovery started",
 		slog.String("event", "recovery_started"), slog.String("run_id", state.RunID),
 		slog.String("phase", string(state.Phase)),
@@ -60,21 +60,21 @@ func (o *Orchestrator) recoverState(ctx context.Context, state RunState, metadat
 	switch state.Phase {
 	case PhasePrepared:
 		if state.Manifest.PayoutTotal == "0" {
-			return o.completeDatabase(ctx, &state)
+			return o.completeDatabase(ctx, state)
 		}
-		return o.runPositive(ctx, &state)
+		return o.runPositive(ctx, state)
 	case PhasePayoutPrepared:
 		// A primary payout_prepared state proves that submission never started.
 		// A backup at the same phase may be one boundary behind a submitted
 		// primary, so it must use balance observation instead of resubmission.
 		if metadata.RecoveredFromBackup {
-			return o.observeUncertainPayout(ctx, &state)
+			return o.observeUncertainPayout(ctx, state)
 		}
-		return o.submitPreparedPayout(ctx, &state)
+		return o.submitPreparedPayout(ctx, state)
 	case PhasePayoutSubmitting:
-		return o.observeUncertainPayout(ctx, &state)
+		return o.observeUncertainPayout(ctx, state)
 	case PhasePayoutConfirmed:
-		return o.completeDatabase(ctx, &state)
+		return o.completeDatabase(ctx, state)
 	case PhaseBlocked:
 		if state.BlockedReason == "" {
 			state.BlockedReason = "funding run is blocked"

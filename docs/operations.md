@@ -30,6 +30,7 @@ chmod 0600 config.toml
 
 Builder 与 settlement 必须全部为我方账户。Settlement 必须是本服务专用出账账户，不得
 人工或由其他程序转出 spot USDC；否则 total 下降不能作为 payout 成功证据。
+Recipient 必须是非零地址，并且不得与任一 builder 或 settlement 相同。
 
 ## 启动与调度
 

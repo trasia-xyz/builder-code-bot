@@ -68,7 +68,8 @@ Builder 列表来自当前配置，不属于 payout 恢复数据。
 这保证 primary 与 backup 至少各持有一份完整付款意图。Submit response body 会完整写入
 结构化日志，但不写入 durable state；完整签名请求始终不写日志。
 
-提交结果分三类：
+只有成功 HTTP transport 返回的 `status = ok/err` 才属于明确结果。非 2xx、网络错误或无法解析的
+响应即使携带类似 JSON body，也一律视为不确定。提交结果分三类：
 
 | 结果 | 行为 |
 | --- | --- |
