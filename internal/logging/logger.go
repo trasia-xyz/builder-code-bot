@@ -87,7 +87,7 @@ func redactReplaceAttr(keys []string) func(groups []string, attr slog.Attr) slog
 		if attr.Key == slog.SourceKey {
 			return trimSourceAttr(attr)
 		}
-		if attr.Key == consolePrefixKey {
+		if attr.Key == consolePrefixKey || attr.Key == consoleSeparatorKey {
 			return slog.Attr{}
 		}
 		return matcher.redactKey(attr, joinGroupKey(groups, attr.Key))

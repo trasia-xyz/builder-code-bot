@@ -58,7 +58,9 @@ run。启动阶段失败会直接返回，由值守人员处理。进入 UTC Sch
 
 输入私钥解密密码后，日志会依次报告私钥初始化、MySQL pool、进程锁、current 检查和
 pending records 查询。进入 Scheduler 等待后会通过 `next_run_at` 报告下一轮执行时间；失败
-重试前也会更新该时间。MySQL pool 使用延迟连接，真正的首次建连发生在 pending 查询期间。
+重试前也会更新该时间。控制台格式会在每次 funding task 或启动恢复检查前插入空行，并用
+`==========` 标记起始日志，便于区分相邻轮次；JSON 格式不插入展示用分隔。MySQL pool 使用
+延迟连接，真正的首次建连发生在 pending 查询期间。
 
 ## 状态与备份
 

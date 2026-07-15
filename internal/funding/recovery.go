@@ -4,12 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+
+	"builder-code-bot/internal/logging"
 )
+
+const fundingTaskConsolePrefix = "=========="
 
 func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) (err error) {
 	report := runReport{trigger: trigger}
 	defer func() { o.reportRun(ctx, report, err) }()
 	o.info(ctx, "funding task started",
+		logging.ConsoleSeparator(),
+		logging.ConsolePrefix(fundingTaskConsolePrefix),
 		slog.String("event", "funding_task_started"),
 		slog.String("trigger", string(trigger)))
 	current, metadata, err := o.loadCurrent(ctx)
@@ -28,6 +34,8 @@ func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) (err error) {
 
 func (o *Orchestrator) Recover(ctx context.Context) error {
 	o.info(ctx, "funding recovery check started",
+		logging.ConsoleSeparator(),
+		logging.ConsolePrefix(fundingTaskConsolePrefix),
 		slog.String("event", "funding_recovery_check_started"))
 	current, metadata, err := o.loadCurrent(ctx)
 	if err != nil || current == nil {

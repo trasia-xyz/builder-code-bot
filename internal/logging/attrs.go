@@ -5,7 +5,10 @@ import (
 	"time"
 )
 
-const consolePrefixKey = "_console_prefix"
+const (
+	consolePrefixKey    = "_console_prefix"
+	consoleSeparatorKey = "_console_separator"
+)
 
 func Component(value string) slog.Attr {
 	return slog.String("component", value)
@@ -33,6 +36,13 @@ func Dex(value string) slog.Attr {
 
 func ConsolePrefix(value string) slog.Attr {
 	return slog.String(consolePrefixKey, value)
+}
+
+// ConsoleSeparator inserts a blank line before the log record in console
+// format. JSON output drops the presentation-only attribute so it remains
+// valid newline-delimited JSON.
+func ConsoleSeparator() slog.Attr {
+	return slog.Bool(consoleSeparatorKey, true)
 }
 
 func Err(err error) slog.Attr {

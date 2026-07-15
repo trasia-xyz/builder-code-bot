@@ -474,6 +474,49 @@ func TestJSONDropsConsolePrefix(t *testing.T) {
 	}
 }
 
+func TestConsoleSeparatorAddsBlankLineBeforeRecord(t *testing.T) {
+	buf := new(bytes.Buffer)
+	logger := New(Config{Format: FormatConsole, Output: buf})
+
+	logger.Info(context.Background(), "funding task started",
+		ConsoleSeparator(),
+		ConsolePrefix("=========="),
+		String("event", "funding_task_started"),
+	)
+
+	output := buf.String()
+	if !strings.HasPrefix(output, "\n") {
+		t.Fatalf("separator did not add a blank line: %q", output)
+	}
+	if !strings.Contains(output, "INFO  ========== funding task started") {
+		t.Fatalf("task marker was not placed before the message: %q", output)
+	}
+	if strings.Contains(output, consoleSeparatorKey) {
+		t.Fatalf("console separator leaked as key=value: %q", output)
+	}
+}
+
+func TestJSONDropsConsoleSeparator(t *testing.T) {
+	buf := new(bytes.Buffer)
+	logger := New(Config{Format: FormatJSON, Output: buf})
+
+	logger.Info(context.Background(), "funding task started",
+		ConsoleSeparator(),
+		String("event", "funding_task_started"),
+	)
+
+	event := decodeEvent(t, buf.String())
+	if event["msg"] != "funding task started" {
+		t.Fatalf("unexpected msg: %#v", event["msg"])
+	}
+	if _, ok := event[consoleSeparatorKey]; ok {
+		t.Fatalf("console separator leaked into json: %#v", event)
+	}
+	if event["event"] != "funding_task_started" {
+		t.Fatalf("ordinary attrs missing from json: %#v", event)
+	}
+}
+
 func TestConsoleFormatExpandsGroupsAndEscapesValues(t *testing.T) {
 	buf := new(bytes.Buffer)
 	handler := newConsoleHandler(buf, slog.LevelDebug, false, false, []string{"secret"})

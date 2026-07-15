@@ -61,13 +61,14 @@ func (h *consoleHandler) Handle(_ context.Context, record slog.Record) error {
 	}
 
 	var prefixValue string
+	var separator bool
 	groupPrefix := strings.Join(h.groups, ".")
 	fields := make([]string, 0, len(h.attrs)+record.NumAttrs()+1)
 	for _, attr := range h.attrs {
-		h.appendAttr(&fields, &prefixValue, groupPrefix, attr)
+		h.appendAttr(&fields, &prefixValue, &separator, groupPrefix, attr)
 	}
 	record.Attrs(func(attr slog.Attr) bool {
-		h.appendAttr(&fields, &prefixValue, groupPrefix, attr)
+		h.appendAttr(&fields, &prefixValue, &separator, groupPrefix, attr)
 		return true
 	})
 	if h.addSource && record.PC != 0 {
@@ -83,6 +84,9 @@ func (h *consoleHandler) Handle(_ context.Context, record slog.Record) error {
 		line += " " + strings.Join(fields, " ")
 	}
 	line += "\n"
+	if separator {
+		line = "\n" + line
+	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -105,7 +109,13 @@ func (h *consoleHandler) WithGroup(name string) slog.Handler {
 	return &next
 }
 
-func (h *consoleHandler) appendAttr(fields *[]string, prefixValue *string, prefix string, attr slog.Attr) {
+func (h *consoleHandler) appendAttr(
+	fields *[]string,
+	prefixValue *string,
+	separator *bool,
+	prefix string,
+	attr slog.Attr,
+) {
 	if isEmptyAttr(attr) {
 		return
 	}
@@ -119,11 +129,22 @@ func (h *consoleHandler) appendAttr(fields *[]string, prefixValue *string, prefi
 		}
 		return
 	}
+	if attr.Key == consoleSeparatorKey {
+		// Like ConsolePrefix, the separator is presentation-only and only
+		// applies at the top level. Drop nested occurrences entirely.
+		if prefix == "" {
+			value := attr.Value.Resolve()
+			if value.Kind() == slog.KindBool {
+				*separator = value.Bool()
+			}
+		}
+		return
+	}
 	key := joinKey(prefix, attr.Key)
 	if attr.Value.Kind() == slog.KindGroup {
 		nextPrefix := key
 		for _, child := range attr.Value.Group() {
-			h.appendAttr(fields, prefixValue, nextPrefix, child)
+			h.appendAttr(fields, prefixValue, separator, nextPrefix, child)
 		}
 		return
 	}
@@ -135,7 +156,7 @@ func (h *consoleHandler) appendAttr(fields *[]string, prefixValue *string, prefi
 	if attr.Value.Kind() == slog.KindGroup {
 		nextPrefix := joinKey(prefix, attr.Key)
 		for _, child := range attr.Value.Group() {
-			h.appendAttr(fields, prefixValue, nextPrefix, child)
+			h.appendAttr(fields, prefixValue, separator, nextPrefix, child)
 		}
 		return
 	}
