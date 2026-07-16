@@ -246,6 +246,10 @@ func (c hyperliquidChain) SpotBalance(ctx context.Context, address string, token
 	return c.info.SpotBalance(ctx, address, token)
 }
 
+func (c hyperliquidChain) UserRateLimit(ctx context.Context, address string) (info.UserRateLimit, error) {
+	return c.info.UserRateLimit(ctx, address)
+}
+
 func (c hyperliquidChain) PrepareClaim(address string, nonce uint64) (exchange.PreparedAction, error) {
 	return c.exchange.PrepareClaim(address, nonce)
 }

@@ -63,6 +63,7 @@ type Server struct {
 
 	balances     map[balanceKey]spotBalance
 	claimRewards map[balanceKey]decimal.Decimal
+	rateLimits   map[string]info.UserRateLimit
 	requests     []RecordedRequest
 	nextFailure  FailureMode
 	outcomes     map[string]exchangeOutcome
@@ -74,6 +75,7 @@ func New(t testing.TB) *Server {
 	s := &Server{
 		balances:     make(map[balanceKey]spotBalance),
 		claimRewards: make(map[balanceKey]decimal.Decimal),
+		rateLimits:   make(map[string]info.UserRateLimit),
 		outcomes:     make(map[string]exchangeOutcome),
 	}
 	s.server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
@@ -110,6 +112,16 @@ func (s *Server) SetClaimReward(address, token, amount string) {
 	}
 	s.mu.Lock()
 	s.claimRewards[balanceKey{address: normalizeAddress(address), token: token}] = value
+	s.mu.Unlock()
+}
+
+// SetUserRateLimit sets the address-based action request counters for an account.
+func (s *Server) SetUserRateLimit(address string, used, cap uint64) {
+	s.mu.Lock()
+	s.rateLimits[normalizeAddress(address)] = info.UserRateLimit{
+		NRequestsUsed: used,
+		NRequestsCap:  cap,
+	}
 	s.mu.Unlock()
 }
 
@@ -175,6 +187,13 @@ func (s *Server) handleInfo(w http.ResponseWriter, body []byte) {
 		response := struct {
 			Balances []info.SpotBalance `json:"balances"`
 		}{Balances: []info.SpotBalance{{Coin: token.Name, Token: token.Index, Total: value.total.String(), Hold: value.hold.String()}}}
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, response)
+	case "userRateLimit":
+		response, exists := s.rateLimits[normalizeAddress(request.User)]
+		if !exists {
+			response.NRequestsCap = 10_000
+		}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
 	default:

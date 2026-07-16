@@ -31,6 +31,7 @@ type Repository interface {
 type Chain interface {
 	CanonicalUSDC(context.Context) (info.Token, error)
 	SpotBalance(context.Context, string, info.Token) (info.SpotBalanceAmounts, error)
+	UserRateLimit(context.Context, string) (info.UserRateLimit, error)
 	PrepareClaim(string, uint64) (exchange.PreparedAction, error)
 	PrepareSpotSend(string, string, info.Token, decimal.Decimal, uint64) (exchange.PreparedAction, error)
 	Submit(context.Context, exchange.PreparedAction) (exchange.SubmitResult, error)

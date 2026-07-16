@@ -168,6 +168,9 @@ func (c *integrationChain) CanonicalUSDC(ctx context.Context) (info.Token, error
 func (c *integrationChain) SpotBalance(ctx context.Context, address string, token info.Token) (info.SpotBalanceAmounts, error) {
 	return c.info.SpotBalance(ctx, address, token)
 }
+func (c *integrationChain) UserRateLimit(ctx context.Context, address string) (info.UserRateLimit, error) {
+	return c.info.UserRateLimit(ctx, address)
+}
 func (c *integrationChain) PrepareClaim(address string, nonce uint64) (exchange.PreparedAction, error) {
 	return c.exchange.PrepareClaim(address, nonce)
 }

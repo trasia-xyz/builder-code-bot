@@ -33,3 +33,17 @@ type SpotBalanceAmounts struct {
 	Total     decimal.Decimal
 	Available decimal.Decimal
 }
+
+type UserRateLimit struct {
+	CumVlm           string `json:"cumVlm"`
+	NRequestsUsed    uint64 `json:"nRequestsUsed"`
+	NRequestsCap     uint64 `json:"nRequestsCap"`
+	NRequestsSurplus uint64 `json:"nRequestsSurplus"`
+}
+
+func (limit UserRateLimit) RemainingRequests() uint64 {
+	if limit.NRequestsUsed >= limit.NRequestsCap {
+		return 0
+	}
+	return limit.NRequestsCap - limit.NRequestsUsed
+}

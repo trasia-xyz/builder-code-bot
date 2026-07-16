@@ -42,6 +42,7 @@ type Orchestrator struct {
 	sleeper    Sleeper
 	alertMu    sync.Mutex
 	alerts     map[string]struct{}
+	lowLimits  map[string]struct{}
 }
 
 const (
@@ -91,7 +92,8 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 		builders:   append([]string(nil), cfg.Builders...),
 		settlement: cfg.Settlement, recipient: cfg.Recipient,
 		clock: cfg.Clock, nonce: cfg.Nonce, sleeper: sleeper,
-		alerts: make(map[string]struct{}),
+		alerts:    make(map[string]struct{}),
+		lowLimits: make(map[string]struct{}),
 	}, nil
 }
 

@@ -92,3 +92,28 @@ func (c *Client) SpotBalance(ctx context.Context, address string, token Token) (
 	}
 	return SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}, nil
 }
+
+func (c *Client) UserRateLimit(ctx context.Context, address string) (UserRateLimit, error) {
+	if c == nil || c.transport == nil {
+		return UserRateLimit{}, fmt.Errorf("hyperliquid info transport is nil")
+	}
+	var response struct {
+		CumVlm           string  `json:"cumVlm"`
+		NRequestsUsed    *uint64 `json:"nRequestsUsed"`
+		NRequestsCap     *uint64 `json:"nRequestsCap"`
+		NRequestsSurplus uint64  `json:"nRequestsSurplus"`
+	}
+	_, err := c.transport.Info(ctx, map[string]any{"type": "userRateLimit", "user": address}, &response)
+	if err != nil {
+		return UserRateLimit{}, fmt.Errorf("query user rate limit: %w", err)
+	}
+	if response.NRequestsUsed == nil || response.NRequestsCap == nil {
+		return UserRateLimit{}, fmt.Errorf("query user rate limit: response is missing request counts")
+	}
+	return UserRateLimit{
+		CumVlm:           response.CumVlm,
+		NRequestsUsed:    *response.NRequestsUsed,
+		NRequestsCap:     *response.NRequestsCap,
+		NRequestsSurplus: response.NRequestsSurplus,
+	}, nil
+}

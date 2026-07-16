@@ -74,6 +74,143 @@ func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
 	})
 }
 
+func TestRunObservesBuilderAndSettlementRateLimits(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.trackRateLimitUsage = true
+	fx.chain.rateLimits["0xbuilder"] = info.UserRateLimit{
+		NRequestsUsed: 798,
+		NRequestsCap:  1000,
+	}
+	fx.chain.rateLimits["0xsettlement"] = info.UserRateLimit{
+		NRequestsUsed: 800,
+		NRequestsCap:  1000,
+	}
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range []string{"0xbuilder", "0xsettlement"} {
+		if got := fx.chain.rateLimitCalls[address]; got != 1 {
+			t.Fatalf("UserRateLimit(%s) calls = %d, want 1", address, got)
+		}
+	}
+	assertRateLimitLog(t, fx.logger, "0xbuilder", "info", map[string]any{
+		"account_kind": "builder", "requests_remaining": uint64(200),
+	})
+	assertRateLimitLog(t, fx.logger, "0xsettlement", "warn", map[string]any{
+		"account_kind": "settlement", "requests_remaining": uint64(199),
+	})
+	if len(fx.notifier.alerts) != 1 || fx.notifier.alerts[0] != "user_rate_limit_low:0xsettlement" {
+		t.Fatalf("alerts = %#v, want settlement rate limit alert", fx.notifier.alerts)
+	}
+	wantAlertMessage := "Hyperliquid user rate limit is low\naccount kind: settlement\naddress: 0xsettlement\nrequests remaining: 199"
+	if fx.notifier.alertMessages[0] != wantAlertMessage {
+		t.Fatalf("alert message = %q, want %q", fx.notifier.alertMessages[0], wantAlertMessage)
+	}
+}
+
+func TestRunObservesRateLimitsAfterOrdinaryAndFatalFailures(t *testing.T) {
+	for _, test := range []struct {
+		name                    string
+		configure               func(*fixture)
+		wantFatal               bool
+		wantBuilderRemaining    uint64
+		wantSettlementRemaining uint64
+	}{
+		{
+			name: "ordinary underfunded failure",
+			configure: func(fx *fixture) {
+				fx.chain.balances["0xbuilder"] = decimal.Zero
+			},
+			wantBuilderRemaining:    9_999,
+			wantSettlementRemaining: 10_000,
+		},
+		{
+			name: "fatal rejected payout",
+			configure: func(fx *fixture) {
+				fx.chain.payoutResult = exchange.SubmitResult{Rejected: true}
+			},
+			wantFatal:               true,
+			wantBuilderRemaining:    9_998,
+			wantSettlementRemaining: 9_999,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.chain.trackRateLimitUsage = true
+			test.configure(fx)
+
+			err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
+			if err == nil || IsFatal(err) != test.wantFatal {
+				t.Fatalf("Run() error = %v, fatal = %v, want fatal %v", err, IsFatal(err), test.wantFatal)
+			}
+			assertRateLimitLog(t, fx.logger, "0xbuilder", "info", map[string]any{
+				"requests_remaining": test.wantBuilderRemaining,
+			})
+			assertRateLimitLog(t, fx.logger, "0xsettlement", "info", map[string]any{
+				"requests_remaining": test.wantSettlementRemaining,
+			})
+		})
+	}
+}
+
+func TestRunUsesUncanceledContextForFinalRateLimitObservation(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.respectRateLimitContext = true
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := fx.orchestrator.Run(ctx, TriggerRunOnStart)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context canceled", err)
+	}
+	assertRateLimitLog(t, fx.logger, "0xbuilder", "info", map[string]any{
+		"requests_remaining": uint64(10_000),
+	})
+}
+
+func TestRateLimitQueryFailureDoesNotBlockFunding(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.rateLimitErrors["0xbuilder"] = errors.New("unavailable")
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	assertLogFields(t, fx.logger, "funding_user_rate_limit_query_failed", map[string]any{
+		"account_kind": "builder", "address": "0xbuilder",
+	})
+	if fx.store.archiveResult != "completed" {
+		t.Fatalf("archive = %q, want completed", fx.store.archiveResult)
+	}
+}
+
+func TestRateLimitAlertIsLatchedUntilTheAccountRecovers(t *testing.T) {
+	fx := newFixture(t)
+	fx.repo.records = nil
+	fx.chain.rateLimits["0xbuilder"] = info.UserRateLimit{NRequestsUsed: 9801, NRequestsCap: 10_000}
+
+	for range 2 {
+		if err := fx.orchestrator.Run(context.Background(), TriggerUTC); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(fx.notifier.alerts) != 1 {
+		t.Fatalf("alerts while continuously low = %#v, want one", fx.notifier.alerts)
+	}
+
+	fx.chain.rateLimits["0xbuilder"] = info.UserRateLimit{NRequestsUsed: 9800, NRequestsCap: 10_000}
+	if err := fx.orchestrator.Run(context.Background(), TriggerUTC); err != nil {
+		t.Fatal(err)
+	}
+	fx.chain.rateLimits["0xbuilder"] = info.UserRateLimit{NRequestsUsed: 9801, NRequestsCap: 10_000}
+	if err := fx.orchestrator.Run(context.Background(), TriggerUTC); err != nil {
+		t.Fatal(err)
+	}
+	if len(fx.notifier.alerts) != 2 {
+		t.Fatalf("alerts after recovery and regression = %#v, want two", fx.notifier.alerts)
+	}
+}
+
 func TestUnknownPayoutConfirmsWhenSettlementBalanceDecreases(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.payoutResult = exchange.SubmitResult{}
@@ -401,6 +538,11 @@ func newFixture(t *testing.T) *fixture {
 		balanceErrors:   map[string]error{},
 		balanceSequence: map[string][]info.SpotBalanceAmounts{},
 		balanceCalls:    map[string]int{},
+		rateLimits: map[string]info.UserRateLimit{
+			"0xbuilder": {NRequestsCap: 10_000}, "0xsettlement": {NRequestsCap: 10_000},
+		},
+		rateLimitErrors: map[string]error{},
+		rateLimitCalls:  map[string]int{},
 		claimResult:     exchange.SubmitResult{Accepted: true},
 		sweepResult:     exchange.SubmitResult{Accepted: true},
 		payoutResult:    exchange.SubmitResult{Accepted: true},
@@ -479,17 +621,22 @@ func (s *fakeStore) Archive(_ context.Context, state RunState, result string) er
 func (s *fakeStore) Clear(context.Context) error { s.current = nil; return nil }
 
 type fakeChain struct {
-	token              info.Token
-	balances           map[string]decimal.Decimal
-	holds              map[string]decimal.Decimal
-	balanceErrors      map[string]error
-	balanceSequence    map[string][]info.SpotBalanceAmounts
-	balanceCalls       map[string]int
-	claimResult        exchange.SubmitResult
-	sweepResult        exchange.SubmitResult
-	payoutResult       exchange.SubmitResult
-	applyUnknownPayout bool
-	events             []string
+	token                   info.Token
+	balances                map[string]decimal.Decimal
+	holds                   map[string]decimal.Decimal
+	balanceErrors           map[string]error
+	balanceSequence         map[string][]info.SpotBalanceAmounts
+	balanceCalls            map[string]int
+	rateLimits              map[string]info.UserRateLimit
+	rateLimitErrors         map[string]error
+	rateLimitCalls          map[string]int
+	trackRateLimitUsage     bool
+	respectRateLimitContext bool
+	claimResult             exchange.SubmitResult
+	sweepResult             exchange.SubmitResult
+	payoutResult            exchange.SubmitResult
+	applyUnknownPayout      bool
+	events                  []string
 }
 
 func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) { return c.token, nil }
@@ -505,6 +652,16 @@ func (c *fakeChain) SpotBalance(_ context.Context, address string, _ info.Token)
 	}
 	return info.SpotBalanceAmounts{Total: c.balances[address], Available: c.balances[address].Sub(c.holds[address])}, nil
 }
+func (c *fakeChain) UserRateLimit(ctx context.Context, address string) (info.UserRateLimit, error) {
+	c.rateLimitCalls[address]++
+	if c.respectRateLimitContext && ctx.Err() != nil {
+		return info.UserRateLimit{}, ctx.Err()
+	}
+	if err := c.rateLimitErrors[address]; err != nil {
+		return info.UserRateLimit{}, err
+	}
+	return c.rateLimits[address], nil
+}
 func (c *fakeChain) PrepareClaim(address string, nonce uint64) (exchange.PreparedAction, error) {
 	return preparedAction(tinyTB{}, "claimRewards", address, "", "", "", nonce), nil
 }
@@ -513,6 +670,11 @@ func (c *fakeChain) PrepareSpotSend(address, destination string, token info.Toke
 }
 func (c *fakeChain) Submit(_ context.Context, action exchange.PreparedAction) (exchange.SubmitResult, error) {
 	c.events = append(c.events, "submit:"+action.Kind+":"+action.Signer)
+	if c.trackRateLimitUsage {
+		limit := c.rateLimits[action.Signer]
+		limit.NRequestsUsed++
+		c.rateLimits[action.Signer] = limit
+	}
 	if action.Kind == "claimRewards" {
 		return c.claimResult, nil
 	}
@@ -541,12 +703,14 @@ func (s *fakeSleeper) Sleep(ctx context.Context, delay time.Duration) error {
 }
 
 type fakeNotifier struct {
-	alerts  []string
-	reports []string
+	alerts        []string
+	alertMessages []string
+	reports       []string
 }
 
-func (n *fakeNotifier) Alert(_ context.Context, key, _ string) {
+func (n *fakeNotifier) Alert(_ context.Context, key, message string) {
 	n.alerts = append(n.alerts, key)
+	n.alertMessages = append(n.alertMessages, message)
 }
 func (n *fakeNotifier) Report(_ context.Context, _ string, message string) {
 	n.reports = append(n.reports, message)
@@ -590,6 +754,30 @@ func assertLogFields(t *testing.T, logger *fakeLogger, event string, want map[st
 		return
 	}
 	t.Fatalf("event %s was not logged", event)
+}
+
+func assertRateLimitLog(t *testing.T, logger *fakeLogger, address, level string, want map[string]any) {
+	t.Helper()
+	for _, entry := range logger.entries {
+		if entry.attrs["event"] != "funding_user_rate_limit_observed" || entry.attrs["address"] != address {
+			continue
+		}
+		if entry.level != level {
+			t.Fatalf("rate limit log for %s level = %q, want %q", address, entry.level, level)
+		}
+		for key, value := range want {
+			if got := entry.attrs[key]; got != value {
+				t.Fatalf("rate limit log for %s field %s = %#v, want %#v", address, key, got, value)
+			}
+		}
+		for _, key := range []string{"requests_cap", "requests_used", "alert_threshold", "below_threshold"} {
+			if _, exists := entry.attrs[key]; exists {
+				t.Fatalf("rate limit log for %s unexpectedly contains field %s", address, key)
+			}
+		}
+		return
+	}
+	t.Fatalf("rate limit observation for %s was not logged", address)
 }
 
 type fixedClock struct{ now time.Time }

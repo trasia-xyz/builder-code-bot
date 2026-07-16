@@ -121,7 +121,10 @@ ListPending 和 Complete 对瞬时 MySQL 错误无限重试，退避响应 conte
 
 结构化日志使用 16 位十六进制 run ID，并记录 record/builder 数量、raw/payout total、每个
 builder 与 settlement 的 total/hold/available、实际 sweep 数量、payout 前余额和 submit
-response。固定的 service component 不重复写入每条日志。
+response。每次 funding task 执行结束后，无论成功还是失败，都会通过 `userRateLimit` 查询所有
+builder 和 settlement，只记录 requests remaining；remaining 严格小于 200 时按账户告警。
+查询失败只记录警告，不会覆盖原任务结果或改变资金状态机；同一账户持续处于低额度
+时只告警一次，恢复到阈值后再次跌破才重新告警。固定的 service component 不重复写入每条日志。
 
 成功 funding run 等待下一 UTC 00:00。普通错误（API 暂时失败、reward 未可见、归集不足）
 约 1 分钟后重试，最多重试 5 次；全部失败则返回 retry-exhausted 错误并退出。Fatal payout

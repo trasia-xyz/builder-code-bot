@@ -13,6 +13,7 @@ const fundingTaskConsolePrefix = "=========="
 func (o *Orchestrator) Run(ctx context.Context, trigger Trigger) (err error) {
 	report := runReport{trigger: trigger}
 	defer func() { o.reportRun(ctx, report, err) }()
+	defer o.observeUserRateLimits(rateLimitObservationContext(ctx))
 	o.info(ctx, "funding task started",
 		logging.ConsoleSeparator(),
 		logging.ConsolePrefix(fundingTaskConsolePrefix),
@@ -41,6 +42,7 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 	if err != nil || current == nil {
 		return err
 	}
+	defer o.observeUserRateLimits(rateLimitObservationContext(ctx))
 	return o.recoverState(ctx, current, metadata)
 }
 

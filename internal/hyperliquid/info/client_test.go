@@ -60,9 +60,43 @@ func TestInfoClientQueriesMetadataAndBalances(t *testing.T) {
 	}
 }
 
+func TestInfoClientQueriesUserRateLimit(t *testing.T) {
+	transport := &fakeTransport{responses: []json.RawMessage{
+		json.RawMessage(`{"cumVlm":"1234.5","nRequestsUsed":9801,"nRequestsCap":10000,"nRequestsSurplus":7}`),
+	}}
+	limit, err := New(transport).UserRateLimit(context.Background(), "0xsender")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit.NRequestsUsed != 9801 || limit.NRequestsCap != 10000 || limit.RemainingRequests() != 199 {
+		t.Fatalf("rate limit = %+v, remaining = %d", limit, limit.RemainingRequests())
+	}
+	if limit.CumVlm != "1234.5" || limit.NRequestsSurplus != 7 {
+		t.Fatalf("rate limit metadata = %+v", limit)
+	}
+	request := transport.requests[0]
+	if request["type"] != "userRateLimit" || request["user"] != "0xsender" {
+		t.Fatalf("rate limit request = %#v", request)
+	}
+}
+
+func TestUserRateLimitRequiresCountsAndClampsExhaustedLimit(t *testing.T) {
+	transport := &fakeTransport{responses: []json.RawMessage{json.RawMessage(`{"cumVlm":"0"}`)}}
+	if _, err := New(transport).UserRateLimit(context.Background(), "0xsender"); err == nil {
+		t.Fatal("expected missing request counts error")
+	}
+	limit := UserRateLimit{NRequestsUsed: 10001, NRequestsCap: 10000}
+	if got := limit.RemainingRequests(); got != 0 {
+		t.Fatalf("RemainingRequests() = %d, want 0", got)
+	}
+}
+
 func TestInfoMethodsRejectNilTransport(t *testing.T) {
 	c := New(nil)
 	if _, err := c.SpotBalance(context.Background(), "0xsender", Token{}); err == nil {
+		t.Fatal("expected nil transport error")
+	}
+	if _, err := c.UserRateLimit(context.Background(), "0xsender"); err == nil {
 		t.Fatal("expected nil transport error")
 	}
 }

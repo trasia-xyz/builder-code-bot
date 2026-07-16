@@ -39,6 +39,14 @@ func TestServerProvidesSpotMetadataAndBalances(t *testing.T) {
 	if !balance.Total.Equal(decimal.RequireFromString("12.5")) || !balance.Available.Equal(decimal.RequireFromString("12.5")) {
 		t.Fatalf("balance = %+v, want total and available 12.5", balance)
 	}
+	server.SetUserRateLimit("0xabc", 9801, 10000)
+	limit, err := client.UserRateLimit(context.Background(), "0xAbC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit.RemainingRequests() != 199 {
+		t.Fatalf("remaining requests = %d, want 199", limit.RemainingRequests())
+	}
 }
 
 func TestServerAppliesSpotSendOnceForSameSignedRequest(t *testing.T) {
