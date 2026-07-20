@@ -8,6 +8,7 @@ import (
 )
 
 const (
+	dailyRunHourUTC    = 1
 	NonfatalRetryDelay = time.Minute
 	MaxNonfatalRetries = 5
 )
@@ -46,9 +47,13 @@ func New(onError func(error), onWait func(time.Time)) *Scheduler {
 	}
 }
 
-func NextUTCMidnight(now time.Time) time.Time {
+func NextDailyRunUTC(now time.Time) time.Time {
 	utc := now.UTC()
-	return time.Date(utc.Year(), utc.Month(), utc.Day()+1, 0, 0, 0, 0, time.UTC)
+	nextRunAt := time.Date(utc.Year(), utc.Month(), utc.Day(), dailyRunHourUTC, 0, 0, 0, time.UTC)
+	if !nextRunAt.After(utc) {
+		nextRunAt = nextRunAt.AddDate(0, 0, 1)
+	}
+	return nextRunAt
 }
 
 func (s *Scheduler) Run(ctx context.Context, run func(context.Context) error) error {
@@ -67,7 +72,7 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context) error) er
 			return err
 		}
 		now := s.now()
-		nextRunAt := NextUTCMidnight(now)
+		nextRunAt := NextDailyRunUTC(now)
 		if retries > 0 {
 			nextRunAt = now.UTC().Add(NonfatalRetryDelay)
 		}

@@ -5,7 +5,7 @@
 
 ## 1. 系统目标与边界
 
-服务在 UTC 00:00 运行，也可用 `--run-on-start` 在启动时立即运行。一次触发最多处理一个
+服务在 UTC 01:00 运行，也可用 `--run-on-start` 在启动时立即运行。一次触发最多处理一个
 funding run：存在 current 时只恢复该 run，不再连续创建新 run；没有 current 时才读取
 pending records 并创建新 run。
 
@@ -126,7 +126,7 @@ builder 和 settlement，只记录 requests remaining；remaining 严格小于 2
 查询失败只记录警告，不会覆盖原任务结果或改变资金状态机；同一账户持续处于低额度
 时只告警一次，恢复到阈值后再次跌破才重新告警。固定的 service component 不重复写入每条日志。
 
-成功 funding run 等待下一 UTC 00:00。普通错误（API 暂时失败、reward 未可见、归集不足）
+成功 funding run 等待下一 UTC 01:00。普通错误（API 暂时失败、reward 未可见、归集不足）
 约 1 分钟后重试，最多重试 5 次；全部失败则返回 retry-exhausted 错误并退出。Fatal payout
 错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL 自身
 的维护恢复仍无限重试。

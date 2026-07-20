@@ -84,6 +84,6 @@ used together.
 Startup always recovers `data/current.json` before starting a new run. The data
 directory retains `LOCK`, checksummed current and backup snapshots, and history
 archives. Confirmed payouts enter unlimited MySQL retry and are never sent
-again during database recovery. Successful runs wait for the next UTC midnight;
-ordinary failures retry at most five times at one-minute intervals, while
-retry exhaustion and fatal payout outcomes exit immediately.
+again during database recovery. Successful runs wait for the next daily run at
+UTC 01:00; ordinary failures retry at most five times at one-minute intervals,
+while retry exhaustion and fatal payout outcomes exit immediately.

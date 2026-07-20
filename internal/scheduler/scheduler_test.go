@@ -10,15 +10,38 @@ import (
 	"builder-code-bot/internal/funding"
 )
 
-func TestNextUTCMidnight(t *testing.T) {
-	now := time.Date(2026, 7, 10, 23, 59, 59, 0, time.FixedZone("local", 8*60*60))
-	want := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
-	if got := NextUTCMidnight(now); !got.Equal(want) {
-		t.Fatalf("NextUTCMidnight() = %s, want %s", got, want)
+func TestNextDailyRunUTC(t *testing.T) {
+	tests := []struct {
+		name string
+		now  time.Time
+		want time.Time
+	}{
+		{
+			name: "before scheduled time",
+			now:  time.Date(2026, 7, 10, 0, 59, 59, 0, time.UTC),
+			want: time.Date(2026, 7, 10, 1, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "at scheduled time",
+			now:  time.Date(2026, 7, 10, 1, 0, 0, 0, time.UTC),
+			want: time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "after scheduled time in non UTC zone",
+			now:  time.Date(2026, 7, 10, 23, 59, 59, 0, time.FixedZone("local", 8*60*60)),
+			want: time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := NextDailyRunUTC(test.now); !got.Equal(test.want) {
+				t.Fatalf("NextDailyRunUTC() = %s, want %s", got, test.want)
+			}
+		})
 	}
 }
 
-func TestNextUTCMidnightIgnoresDSTBoundaries(t *testing.T) {
+func TestNextDailyRunUTCIgnoresDSTBoundaries(t *testing.T) {
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		t.Fatal(err)
@@ -28,9 +51,9 @@ func TestNextUTCMidnightIgnoresDSTBoundaries(t *testing.T) {
 		time.Date(2026, 11, 1, 1, 59, 59, 0, location),
 	} {
 		utc := now.UTC()
-		want := time.Date(utc.Year(), utc.Month(), utc.Day()+1, 0, 0, 0, 0, time.UTC)
-		if got := NextUTCMidnight(now); !got.Equal(want) {
-			t.Errorf("NextUTCMidnight(%s) = %s, want %s", now, got, want)
+		want := time.Date(utc.Year(), utc.Month(), utc.Day()+1, 1, 0, 0, 0, time.UTC)
+		if got := NextDailyRunUTC(now); !got.Equal(want) {
+			t.Errorf("NextDailyRunUTC(%s) = %s, want %s", now, got, want)
 		}
 	}
 }
@@ -107,7 +130,7 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 
 	delaysMu.Lock()
 	defer delaysMu.Unlock()
-	want := []time.Duration{time.Hour, NonfatalRetryDelay}
+	want := []time.Duration{2 * time.Hour, NonfatalRetryDelay}
 	if len(delays) != len(want) {
 		t.Fatalf("delays = %v, want %v", delays, want)
 	}
@@ -117,7 +140,7 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 		}
 	}
 	wantNextRuns := []time.Time{
-		time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC),
 		time.Date(2026, 7, 11, 0, 1, 30, 0, time.UTC),
 	}
 	if len(nextRuns) != len(wantNextRuns) {
@@ -219,7 +242,7 @@ func TestRunExitsAfterFiveNonfatalRetries(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(delays) != MaxNonfatalRetries+1 || delays[0] != 12*time.Hour {
+	if len(delays) != MaxNonfatalRetries+1 || delays[0] != 13*time.Hour {
 		t.Fatalf("delays = %v", delays)
 	}
 	for index, delay := range delays[1:] {
