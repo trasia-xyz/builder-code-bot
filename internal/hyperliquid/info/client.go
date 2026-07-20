@@ -2,6 +2,7 @@ package info
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -91,6 +92,59 @@ func (c *Client) SpotBalance(ctx context.Context, address string, token Token) (
 		}
 	}
 	return SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}, nil
+}
+
+func (c *Client) ClaimableUSDC(ctx context.Context, address string, token Token) (decimal.Decimal, error) {
+	if c == nil || c.transport == nil {
+		return decimal.Zero, fmt.Errorf("hyperliquid info transport is nil")
+	}
+	var response struct {
+		TokenToState *[][]json.RawMessage `json:"tokenToState"`
+	}
+	_, err := c.transport.Info(ctx, map[string]any{"type": "referral", "user": address}, &response)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("query claimable USDC rewards: %w", err)
+	}
+	if response.TokenToState == nil {
+		return decimal.Zero, fmt.Errorf("claimable reward response is missing tokenToState")
+	}
+	var (
+		claimable decimal.Decimal
+		found     bool
+	)
+	for entryIndex, entry := range *response.TokenToState {
+		if len(entry) != 2 {
+			return decimal.Zero, fmt.Errorf("claimable reward token entry %d is invalid", entryIndex)
+		}
+		var tokenIndex int
+		if err := json.Unmarshal(entry[0], &tokenIndex); err != nil {
+			return decimal.Zero, fmt.Errorf("parse claimable reward token index at entry %d: %w", entryIndex, err)
+		}
+		if tokenIndex != token.Index {
+			continue
+		}
+		if found {
+			return decimal.Zero, fmt.Errorf("claimable reward response contains duplicate USDC token index %d", token.Index)
+		}
+		var state struct {
+			UnclaimedRewards string `json:"unclaimedRewards"`
+		}
+		if err := json.Unmarshal(entry[1], &state); err != nil {
+			return decimal.Zero, fmt.Errorf("parse claimable USDC reward state: %w", err)
+		}
+		claimable, err = decimal.NewFromString(state.UnclaimedRewards)
+		if err != nil {
+			return decimal.Zero, fmt.Errorf("parse claimable USDC rewards: %w", err)
+		}
+		if claimable.IsNegative() {
+			return decimal.Zero, fmt.Errorf("claimable USDC rewards are negative: %s", claimable)
+		}
+		found = true
+	}
+	if !found {
+		return decimal.Zero, nil
+	}
+	return claimable, nil
 }
 
 func (c *Client) UserRateLimit(ctx context.Context, address string) (UserRateLimit, error) {

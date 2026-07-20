@@ -37,6 +37,9 @@ func TestRunHappyPathOnlyPersistsFinalPayout(t *testing.T) {
 	if len(fx.sleeper.delays) != 0 {
 		t.Fatalf("delays = %v, want immediate convergence", fx.sleeper.delays)
 	}
+	if got := fx.chain.claimableCalls["0xbuilder"]; got != 1 {
+		t.Fatalf("ClaimableUSDC() calls = %d, want 1", got)
+	}
 	for _, saved := range fx.store.saved {
 		if saved.Payout == nil && saved.Phase != PhasePrepared {
 			t.Fatalf("unexpected state before payout journal: %#v", saved)
@@ -53,6 +56,9 @@ func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
 
 	assertLogFields(t, fx.logger, "funding_snapshot_calculated", map[string]any{
 		"record_count": int64(2), "raw_total": "1.500000000000000000", "payout_total": "1.5",
+	})
+	assertLogFields(t, fx.logger, "funding_builder_claim_eligibility_checked", map[string]any{
+		"builder": "0xbuilder", "claimable_usdc": "1.5", "threshold_usdc": "1", "eligible": true,
 	})
 	assertLogFields(t, fx.logger, "funding_builder_balance_observed", map[string]any{
 		"builder": "0xbuilder", "attempt": int64(1),
@@ -71,6 +77,50 @@ func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
 	})
 	assertLogFields(t, fx.logger, "funding_run_completed", map[string]any{
 		"record_count": int64(2), "raw_total": "1.500000000000000000", "payout_total": "1.5",
+	})
+}
+
+func TestClaimRewardIsSkippedWithoutAlertAtOrBelowThreshold(t *testing.T) {
+	for _, amount := range []string{"0", "1"} {
+		t.Run(amount, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString(amount)
+			fx.chain.balances["0xbuilder"] = decimal.Zero
+			fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+
+			if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+				t.Fatal(err)
+			}
+			if containsString(fx.chain.events, "submit:claimRewards:0xbuilder") {
+				t.Fatalf("claim was submitted with %s claimable USDC: %v", amount, fx.chain.events)
+			}
+			if len(fx.notifier.alerts) != 0 {
+				t.Fatalf("alerts = %#v, want none", fx.notifier.alerts)
+			}
+			assertLogFields(t, fx.logger, "funding_builder_claim_eligibility_checked", map[string]any{
+				"builder": "0xbuilder", "claimable_usdc": amount, "threshold_usdc": "1", "eligible": false,
+			})
+		})
+	}
+}
+
+func TestClaimableRewardQueryFailureAlertsWithoutSubmittingClaim(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableErrors["0xbuilder"] = errors.New("referral endpoint unavailable")
+	fx.chain.balances["0xbuilder"] = decimal.Zero
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if containsString(fx.chain.events, "submit:claimRewards:0xbuilder") {
+		t.Fatalf("claim was submitted after eligibility query failure: %v", fx.chain.events)
+	}
+	if len(fx.notifier.alerts) != 1 {
+		t.Fatalf("alerts = %#v, want one query failure alert", fx.notifier.alerts)
+	}
+	assertLogFields(t, fx.logger, "funding_builder_action_failed", map[string]any{
+		"builder": "0xbuilder", "action_kind": "claimRewards", "outcome": "query",
 	})
 }
 
@@ -531,6 +581,10 @@ func newFixture(t *testing.T) *fixture {
 	store := &fakeStore{}
 	chain := &fakeChain{
 		token: info.Token{Name: "USDC", TokenID: "0", WireToken: "USDC:0", WeiDecimals: 6},
+		claimableRewards: map[string]decimal.Decimal{
+			"0xbuilder": decimal.RequireFromString("1.5"),
+		},
+		claimableErrors: map[string]error{},
 		balances: map[string]decimal.Decimal{
 			"0xbuilder": decimal.RequireFromString("1.5"), "0xsettlement": decimal.Zero,
 		},
@@ -622,6 +676,9 @@ func (s *fakeStore) Clear(context.Context) error { s.current = nil; return nil }
 
 type fakeChain struct {
 	token                   info.Token
+	claimableRewards        map[string]decimal.Decimal
+	claimableErrors         map[string]error
+	claimableCalls          map[string]int
 	balances                map[string]decimal.Decimal
 	holds                   map[string]decimal.Decimal
 	balanceErrors           map[string]error
@@ -640,6 +697,16 @@ type fakeChain struct {
 }
 
 func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) { return c.token, nil }
+func (c *fakeChain) ClaimableUSDC(_ context.Context, address string, _ info.Token) (decimal.Decimal, error) {
+	if c.claimableCalls == nil {
+		c.claimableCalls = make(map[string]int)
+	}
+	c.claimableCalls[address]++
+	if err := c.claimableErrors[address]; err != nil {
+		return decimal.Zero, err
+	}
+	return c.claimableRewards[address], nil
+}
 func (c *fakeChain) SpotBalance(_ context.Context, address string, _ info.Token) (info.SpotBalanceAmounts, error) {
 	c.balanceCalls[address]++
 	if err := c.balanceErrors[address]; err != nil {

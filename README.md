@@ -1,9 +1,9 @@
 # Hyperliquid Builder Code Bot
 
-This service claims rewards for configured builder accounts, sweeps each
-builder's full available spot USDC balance into an operator-controlled
-settlement account, sends one payout to a fixed recipient, and marks the
-corresponding MySQL records complete.
+This service claims canonical USDC rewards exceeding 1 USDC for configured
+builder accounts, sweeps each builder's full available spot USDC balance into
+an operator-controlled settlement account, sends one payout to a fixed
+recipient, and marks the corresponding MySQL records complete.
 
 The design treats builder-to-settlement transfers as repeatable internal fund
 movement. Only the final settlement-to-recipient payout has a durable recovery

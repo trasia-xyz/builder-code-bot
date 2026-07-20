@@ -39,6 +39,18 @@ func TestServerProvidesSpotMetadataAndBalances(t *testing.T) {
 	if !balance.Total.Equal(decimal.RequireFromString("12.5")) || !balance.Available.Equal(decimal.RequireFromString("12.5")) {
 		t.Fatalf("balance = %+v, want total and available 12.5", balance)
 	}
+	claimable, err := client.ClaimableUSDC(context.Background(), "0x000000000000000000000000000000000000dEaD", token)
+	if err != nil || !claimable.IsZero() {
+		t.Fatalf("claimable USDC without reward = %s, %v, want 0", claimable, err)
+	}
+	server.SetClaimReward("0xabc", "USDC:0", "0.75")
+	claimable, err = client.ClaimableUSDC(context.Background(), "0xAbC", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimable.Equal(decimal.RequireFromString("0.75")) {
+		t.Fatalf("claimable USDC = %s, want 0.75", claimable)
+	}
 	server.SetUserRateLimit("0xabc", 9801, 10000)
 	limit, err := client.UserRateLimit(context.Background(), "0xAbC")
 	if err != nil {
@@ -139,6 +151,19 @@ func TestServerCreditsConfiguredClaimReward(t *testing.T) {
 		t.Fatalf("Submit() = %#v, %v", result, err)
 	}
 	assertBalance(t, server, signer, "1.75")
+}
+
+func TestServerRejectsClaimRewardAtThreshold(t *testing.T) {
+	server := New(t)
+	client, signer := newExchangeClient(t, server.URL)
+	server.SetClaimReward(signer, "USDC:0", "1")
+	action, err := client.PrepareClaim(signer, 1006)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := client.Submit(context.Background(), action); err != nil || !result.Rejected {
+		t.Fatalf("Submit() = %#v, %v, want explicit rejection", result, err)
+	}
 }
 
 func TestServerFailureModesControlWhetherMutationApplies(t *testing.T) {

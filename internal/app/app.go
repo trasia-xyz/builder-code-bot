@@ -242,6 +242,10 @@ func (c hyperliquidChain) CanonicalUSDC(ctx context.Context) (info.Token, error)
 	return c.info.CanonicalUSDC(ctx)
 }
 
+func (c hyperliquidChain) ClaimableUSDC(ctx context.Context, address string, token info.Token) (decimal.Decimal, error) {
+	return c.info.ClaimableUSDC(ctx, address, token)
+}
+
 func (c hyperliquidChain) SpotBalance(ctx context.Context, address string, token info.Token) (info.SpotBalanceAmounts, error) {
 	return c.info.SpotBalance(ctx, address, token)
 }

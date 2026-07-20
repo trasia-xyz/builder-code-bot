@@ -80,6 +80,63 @@ func TestInfoClientQueriesUserRateLimit(t *testing.T) {
 	}
 }
 
+func TestInfoClientQueriesClaimableUSDC(t *testing.T) {
+	transport := &fakeTransport{responses: []json.RawMessage{
+		json.RawMessage(`{
+			"unclaimedRewards":"99",
+			"tokenToState":[
+				[235,{"unclaimedRewards":"4.5"}],
+				[0,{"unclaimedRewards":"1.25","claimedRewards":"7","builderRewards":"8.25"}]
+			]
+		}`),
+	}}
+	token := Token{Name: "USDC", Index: 0}
+	claimable, err := New(transport).ClaimableUSDC(context.Background(), "0xsender", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimable.Equal(decimal.RequireFromString("1.25")) {
+		t.Fatalf("claimable USDC = %s, want 1.25", claimable)
+	}
+	request := transport.requests[0]
+	if request["type"] != "referral" || request["user"] != "0xsender" {
+		t.Fatalf("referral request = %#v", request)
+	}
+}
+
+func TestClaimableUSDCRejectsInvalidAmounts(t *testing.T) {
+	for _, response := range []json.RawMessage{
+		json.RawMessage(`{"tokenToState":[[0,{"unclaimedRewards":"bad"}]]}`),
+		json.RawMessage(`{"tokenToState":[[0,{"unclaimedRewards":"-0.1"}]]}`),
+		json.RawMessage(`{"tokenToState":[[0]]}`),
+		json.RawMessage(`{"tokenToState":[[0,{"unclaimedRewards":"1.25"}],[0,{"unclaimedRewards":"2"}]]}`),
+		json.RawMessage(`{"unclaimedRewards":"1.25"}`),
+		json.RawMessage(`{"tokenToState":null}`),
+		json.RawMessage(`{}`),
+	} {
+		transport := &fakeTransport{responses: []json.RawMessage{response}}
+		if _, err := New(transport).ClaimableUSDC(context.Background(), "0xsender", Token{Index: 0}); err == nil {
+			t.Fatalf("ClaimableUSDC() accepted response %s", response)
+		}
+	}
+}
+
+func TestClaimableUSDCReturnsZeroWithoutUSDCEntry(t *testing.T) {
+	for _, response := range []json.RawMessage{
+		json.RawMessage(`{"unclaimedRewards":"0","tokenToState":[]}`),
+		json.RawMessage(`{"unclaimedRewards":"4.5","tokenToState":[[235,{"unclaimedRewards":"4.5"}]]}`),
+	} {
+		transport := &fakeTransport{responses: []json.RawMessage{response}}
+		claimable, err := New(transport).ClaimableUSDC(context.Background(), "0xsender", Token{Index: 0})
+		if err != nil {
+			t.Fatalf("ClaimableUSDC() response %s: %v", response, err)
+		}
+		if !claimable.IsZero() {
+			t.Fatalf("ClaimableUSDC() response %s = %s, want 0", response, claimable)
+		}
+	}
+}
+
 func TestUserRateLimitRequiresCountsAndClampsExhaustedLimit(t *testing.T) {
 	transport := &fakeTransport{responses: []json.RawMessage{json.RawMessage(`{"cumVlm":"0"}`)}}
 	if _, err := New(transport).UserRateLimit(context.Background(), "0xsender"); err == nil {
@@ -94,6 +151,9 @@ func TestUserRateLimitRequiresCountsAndClampsExhaustedLimit(t *testing.T) {
 func TestInfoMethodsRejectNilTransport(t *testing.T) {
 	c := New(nil)
 	if _, err := c.SpotBalance(context.Background(), "0xsender", Token{}); err == nil {
+		t.Fatal("expected nil transport error")
+	}
+	if _, err := c.ClaimableUSDC(context.Background(), "0xsender", Token{Index: 0}); err == nil {
 		t.Fatal("expected nil transport error")
 	}
 	if _, err := c.UserRateLimit(context.Background(), "0xsender"); err == nil {

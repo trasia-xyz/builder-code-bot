@@ -48,6 +48,7 @@ type Orchestrator struct {
 const (
 	builderConvergenceAttempts = 5
 	builderConvergenceInterval = time.Second
+	claimRewardThresholdUSDC   = int64(1)
 	zeroEthereumAddress        = "0x0000000000000000000000000000000000000000"
 )
 
@@ -166,9 +167,26 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 }
 
 func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
+	token := *state.Manifest.Token
 	for _, builder := range o.builders {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		claimable, err := o.chain.ClaimableUSDC(ctx, builder, token)
+		if err != nil {
+			o.builderFailure(ctx, state, builder, "claimRewards", "query")
+			continue
+		}
+		threshold := decimal.NewFromInt(claimRewardThresholdUSDC)
+		eligible := claimable.GreaterThan(threshold)
+		o.info(ctx, "builder claim eligibility checked",
+			slog.String("event", "funding_builder_claim_eligibility_checked"),
+			slog.String("run_id", state.RunID), slog.String("builder", builder),
+			slog.String("claimable_usdc", claimable.String()),
+			slog.String("threshold_usdc", threshold.String()),
+			slog.Bool("eligible", eligible))
+		if !eligible {
+			continue
 		}
 		prepared, err := o.chain.PrepareClaim(builder, o.nonce.Next())
 		if err != nil {
@@ -181,7 +199,6 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 			o.builderFailure(ctx, state, builder, "claimRewards", submitResultName(result))
 		}
 	}
-	token := *state.Manifest.Token
 	payout, err := decimalFromString(state.Manifest.PayoutTotal)
 	if err != nil {
 		return err

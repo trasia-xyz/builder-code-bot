@@ -111,9 +111,9 @@ func newIntegrationEnvironment(t *testing.T, ambiguousPayout bool) *integrationE
 		t.Fatal(err)
 	}
 	server.SetSpotBalance(addresses[0], "USDC:0", "0.5")
-	server.SetClaimReward(addresses[0], "USDC:0", "1")
+	server.SetClaimReward(addresses[0], "USDC:0", "1.25")
 	server.SetSpotBalance(addresses[1], "USDC:0", "1")
-	server.SetClaimReward(addresses[1], "USDC:0", "1")
+	server.SetClaimReward(addresses[1], "USDC:0", "1.25")
 	server.SetSpotBalance(addresses[2], "USDC:0", "0")
 	server.SetSpotBalance(integrationRecipient, "USDC:0", "0")
 
@@ -164,6 +164,9 @@ type integrationChain struct {
 
 func (c *integrationChain) CanonicalUSDC(ctx context.Context) (info.Token, error) {
 	return c.info.CanonicalUSDC(ctx)
+}
+func (c *integrationChain) ClaimableUSDC(ctx context.Context, address string, token info.Token) (decimal.Decimal, error) {
+	return c.info.ClaimableUSDC(ctx, address, token)
 }
 func (c *integrationChain) SpotBalance(ctx context.Context, address string, token info.Token) (info.SpotBalanceAmounts, error) {
 	return c.info.SpotBalance(ctx, address, token)

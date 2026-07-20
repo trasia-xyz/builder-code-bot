@@ -189,6 +189,26 @@ func (s *Server) handleInfo(w http.ResponseWriter, body []byte) {
 		}{Balances: []info.SpotBalance{{Coin: token.Name, Token: token.Index, Total: value.total.String(), Hold: value.hold.String()}}}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
+	case "referral":
+		token := canonicalToken()
+		wireToken := token.Name + ":" + token.TokenID
+		reward := s.claimRewards[balanceKey{address: normalizeAddress(request.User), token: wireToken}]
+		tokenState := struct {
+			UnclaimedRewards string `json:"unclaimedRewards"`
+		}{UnclaimedRewards: reward.String()}
+		tokenToState := make([][2]any, 0, 1)
+		if !reward.IsZero() {
+			tokenToState = append(tokenToState, [2]any{token.Index, tokenState})
+		}
+		response := struct {
+			UnclaimedRewards string   `json:"unclaimedRewards"`
+			TokenToState     [][2]any `json:"tokenToState"`
+		}{
+			UnclaimedRewards: reward.String(),
+			TokenToState:     tokenToState,
+		}
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, response)
 	case "userRateLimit":
 		response, exists := s.rateLimits[normalizeAddress(request.User)]
 		if !exists {
@@ -241,12 +261,14 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 			token := canonicalToken()
 			wireToken := token.Name + ":" + token.TokenID
 			key := balanceKey{address: normalizeAddress(signerAddress), token: wireToken}
-			if reward := s.claimRewards[key]; !reward.IsZero() {
-				balance := s.balances[key]
-				balance.total = balance.total.Add(reward)
-				s.balances[key] = balance
-				delete(s.claimRewards, key)
+			reward := s.claimRewards[key]
+			if !reward.GreaterThan(decimal.NewFromInt(1)) {
+				return fmt.Errorf("must have more than 1 USDC of rewards to claim")
 			}
+			balance := s.balances[key]
+			balance.total = balance.total.Add(reward)
+			s.balances[key] = balance
+			delete(s.claimRewards, key)
 			return nil
 		}
 	case "spotSend":
