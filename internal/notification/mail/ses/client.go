@@ -33,7 +33,7 @@ func NewClient(ctx context.Context, cfg config.AWSConfig) (*awsses.Client, error
 
 func New(ctx context.Context, awsCfg config.AWSConfig, sesCfg config.SESConfig) (*Notifier, error) {
 	opts, err := validateAndNormalizeOptions(Options{
-		Source: sesCfg.From, To: cloneStrings(sesCfg.To), ReplyTo: cloneStrings(sesCfg.ReplyTo),
+		Source: sesCfg.From, To: cloneStrings(sesCfg.To),
 		SubjectPrefix: sesCfg.SubjectPrefix,
 	})
 	if err != nil {

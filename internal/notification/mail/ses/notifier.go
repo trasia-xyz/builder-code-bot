@@ -28,7 +28,6 @@ type api interface {
 type Options struct {
 	Source        string
 	To            []string
-	ReplyTo       []string
 	SubjectPrefix string
 }
 
@@ -77,9 +76,6 @@ func (n *Notifier) Notify(ctx context.Context, msg notification.Message) error {
 			Body:    &types.Body{Text: content(msg.Body)},
 		},
 	}
-	if len(n.opts.ReplyTo) > 0 {
-		input.ReplyToAddresses = cloneStrings(n.opts.ReplyTo)
-	}
 	out, err := n.client.SendEmail(ctx, input)
 	if err != nil {
 		return fmt.Errorf("send ses email: %w", err)
@@ -93,7 +89,6 @@ func (n *Notifier) Notify(ctx context.Context, msg notification.Message) error {
 func normalizeOptions(opts Options) Options {
 	opts.Source = notificationmail.NormalizeAddress(opts.Source)
 	opts.To = notificationmail.NormalizeAddressList(opts.To)
-	opts.ReplyTo = notificationmail.NormalizeAddressList(opts.ReplyTo)
 	opts.SubjectPrefix = strings.TrimSpace(opts.SubjectPrefix)
 	return opts
 }
@@ -110,9 +105,6 @@ func validateOptions(opts Options) error {
 	}
 	for i, value := range opts.To {
 		errs = append(errs, notificationmail.ValidateAddress(fmt.Sprintf("ses to[%d]", i), value))
-	}
-	for i, value := range opts.ReplyTo {
-		errs = append(errs, notificationmail.ValidateAddress(fmt.Sprintf("ses reply_to[%d]", i), value))
 	}
 	return errors.Join(errs...)
 }

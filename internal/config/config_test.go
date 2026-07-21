@@ -78,8 +78,7 @@ func TestLoadFileValidatesEnabledSES(t *testing.T) {
 
 func TestNotificationNormalizeAndValidateDropsEmptyRecipients(t *testing.T) {
 	cfg := NotificationConfig{SES: SESConfig{
-		To:      []string{" first@example.com ", " ", "", "second@example.com"},
-		ReplyTo: []string{" ", " reply@example.com "},
+		To: []string{" first@example.com ", " ", "", "second@example.com"},
 	}}
 
 	if err := cfg.NormalizeAndValidate(); err != nil {
@@ -87,9 +86,6 @@ func TestNotificationNormalizeAndValidateDropsEmptyRecipients(t *testing.T) {
 	}
 	if got, want := strings.Join(cfg.SES.To, ","), "first@example.com,second@example.com"; got != want {
 		t.Fatalf("SES.To = %q, want %q", got, want)
-	}
-	if got, want := strings.Join(cfg.SES.ReplyTo, ","), "reply@example.com"; got != want {
-		t.Fatalf("SES.ReplyTo = %q, want %q", got, want)
 	}
 }
 
@@ -285,7 +281,6 @@ enabled = false
 [notification.ses]
 from = ""
 to = []
-reply_to = []
 subject_prefix = "[builder-code]"
 `
 }

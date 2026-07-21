@@ -48,5 +48,4 @@ enabled = false
 [notification.ses]
 from = ""
 to = []
-reply_to = []
 subject_prefix = "[builder-code]"

@@ -18,7 +18,6 @@ type NotificationConfig struct {
 type SESConfig struct {
 	From          string   `toml:"from"`
 	To            []string `toml:"to"`
-	ReplyTo       []string `toml:"reply_to"`
 	SubjectPrefix string   `toml:"subject_prefix"`
 }
 
@@ -32,7 +31,6 @@ func (cfg *NotificationConfig) NormalizeAndValidate() error {
 	cfg.SES.From = strings.TrimSpace(cfg.SES.From)
 	cfg.SES.SubjectPrefix = strings.TrimSpace(cfg.SES.SubjectPrefix)
 	cfg.SES.To = normalizeStrings(cfg.SES.To)
-	cfg.SES.ReplyTo = normalizeStrings(cfg.SES.ReplyTo)
 	if !cfg.Enabled {
 		return nil
 	}

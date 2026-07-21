@@ -17,8 +17,9 @@ func TestNotifierBuildsUTF8PlainTextEmail(t *testing.T) {
 	t.Parallel()
 	fake := &fakeSES{}
 	n, err := NewNotifier(fake, Options{
-		Source: " Trasia <alerts@example.com> ", To: []string{" ops@example.com ", "dev@example.com"},
-		ReplyTo: []string{" support@example.com "}, SubjectPrefix: " [prod] ",
+		Source:        " Trasia <alerts@example.com> ",
+		To:            []string{" ops@example.com ", "dev@example.com"},
+		SubjectPrefix: " [prod] ",
 	})
 	if err != nil {
 		t.Fatalf("NewNotifier() error = %v", err)
@@ -32,7 +33,6 @@ func TestNotifierBuildsUTF8PlainTextEmail(t *testing.T) {
 		t.Fatalf("source = %q", aws.ToString(got.Source))
 	}
 	assertStringSlice(t, got.Destination.ToAddresses, []string{"ops@example.com", "dev@example.com"})
-	assertStringSlice(t, got.ReplyToAddresses, []string{"support@example.com"})
 	if aws.ToString(got.Message.Subject.Data) != "[prod] mysql down" {
 		t.Fatalf("subject = %q", aws.ToString(got.Message.Subject.Data))
 	}
