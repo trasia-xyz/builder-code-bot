@@ -13,7 +13,7 @@ import (
 	"builder-code-bot/internal/notification"
 )
 
-func TestNotifierBuildsUTF8PlainTextEmail(t *testing.T) {
+func TestNotifierBuildsUTF8HTMLEmailWithStatusFirst(t *testing.T) {
 	t.Parallel()
 	fake := &fakeSES{}
 	n, err := NewNotifier(fake, Options{
@@ -24,7 +24,10 @@ func TestNotifierBuildsUTF8PlainTextEmail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNotifier() error = %v", err)
 	}
-	err = n.Notify(context.Background(), notification.Message{Subject: "mysql down", Body: "attempts: 9"})
+	err = n.Notify(context.Background(), notification.Message{
+		Status: notification.StatusCritical, Subject: "mysql down",
+		HTMLBody: "<strong>attempts: 9</strong>",
+	})
 	if err != nil {
 		t.Fatalf("Notify() error = %v", err)
 	}
@@ -33,20 +36,39 @@ func TestNotifierBuildsUTF8PlainTextEmail(t *testing.T) {
 		t.Fatalf("source = %q", aws.ToString(got.Source))
 	}
 	assertStringSlice(t, got.Destination.ToAddresses, []string{"ops@example.com", "dev@example.com"})
-	if aws.ToString(got.Message.Subject.Data) != "[prod] mysql down" {
+	if aws.ToString(got.Message.Subject.Data) != "🔴 [prod] mysql down" {
 		t.Fatalf("subject = %q", aws.ToString(got.Message.Subject.Data))
 	}
 	if aws.ToString(got.Message.Subject.Charset) != charset {
 		t.Fatalf("subject charset = %q", aws.ToString(got.Message.Subject.Charset))
 	}
-	if got.Message.Body.Html != nil {
-		t.Fatal("HTML body is set")
+	if got.Message.Body.Text != nil {
+		t.Fatal("plain-text body is set")
 	}
-	if aws.ToString(got.Message.Body.Text.Data) != "attempts: 9" {
-		t.Fatalf("body = %q", aws.ToString(got.Message.Body.Text.Data))
+	if aws.ToString(got.Message.Body.Html.Data) != "<strong>attempts: 9</strong>" {
+		t.Fatalf("body = %q", aws.ToString(got.Message.Body.Html.Data))
 	}
-	if aws.ToString(got.Message.Body.Text.Charset) != charset {
-		t.Fatalf("body charset = %q", aws.ToString(got.Message.Body.Text.Charset))
+	if aws.ToString(got.Message.Body.Html.Charset) != charset {
+		t.Fatalf("body charset = %q", aws.ToString(got.Message.Body.Html.Charset))
+	}
+}
+
+func TestNotifierEscapesSimpleBodyIntoHTML(t *testing.T) {
+	t.Parallel()
+	fake := &fakeSES{}
+	n, err := NewNotifier(fake, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = n.Notify(context.Background(), notification.Message{
+		Status: notification.StatusWarning, Subject: "warning", Body: "<unsafe>\nnext",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := aws.ToString(fake.input.Message.Body.Html.Data)
+	if !strings.Contains(html, "&lt;unsafe&gt;<br>next") || strings.Contains(html, "<unsafe>") {
+		t.Fatalf("HTML body was not safely escaped: %q", html)
 	}
 }
 

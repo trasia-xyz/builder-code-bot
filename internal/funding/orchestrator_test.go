@@ -45,6 +45,59 @@ func TestRunHappyPathOnlyPersistsFinalPayout(t *testing.T) {
 			t.Fatalf("unexpected state before payout journal: %#v", saved)
 		}
 	}
+	if len(fx.notifier.reports) != 1 {
+		t.Fatalf("reports = %d, want one", len(fx.notifier.reports))
+	}
+	report := fx.notifier.reports[0]
+	if report.Status != ReportStatusSuccess || report.Payout.Status != ReportStepSuccess ||
+		report.Builders[0].ClaimStatus != ReportStepSuccess ||
+		report.Builders[0].SweepAmount != "1.5" ||
+		!report.SettlementBalance.Observed ||
+		report.SettlementBalance.Total != "0" ||
+		report.SettlementBalance.Available != "0" {
+		t.Fatalf("run report = %#v", report)
+	}
+}
+
+func TestScheduledRunReportsRetryAndFinalFailureDifferently(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xbuilder"] = decimal.Zero
+
+	err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 2, 6)
+	if err == nil {
+		t.Fatal("RunScheduled() error = nil")
+	}
+	if len(fx.notifier.reports) != 1 ||
+		fx.notifier.reports[0].Status != ReportStatusRetrying ||
+		!fx.notifier.reports[0].Compact {
+		t.Fatalf("retry report = %#v", fx.notifier.reports)
+	}
+
+	fx.notifier.reports = nil
+	err = fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 6, 6)
+	if err == nil {
+		t.Fatal("RunScheduled() final error = nil")
+	}
+	if len(fx.notifier.reports) != 1 ||
+		fx.notifier.reports[0].Status != ReportStatusCritical ||
+		fx.notifier.reports[0].Compact ||
+		fx.notifier.reports[0].Outcome != "retry_exhausted" {
+		t.Fatalf("final report = %#v", fx.notifier.reports)
+	}
+}
+
+func TestScheduledRetryAddsGenericFailureSummary(t *testing.T) {
+	report := newRunReport(
+		time.Now(), TriggerUTC, ReportExecution{Attempt: 1, MaxAttempts: 6},
+		"mainnet", []string{"0xbuilder"}, nil, "0xsettlement", "0xrecipient",
+	)
+
+	if !report.finalize(time.Now(), errors.New("unclassified failure")) {
+		t.Fatal("finalize() suppressed a non-cancellation error")
+	}
+	if report.Status != ReportStatusRetrying || report.FailureSummary != "资金任务未能完成。" {
+		t.Fatalf("retry report = %#v", report)
+	}
 }
 
 func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
@@ -77,6 +130,9 @@ func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
 	})
 	assertLogFields(t, fx.logger, "funding_run_completed", map[string]any{
 		"record_count": int64(2), "raw_total": "1.500000000000000000", "payout_total": "1.5",
+	})
+	assertLogFields(t, fx.logger, "funding_settlement_final_balance_observed", map[string]any{
+		"settlement": "0xsettlement", "total": "0", "hold": "0", "available": "0",
 	})
 }
 
@@ -153,6 +209,9 @@ func TestRunObservesBuilderAndSettlementRateLimits(t *testing.T) {
 	if len(fx.notifier.alerts) != 1 || fx.notifier.alerts[0] != "user_rate_limit_low:0xsettlement" {
 		t.Fatalf("alerts = %#v, want settlement rate limit alert", fx.notifier.alerts)
 	}
+	if fx.notifier.alertSeverity[0] != AlertSeverityWarning {
+		t.Fatalf("alert severity = %q, want warning", fx.notifier.alertSeverity[0])
+	}
 	wantAlertMessage := "Hyperliquid user rate limit is low\naccount kind: settlement\naddress: 0xsettlement\nrequests remaining: 199"
 	if fx.notifier.alertMessages[0] != wantAlertMessage {
 		t.Fatalf("alert message = %q, want %q", fx.notifier.alertMessages[0], wantAlertMessage)
@@ -204,7 +263,7 @@ func TestRunObservesRateLimitsAfterOrdinaryAndFatalFailures(t *testing.T) {
 	}
 }
 
-func TestRunUsesUncanceledContextForFinalRateLimitObservation(t *testing.T) {
+func TestRunSkipsFinalObservationsAfterCancellation(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.respectRateLimitContext = true
 	ctx, cancel := context.WithCancel(context.Background())
@@ -214,9 +273,15 @@ func TestRunUsesUncanceledContextForFinalRateLimitObservation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context canceled", err)
 	}
-	assertRateLimitLog(t, fx.logger, "0xbuilder", "info", map[string]any{
-		"requests_remaining": uint64(10_000),
-	})
+	if len(fx.chain.rateLimitCalls) != 0 || len(fx.chain.balanceCalls) != 0 {
+		t.Fatalf(
+			"final observations after cancellation: rate limits = %#v, balances = %#v",
+			fx.chain.rateLimitCalls, fx.chain.balanceCalls,
+		)
+	}
+	if len(fx.notifier.reports) != 0 {
+		t.Fatalf("reports after cancellation = %#v", fx.notifier.reports)
+	}
 }
 
 func TestRateLimitQueryFailureDoesNotBlockFunding(t *testing.T) {
@@ -231,6 +296,120 @@ func TestRateLimitQueryFailureDoesNotBlockFunding(t *testing.T) {
 	})
 	if fx.store.archiveResult != "completed" {
 		t.Fatalf("archive = %q, want completed", fx.store.archiveResult)
+	}
+}
+
+func TestFinalSettlementBalanceQueryFailureOnlyWarnsReport(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balanceErrors["0xsettlement"] = errors.New("unavailable")
+	report := newRunReport(
+		fx.clock.Now(), TriggerUTC, ReportExecution{}, "mainnet",
+		[]string{"0xbuilder"}, map[string]string{"0xbuilder": "builder-1"},
+		"0xsettlement", "0xrecipient",
+	)
+	report.token = cloneToken(&fx.chain.token)
+
+	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
+
+	if !report.SettlementBalance.QueryFailed || report.SettlementBalance.Observed {
+		t.Fatalf("settlement balance report = %#v", report.SettlementBalance)
+	}
+	if len(report.Warnings) != 1 || report.Warnings[0] != "Settlement：任务结束余额查询失败" {
+		t.Fatalf("warnings = %#v", report.Warnings)
+	}
+	assertLogFields(t, fx.logger, "funding_settlement_final_balance_query_failed", map[string]any{
+		"query_kind": "spot_balance", "settlement": "0xsettlement",
+	})
+}
+
+func TestFinalSettlementTokenQueryFailureOnlyWarnsReport(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.tokenError = errors.New("spot metadata unavailable")
+	report := newRunReport(
+		fx.clock.Now(), TriggerUTC, ReportExecution{}, "mainnet",
+		[]string{"0xbuilder"}, nil, "0xsettlement", "0xrecipient",
+	)
+
+	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
+
+	if !report.SettlementBalance.QueryFailed || report.SettlementBalance.Observed {
+		t.Fatalf("settlement balance report = %#v", report.SettlementBalance)
+	}
+	assertLogFields(t, fx.logger, "funding_settlement_final_balance_query_failed", map[string]any{
+		"query_kind": "canonical_usdc",
+	})
+}
+
+func TestFinalSettlementBalanceFailureMarksSuccessfulRunWarning(t *testing.T) {
+	fx := newFixture(t)
+	fx.repo.records = nil
+	fx.chain.balanceErrors["0xsettlement"] = errors.New("unavailable")
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerUTC); err != nil {
+		t.Fatal(err)
+	}
+	if len(fx.notifier.reports) != 1 ||
+		fx.notifier.reports[0].Status != ReportStatusWarning ||
+		!fx.notifier.reports[0].SettlementBalance.QueryFailed {
+		t.Fatalf("report = %#v", fx.notifier.reports)
+	}
+}
+
+func TestFinalSettlementBalanceUsesPersistedReportAddress(t *testing.T) {
+	fx := newFixture(t)
+	fx.orchestrator.settlement = "0xnew-settlement"
+	fx.chain.balances["0xpersisted-settlement"] = decimal.RequireFromString("7.5")
+	report := newRunReport(
+		fx.clock.Now(), TriggerUTC, ReportExecution{}, "mainnet",
+		[]string{"0xbuilder"}, nil, "0xpersisted-settlement", "0xrecipient",
+	)
+	report.token = cloneToken(&fx.chain.token)
+
+	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
+
+	if report.SettlementBalance.Address != "0xpersisted-settlement" ||
+		report.SettlementBalance.Total != "7.5" ||
+		fx.chain.balanceCalls["0xpersisted-settlement"] != 1 ||
+		fx.chain.balanceCalls["0xnew-settlement"] != 0 {
+		t.Fatalf("settlement observation = %#v, calls = %#v", report.SettlementBalance, fx.chain.balanceCalls)
+	}
+}
+
+func TestFinalSettlementRateLimitUsesPersistedReportAddress(t *testing.T) {
+	fx := newFixture(t)
+	fx.orchestrator.settlement = "0xnew-settlement"
+	fx.chain.rateLimits["0xpersisted-settlement"] = info.UserRateLimit{NRequestsCap: 1_000}
+	report := newRunReport(
+		fx.clock.Now(), TriggerUTC, ReportExecution{}, "mainnet",
+		[]string{"0xbuilder"}, nil, "0xpersisted-settlement", "0xrecipient",
+	)
+
+	fx.orchestrator.observeUserRateLimits(context.Background(), &report)
+
+	if !report.SettlementRateLimitObserved ||
+		report.SettlementRateLimitRemaining != 1_000 ||
+		fx.chain.rateLimitCalls["0xpersisted-settlement"] != 1 ||
+		fx.chain.rateLimitCalls["0xnew-settlement"] != 0 {
+		t.Fatalf("settlement rate limit report = %#v, calls = %#v", report, fx.chain.rateLimitCalls)
+	}
+}
+
+func TestSettlementBalanceQueryFailureIsNotReportedAsUnderfunded(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balanceErrors["0xsettlement"] = errors.New("unavailable")
+
+	err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6)
+	if err == nil {
+		t.Fatal("RunScheduled() error = nil")
+	}
+	report := fx.notifier.reports[0]
+	if report.FailureSummary != "Settlement 余额查询失败，无法确认是否满足 Payout。" ||
+		strings.Contains(report.FailureSummary, "0 USDC") {
+		t.Fatalf("failure summary = %q", report.FailureSummary)
+	}
+	if len(fx.notifier.alertSeverity) == 0 ||
+		fx.notifier.alertSeverity[len(fx.notifier.alertSeverity)-1] != AlertSeverityWarning {
+		t.Fatalf("alert severities = %#v", fx.notifier.alertSeverity)
 	}
 }
 
@@ -289,8 +468,8 @@ func TestUnknownPayoutBlocksAfterFiniteBalanceObservations(t *testing.T) {
 	if len(fx.repo.completedIDs) != 0 {
 		t.Fatalf("database completed after ambiguous payout: %v", fx.repo.completedIDs)
 	}
-	if got := fx.chain.balanceCalls["0xsettlement"]; got != 1+payoutBalanceObservationAttempts {
-		t.Fatalf("settlement balance calls = %d, want sufficiency plus %d observations", got, payoutBalanceObservationAttempts)
+	if got := fx.chain.balanceCalls["0xsettlement"]; got != 2+payoutBalanceObservationAttempts {
+		t.Fatalf("settlement balance calls = %d, want sufficiency, %d observations, and final report balance", got, payoutBalanceObservationAttempts)
 	}
 }
 
@@ -392,6 +571,10 @@ func TestRejectedPayoutBlocksWithoutBalanceObservation(t *testing.T) {
 	if fx.store.archiveResult != "rejected" {
 		t.Fatalf("archive = %q", fx.store.archiveResult)
 	}
+	if len(fx.notifier.alertSeverity) == 0 ||
+		fx.notifier.alertSeverity[len(fx.notifier.alertSeverity)-1] != AlertSeverityCritical {
+		t.Fatalf("alert severities = %#v, want final critical alert", fx.notifier.alertSeverity)
+	}
 }
 
 func TestBuilderFailuresDoNotBlockPreFundedPayout(t *testing.T) {
@@ -407,6 +590,9 @@ func TestBuilderFailuresDoNotBlockPreFundedPayout(t *testing.T) {
 	}
 	if len(fx.notifier.alerts) == 0 {
 		t.Fatal("builder failures did not alert")
+	}
+	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusWarning {
+		t.Fatalf("report = %#v, want success with warnings", fx.notifier.reports)
 	}
 }
 
@@ -427,6 +613,21 @@ func TestRecoverSubmittingPayoutUsesBalanceWithoutResubmitting(t *testing.T) {
 	}
 	if fx.store.archiveResult != "completed" {
 		t.Fatalf("archive = %q", fx.store.archiveResult)
+	}
+	if len(fx.notifier.reports) != 1 || !fx.notifier.reports[0].Recovery ||
+		fx.notifier.reports[0].Status != ReportStatusSuccess {
+		t.Fatalf("recovery report = %#v", fx.notifier.reports)
+	}
+	report := fx.notifier.reports[0]
+	for _, key := range []string{"rewards", "sweep"} {
+		if stage := report.stage(key); stage == nil || stage.Status != ReportStepSkipped ||
+			!strings.Contains(stage.Summary, "历史明细未持久化") {
+			t.Fatalf("recovery %s stage = %#v", key, stage)
+		}
+	}
+	if report.Builders[0].ClaimStatus != ReportStepSkipped ||
+		report.Builders[0].SweepStatus != ReportStepSkipped {
+		t.Fatalf("recovery builder report = %#v", report.Builders[0])
 	}
 }
 
@@ -514,7 +715,7 @@ func TestRunRecoveryReportUsesFinalPhase(t *testing.T) {
 	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
-	if len(fx.notifier.reports) != 1 || !strings.Contains(fx.notifier.reports[0], "phase: payout_confirmed") {
+	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Phase != PhasePayoutConfirmed {
 		t.Fatalf("reports = %#v", fx.notifier.reports)
 	}
 }
@@ -558,6 +759,16 @@ func TestRunNoDataArchivesWithoutChainMutation(t *testing.T) {
 	}
 	if len(fx.chain.events) != 0 || fx.store.archiveResult != "" {
 		t.Fatalf("chain = %v, archive = %q", fx.chain.events, fx.store.archiveResult)
+	}
+	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusNoData {
+		t.Fatalf("report = %#v, want no data", fx.notifier.reports)
+	}
+	if !fx.notifier.reports[0].SettlementBalance.Observed {
+		t.Fatalf("no-data report missing final settlement balance: %#v", fx.notifier.reports[0])
+	}
+	if builder := fx.notifier.reports[0].Builders[0]; builder.ClaimStatus != ReportStepSkipped ||
+		builder.SweepStatus != ReportStepSkipped {
+		t.Fatalf("no-data builder report = %#v", builder)
 	}
 }
 
@@ -607,7 +818,7 @@ func newFixture(t *testing.T) *fixture {
 	clock := fixedClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
 		Repository: repo, Store: store, Chain: chain, Notifier: notifier, Logger: logger,
-		Builders:   []string{"0xbuilder"},
+		Builders: []string{"0xbuilder"}, BuilderNames: map[string]string{"0xbuilder": "builder-1"},
 		Settlement: "0xsettlement", Recipient: "0xrecipient",
 		Clock: clock, Nonce: &fakeNonce{next: uint64(clock.now.UnixMilli())}, Sleeper: sleeper,
 	})
@@ -676,6 +887,7 @@ func (s *fakeStore) Clear(context.Context) error { s.current = nil; return nil }
 
 type fakeChain struct {
 	token                   info.Token
+	tokenError              error
 	claimableRewards        map[string]decimal.Decimal
 	claimableErrors         map[string]error
 	claimableCalls          map[string]int
@@ -696,7 +908,9 @@ type fakeChain struct {
 	events                  []string
 }
 
-func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) { return c.token, nil }
+func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) {
+	return c.token, c.tokenError
+}
 func (c *fakeChain) ClaimableUSDC(_ context.Context, address string, _ info.Token) (decimal.Decimal, error) {
 	if c.claimableCalls == nil {
 		c.claimableCalls = make(map[string]int)
@@ -771,16 +985,18 @@ func (s *fakeSleeper) Sleep(ctx context.Context, delay time.Duration) error {
 
 type fakeNotifier struct {
 	alerts        []string
+	alertSeverity []AlertSeverity
 	alertMessages []string
-	reports       []string
+	reports       []RunReport
 }
 
-func (n *fakeNotifier) Alert(_ context.Context, key, message string) {
+func (n *fakeNotifier) Alert(_ context.Context, key string, severity AlertSeverity, message string) {
 	n.alerts = append(n.alerts, key)
+	n.alertSeverity = append(n.alertSeverity, severity)
 	n.alertMessages = append(n.alertMessages, message)
 }
-func (n *fakeNotifier) Report(_ context.Context, _ string, message string) {
-	n.reports = append(n.reports, message)
+func (n *fakeNotifier) Report(_ context.Context, report RunReport) {
+	n.reports = append(n.reports, report)
 }
 
 type fakeLogEntry struct {

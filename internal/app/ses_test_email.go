@@ -13,7 +13,20 @@ import (
 
 const (
 	sesTestSubject = "Amazon SES connectivity test"
-	sesTestBody    = "This is a test email sent by builder-code-bot to verify Amazon SES connectivity."
+	sesTestBody    = `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;background:#f3f5f8;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">Amazon SES HTML delivery is working.</div>
+  <div style="max-width:640px;margin:0 auto;padding:24px 16px;">
+    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:14px;padding:28px;">
+      <div style="font-size:12px;font-weight:700;letter-spacing:.08em;color:#2563eb;">BUILDER CODE BOT</div>
+      <div style="margin-top:8px;font-size:24px;font-weight:750;color:#1d4ed8;">SES HTML delivery is working</div>
+      <div style="margin-top:10px;font-size:14px;line-height:1.6;color:#475569;">This email verifies AWS credentials, Amazon SES delivery, UTF-8 subjects, HTML rendering, and inbox preview text.</div>
+    </div>
+  </div>
+</body>
+</html>`
 )
 
 type sesNotifierFactory func(context.Context, config.AWSConfig, config.SESConfig) (notification.Notifier, error)
@@ -61,7 +74,11 @@ func sendSESTestEmail(ctx context.Context, cfg config.Config, factory sesNotifie
 	if notifier == nil {
 		return fmt.Errorf("initialize SES test notifier: notifier is nil")
 	}
-	if err := notifier.Notify(ctx, notification.Message{Subject: sesTestSubject, Body: sesTestBody}); err != nil {
+	if err := notifier.Notify(ctx, notification.Message{
+		Status:   notification.StatusInfo,
+		Subject:  sesTestSubject,
+		HTMLBody: sesTestBody,
+	}); err != nil {
 		return fmt.Errorf("send SES test email: %w", err)
 	}
 	return nil

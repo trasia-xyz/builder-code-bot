@@ -15,6 +15,7 @@ func TestMessageValidate(t *testing.T) {
 		want string
 	}{
 		{name: "valid", msg: Message{Subject: "subject", Body: "body"}},
+		{name: "valid HTML", msg: Message{Subject: "subject", HTMLBody: "<strong>body</strong>"}},
 		{name: "subject", msg: Message{Body: "body"}, want: "subject"},
 		{name: "body", msg: Message{Subject: "subject"}, want: "body"},
 	}
@@ -37,5 +38,18 @@ func TestNoopAlwaysSucceeds(t *testing.T) {
 	t.Parallel()
 	if err := (Noop{}).Notify(context.Background(), Message{}); err != nil {
 		t.Fatalf("Notify() error = %v", err)
+	}
+}
+
+func TestStatusIndicators(t *testing.T) {
+	t.Parallel()
+	tests := map[Status]string{
+		StatusSuccess: "🟢", StatusWarning: "🟡", StatusInfo: "🔵",
+		StatusRetrying: "🟠", StatusCritical: "🔴",
+	}
+	for status, want := range tests {
+		if got := status.Indicator(); got != want {
+			t.Errorf("%s indicator = %q, want %q", status, got, want)
+		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -72,8 +73,8 @@ func (n *Notifier) Notify(ctx context.Context, msg notification.Message) error {
 		Source:      aws.String(n.opts.Source),
 		Destination: &types.Destination{ToAddresses: cloneStrings(n.opts.To)},
 		Message: &types.Message{
-			Subject: content(prefixedSubject(n.opts.SubjectPrefix, msg.Subject)),
-			Body:    &types.Body{Text: content(msg.Body)},
+			Subject: content(prefixedSubject(msg.Status.Indicator(), n.opts.SubjectPrefix, msg.Subject)),
+			Body:    &types.Body{Html: content(messageHTML(msg))},
 		},
 	}
 	out, err := n.client.SendEmail(ctx, input)
@@ -113,12 +114,26 @@ func content(data string) *types.Content {
 	return &types.Content{Data: aws.String(data), Charset: aws.String(charset)}
 }
 
-func prefixedSubject(prefix, subject string) string {
-	prefix, subject = strings.TrimSpace(prefix), strings.TrimSpace(subject)
-	if prefix == "" {
-		return subject
+func prefixedSubject(indicator, prefix, subject string) string {
+	parts := make([]string, 0, 3)
+	for _, part := range []string{indicator, prefix, subject} {
+		if part = strings.TrimSpace(part); part != "" {
+			parts = append(parts, part)
+		}
 	}
-	return prefix + " " + subject
+	return strings.Join(parts, " ")
+}
+
+func messageHTML(msg notification.Message) string {
+	if body := strings.TrimSpace(msg.HTMLBody); body != "" {
+		return body
+	}
+	body := html.EscapeString(strings.TrimSpace(msg.Body))
+	body = strings.ReplaceAll(body, "\n", "<br>")
+	return `<!doctype html><html><body style="margin:0;background:#f5f7fa;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">` +
+		`<div style="max-width:640px;margin:0 auto;padding:24px 16px;">` +
+		`<div style="background:#ffffff;border:1px solid #e5e9f0;border-radius:12px;padding:24px;font-size:15px;line-height:1.65;">` +
+		body + `</div></div></body></html>`
 }
 
 func cloneStrings(values []string) []string { return append([]string(nil), values...) }

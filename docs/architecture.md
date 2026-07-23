@@ -132,6 +132,24 @@ builder 和 settlement，只记录 requests remaining；remaining 严格小于 2
 查询失败只记录警告，不会覆盖原任务结果或改变资金状态机；同一账户持续处于低额度
 时只告警一次，恢复到阈值后再次跌破才重新告警。固定的 service component 不重复写入每条日志。
 
+SES 通知只发送 UTF-8 HTML。Funding report 使用结构化的运行期数据生成移动端仪表盘，包含
+阶段状态、records/金额、builder claim 与 sweep、payout 证据、rate limit、告警和处置建议。
+报告数据不写入 durable `RunState`，因此不会改变 payout 恢复协议或 schema。邮件标题将状态
+指示器置于配置前缀之前：🟢 成功、🟡 成功但有告警、🔵 无数据、🟠 等待自动重试、🔴 需要人工
+处理。HTML preheader 提供金额、记录数或失败摘要，便于移动端邮件列表快速判断状态。
+报告发送前还会独立查询一次 settlement canonical USDC spot balance，并展示任务结束时的
+`Total`、`Hold` 和 `Available`。该查询只影响报告完整性；失败会产生 warning，但不会覆盖
+资金任务原本的结果。随后查询 address-based rate limit，以反映本轮所有 chain action
+完成后的剩余额度；spot balance 和其他 info 请求本身不计入该地址额度。
+
+运行期报告数据不持久化。恢复 `payout_prepared`、`payout_submitting` 或 `payout_confirmed`
+时，Reward 和 Sweep 会标记为“历史明细未持久化，本次恢复未重复执行”，不会凭持久化 phase
+推断此前每个 Builder action 的成功状态。
+
+Scheduler 的普通失败在尚有剩余次数时发送精简的橙色重试通知；成功、无数据、fatal 结果以及
+最后一次普通失败发送完整报告。启动恢复实际处理了 current 时也发送完整报告；没有 current
+的启动检查不发送邮件。
+
 成功 funding run 等待下一 UTC 01:00。普通错误（API 暂时失败、reward 未可见、归集不足）
 约 1 分钟后重试，最多重试 5 次；全部失败则返回 retry-exhausted 错误并退出。Fatal payout
 错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL 自身

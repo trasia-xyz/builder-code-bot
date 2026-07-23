@@ -15,34 +15,38 @@ import (
 )
 
 type OrchestratorConfig struct {
-	Repository Repository
-	Store      StateStore
-	Chain      Chain
-	Notifier   Notifier
-	Logger     Logger
-	Builders   []string
-	Settlement string
-	Recipient  string
-	Clock      Clock
-	Nonce      NonceSource
-	Sleeper    Sleeper
+	Repository   Repository
+	Store        StateStore
+	Chain        Chain
+	Notifier     Notifier
+	Logger       Logger
+	Builders     []string
+	BuilderNames map[string]string
+	Settlement   string
+	Recipient    string
+	Network      string
+	Clock        Clock
+	Nonce        NonceSource
+	Sleeper      Sleeper
 }
 
 type Orchestrator struct {
-	repository Repository
-	store      StateStore
-	chain      Chain
-	notifier   Notifier
-	logger     Logger
-	builders   []string
-	settlement string
-	recipient  string
-	clock      Clock
-	nonce      NonceSource
-	sleeper    Sleeper
-	alertMu    sync.Mutex
-	alerts     map[string]struct{}
-	lowLimits  map[string]struct{}
+	repository   Repository
+	store        StateStore
+	chain        Chain
+	notifier     Notifier
+	logger       Logger
+	builders     []string
+	builderNames map[string]string
+	settlement   string
+	recipient    string
+	network      string
+	clock        Clock
+	nonce        NonceSource
+	sleeper      Sleeper
+	alertMu      sync.Mutex
+	alerts       map[string]struct{}
+	lowLimits    map[string]struct{}
 }
 
 const (
@@ -90,23 +94,16 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 	return &Orchestrator{
 		repository: cfg.Repository, store: cfg.Store, chain: cfg.Chain,
 		notifier: cfg.Notifier, logger: cfg.Logger,
-		builders:   append([]string(nil), cfg.Builders...),
-		settlement: cfg.Settlement, recipient: cfg.Recipient,
+		builders:     append([]string(nil), cfg.Builders...),
+		builderNames: cloneBuilderNames(cfg.BuilderNames),
+		settlement:   cfg.Settlement, recipient: cfg.Recipient, network: cfg.Network,
 		clock: cfg.Clock, nonce: cfg.Nonce, sleeper: sleeper,
 		alerts:    make(map[string]struct{}),
 		lowLimits: make(map[string]struct{}),
 	}, nil
 }
 
-type runReport struct {
-	trigger     Trigger
-	state       *RunState
-	recordCount int
-	recordsRead bool
-	outcome     string
-}
-
-func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runReport) error {
+func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *RunReport) error {
 	o.info(ctx, "pending funding records query started",
 		slog.String("event", "funding_pending_records_query_started"))
 	records, err := o.repository.ListPending(ctx)
@@ -116,9 +113,14 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 	o.info(ctx, "pending funding records query completed",
 		slog.String("event", "funding_pending_records_query_completed"),
 		slog.Int("record_count", len(records)))
-	report.recordCount, report.recordsRead = len(records), true
+	report.RecordCount, report.RecordsRead = len(records), true
 	if len(records) == 0 {
-		report.outcome = "no_data"
+		report.Outcome = "no_data"
+		report.setStage("snapshot", ReportStepSuccess, "没有待处理记录")
+		for _, key := range []string{"rewards", "sweep", "payout", "database"} {
+			report.setStage(key, ReportStepSkipped, "无需执行")
+		}
+		markBuilderStepsSkipped(report, "无待处理 records")
 		o.info(ctx, "no pending funding records", slog.String("event", "funding_no_data"))
 		return nil
 	}
@@ -126,7 +128,7 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 	if err != nil {
 		return err
 	}
-	report.state = &run
+	report.syncState(&run)
 	o.info(ctx, "funding run started",
 		slog.String("event", "funding_run_started"), slog.String("run_id", run.RunID),
 		slog.String("trigger", string(trigger)), slog.Int("record_count", len(records)),
@@ -136,17 +138,22 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 	manifest, validationErr := buildManifest(input, false)
 	run.Manifest = manifest
 	if validationErr != nil {
-		report.outcome = "failed_validation"
+		report.Outcome = "failed_validation"
+		report.fail("snapshot", "资金记录校验失败。", "请修复数据库中的异常 funding record 后再启动服务。")
 		if archiveErr := o.store.Archive(ctx, run, "failed_validation"); archiveErr != nil {
 			return &FatalError{Err: fmt.Errorf("validate records: %w; archive failure: %v", validationErr, archiveErr)}
 		}
-		o.alertOnce(ctx, run.RunID, "validation_failed", "funding snapshot validation failed")
+		o.alertOnce(
+			ctx, run.RunID, "validation_failed",
+			AlertSeverityCritical, "funding snapshot validation failed",
+		)
 		return &FatalError{Err: validationErr}
 	}
 	payout := run.Manifest.PayoutTotal
 	if payout != "0" {
 		token, tokenErr := o.chain.CanonicalUSDC(ctx)
 		if tokenErr != nil {
+			report.fail("snapshot", "Canonical USDC metadata 查询失败。", "")
 			return tokenErr
 		}
 		run.Manifest.Token = &token
@@ -156,17 +163,25 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *runR
 		slog.String("run_id", run.RunID), slog.Int("record_count", len(records)),
 		slog.String("raw_total", run.Manifest.RawTotal),
 		slog.String("payout_total", run.Manifest.PayoutTotal))
-	report.outcome = "completed"
+	report.Outcome = "completed"
+	report.syncState(&run)
+	report.setStage("snapshot", ReportStepSuccess, fmt.Sprintf("%d 条记录，Payout %s USDC", len(records), run.Manifest.PayoutTotal))
 	if err := o.save(ctx, &run, PhasePrepared); err != nil {
+		report.fail("snapshot", "资金快照持久化失败。", "请检查本地 data 目录和文件系统状态。")
 		return err
 	}
+	report.syncState(&run)
 	if payout == "0" {
-		return o.completeDatabase(ctx, &run)
+		report.setStage("rewards", ReportStepSkipped, "Payout 为 0")
+		report.setStage("sweep", ReportStepSkipped, "Payout 为 0")
+		report.setStage("payout", ReportStepSkipped, "无需付款")
+		report.Payout.Status = ReportStepSkipped
+		return o.completeDatabase(ctx, &run, report)
 	}
-	return o.runPositive(ctx, &run)
+	return o.runPositive(ctx, &run, report)
 }
 
-func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
+func (o *Orchestrator) runPositive(ctx context.Context, state *RunState, report *RunReport) error {
 	token := *state.Manifest.Token
 	for _, builder := range o.builders {
 		if err := ctx.Err(); err != nil {
@@ -174,11 +189,18 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 		}
 		claimable, err := o.chain.ClaimableUSDC(ctx, builder, token)
 		if err != nil {
-			o.builderFailure(ctx, state, builder, "claimRewards", "query")
+			o.builderFailure(ctx, state, report, builder, "claimRewards", "query")
 			continue
 		}
 		threshold := decimal.NewFromInt(claimRewardThresholdUSDC)
 		eligible := claimable.GreaterThan(threshold)
+		if builderReport := report.builder(builder); builderReport != nil {
+			builderReport.ClaimableUSDC = claimable.String()
+			if !eligible {
+				builderReport.ClaimStatus = ReportStepSkipped
+				builderReport.ClaimSummary = "未超过 1 USDC 阈值"
+			}
+		}
 		o.info(ctx, "builder claim eligibility checked",
 			slog.String("event", "funding_builder_claim_eligibility_checked"),
 			slog.String("run_id", state.RunID), slog.String("builder", builder),
@@ -190,17 +212,24 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 		}
 		prepared, err := o.chain.PrepareClaim(builder, o.nonce.Next())
 		if err != nil {
-			o.builderFailure(ctx, state, builder, "claimRewards", "prepare")
+			o.builderFailure(ctx, state, report, builder, "claimRewards", "prepare")
 			continue
 		}
 		result, _ := o.chain.Submit(ctx, prepared)
 		o.logBuilderSubmitResult(ctx, state, builder, "claimRewards", "", result)
-		if !result.Accepted {
-			o.builderFailure(ctx, state, builder, "claimRewards", submitResultName(result))
+		if result.Accepted {
+			if builderReport := report.builder(builder); builderReport != nil {
+				builderReport.ClaimStatus = ReportStepSuccess
+				builderReport.ClaimSummary = "Reward 已领取"
+			}
+		} else {
+			o.builderFailure(ctx, state, report, builder, "claimRewards", submitResultName(result))
 		}
 	}
+	report.setStage("rewards", aggregateBuilderStep(report.Builders, true), builderStepSummary(report.Builders, true))
 	payout, err := decimalFromString(state.Manifest.PayoutTotal)
 	if err != nil {
+		report.fail("snapshot", "持久化的 Payout 金额无法解析。", "请保留 current 状态并检查数据完整性。")
 		return err
 	}
 	var settlement info.SpotBalanceAmounts
@@ -214,8 +243,16 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 			}
 			balance, balanceErr := o.chain.SpotBalance(ctx, builder, token)
 			if balanceErr != nil {
-				o.builderFailure(ctx, state, builder, "spotBalance", "query")
+				o.builderFailure(ctx, state, report, builder, "spotBalance", "query")
 				continue
+			}
+			if builderReport := report.builder(builder); builderReport != nil {
+				builderReport.FinalTotal = balance.Total.String()
+				builderReport.FinalAvailable = balance.Available.String()
+				if !balance.Available.IsPositive() && builderReport.SweepStatus == ReportStepPending {
+					builderReport.SweepStatus = ReportStepSkipped
+					builderReport.SweepSummary = "无可归集余额"
+				}
 			}
 			o.info(ctx, "builder balance observed",
 				slog.String("event", "funding_builder_balance_observed"),
@@ -228,13 +265,19 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 			}
 			prepared, prepareErr := o.chain.PrepareSpotSend(builder, state.Manifest.Settlement, token, balance.Available, o.nonce.Next())
 			if prepareErr != nil {
-				o.builderFailure(ctx, state, builder, "spotSend", "prepare")
+				o.builderFailure(ctx, state, report, builder, "spotSend", "prepare")
 				continue
 			}
 			result, _ := o.chain.Submit(ctx, prepared)
 			o.logBuilderSubmitResult(ctx, state, builder, "spotSend", balance.Available.String(), result)
-			if !result.Accepted {
-				o.builderFailure(ctx, state, builder, "spotSend", submitResultName(result))
+			if result.Accepted {
+				if builderReport := report.builder(builder); builderReport != nil {
+					report.addSweepAmount(builderReport, balance.Available.String())
+					builderReport.SweepStatus = ReportStepSuccess
+					builderReport.SweepSummary = "资金已归集"
+				}
+			} else {
+				o.builderFailure(ctx, state, report, builder, "spotSend", submitResultName(result))
 			}
 		}
 		settlement, err = o.chain.SpotBalance(ctx, state.Manifest.Settlement, token)
@@ -248,7 +291,8 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 				slog.String("available", settlement.Available.String()),
 				slog.String("payout_total", payout.String()), slog.Bool("sufficient", sufficient))
 			if sufficient {
-				return o.executePayout(ctx, state, settlement.Total, payout)
+				report.setStage("sweep", aggregateBuilderStep(report.Builders, false), builderStepSummary(report.Builders, false))
+				return o.executePayout(ctx, state, settlement.Total, payout, report)
 			}
 		} else {
 			o.warn(ctx, "settlement balance query failed",
@@ -261,10 +305,27 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState) error {
 			}
 		}
 	}
-	o.alertOnce(ctx, state.RunID, "settlement_underfunded", "settlement available balance is below required payout")
 	if err != nil {
+		report.fail(
+			"sweep",
+			"Settlement 余额查询失败，无法确认是否满足 Payout。",
+			"",
+		)
+		o.alertOnce(
+			ctx, state.RunID, "settlement_balance_query_failed",
+			AlertSeverityWarning, "settlement spot balance query failed",
+		)
 		return fmt.Errorf("query settlement spot balance after %d attempts: %w", builderConvergenceAttempts, err)
 	}
+	o.alertOnce(
+		ctx, state.RunID, "settlement_underfunded",
+		AlertSeverityWarning, "settlement available balance is below required payout",
+	)
+	report.fail(
+		"sweep",
+		fmt.Sprintf("Settlement 可用余额 %s USDC，低于所需的 %s USDC。", settlement.Available, payout),
+		"",
+	)
 	return fmt.Errorf("settlement available balance %s is below payout %s after %d attempts", settlement.Available, payout, builderConvergenceAttempts)
 }
 
@@ -296,13 +357,32 @@ func (o *Orchestrator) logBuilderSubmitResult(
 	o.info(ctx, "builder submission returned", attrs...)
 }
 
-func (o *Orchestrator) builderFailure(ctx context.Context, state *RunState, builder, action, outcome string) {
+func (o *Orchestrator) builderFailure(
+	ctx context.Context,
+	state *RunState,
+	report *RunReport,
+	builder, action, outcome string,
+) {
 	o.warn(ctx, "builder action did not complete",
 		slog.String("event", "funding_builder_action_failed"),
 		slog.String("run_id", state.RunID), slog.String("builder", builder),
 		slog.String("action_kind", action),
 		slog.String("outcome", outcome))
-	o.alertOnce(ctx, state.RunID, "builder_"+action+"_failed", action+" action did not complete")
+	if builderReport := report.builder(builder); builderReport != nil {
+		switch action {
+		case "claimRewards":
+			builderReport.ClaimStatus = ReportStepWarning
+			builderReport.ClaimSummary = builderActionSummary(action, outcome)
+		default:
+			builderReport.SweepStatus = ReportStepWarning
+			builderReport.SweepSummary = builderActionSummary(action, outcome)
+		}
+		report.addWarning(builderReport.Name + "：" + builderActionSummary(action, outcome))
+	}
+	o.alertOnce(
+		ctx, state.RunID, "builder_"+action+"_failed",
+		AlertSeverityWarning, action+" action did not complete",
+	)
 }
 
 func (o *Orchestrator) newState(trigger Trigger) (RunState, error) {
@@ -326,7 +406,7 @@ func (o *Orchestrator) save(ctx context.Context, state *RunState, phase Phase) e
 	return nil
 }
 
-func (o *Orchestrator) completeDatabase(ctx context.Context, state *RunState) error {
+func (o *Orchestrator) completeDatabase(ctx context.Context, state *RunState, report *RunReport) error {
 	ids := make([]uint64, len(state.Manifest.Records))
 	for i, record := range state.Manifest.Records {
 		ids[i] = record.ID
@@ -335,15 +415,27 @@ func (o *Orchestrator) completeDatabase(ctx context.Context, state *RunState) er
 		slog.String("event", "funding_database_completion_started"),
 		slog.String("run_id", state.RunID), slog.Int("record_count", len(ids)))
 	if err := o.repository.Complete(ctx, ids); err != nil {
-		o.alertOnce(ctx, state.RunID, "database_completion_failed", "funding database completion failed")
+		o.alertOnce(
+			ctx, state.RunID, "database_completion_failed",
+			AlertSeverityWarning, "funding database completion failed",
+		)
+		report.fail(
+			"database",
+			"MySQL funding records 未能标记完成。",
+			"Payout 状态是安全的；服务会持续重试数据库操作，请检查 MySQL 可用性。",
+		)
 		return err
 	}
 	if err := o.store.Archive(ctx, *state, "completed"); err != nil {
+		report.fail("database", "运行历史归档失败。", "请检查 data/history 目录和文件系统状态。")
 		return err
 	}
 	if err := o.store.Clear(ctx); err != nil {
+		report.fail("database", "已完成运行的 current 状态清理失败。", "请检查 data 目录并保留现场。")
 		return err
 	}
+	report.setStage("database", ReportStepSuccess, fmt.Sprintf("%d 条记录已完成", len(ids)))
+	report.syncState(state)
 	o.info(ctx, "funding run completed",
 		slog.String("event", "funding_run_completed"), slog.String("run_id", state.RunID),
 		slog.Int("record_count", len(ids)), slog.String("raw_total", state.Manifest.RawTotal),
@@ -352,43 +444,18 @@ func (o *Orchestrator) completeDatabase(ctx context.Context, state *RunState) er
 	return nil
 }
 
-func (o *Orchestrator) reportRun(ctx context.Context, report runReport, runErr error) {
-	if o.notifier == nil {
-		return
-	}
-	status, subject := "succeeded", "Funding run succeeded"
-	if runErr != nil {
-		status, subject = "failed", "Funding run failed"
-		if report.outcome == "" || report.outcome == "completed" {
-			report.outcome = "failed"
-		}
-	}
-	if report.outcome == "" {
-		report.outcome = "completed"
-	}
-	lines := []string{"status: " + status, "trigger: " + string(report.trigger), "outcome: " + report.outcome}
-	if report.recordsRead {
-		lines = append(lines, fmt.Sprintf("record count: %d", report.recordCount))
-	}
-	if report.state != nil {
-		lines = append(lines, "run id: "+report.state.RunID, "utc date: "+report.state.UTCDate)
-		if report.state.Phase != "" {
-			lines = append(lines, "phase: "+string(report.state.Phase))
-		}
-		if report.state.Manifest.PayoutTotal != "" {
-			lines = append(lines, "payout total: "+report.state.Manifest.PayoutTotal)
-		}
-	}
-	o.notifier.Report(ctx, subject, strings.Join(lines, "\n"))
-}
-
-func (o *Orchestrator) alert(ctx context.Context, key, message string) {
+func (o *Orchestrator) alert(ctx context.Context, key string, severity AlertSeverity, message string) {
 	if o.notifier != nil {
-		o.notifier.Alert(ctx, key, message)
+		o.notifier.Alert(ctx, key, severity, message)
 	}
 }
 
-func (o *Orchestrator) alertOnce(ctx context.Context, runID, key, message string) {
+func (o *Orchestrator) alertOnce(
+	ctx context.Context,
+	runID, key string,
+	severity AlertSeverity,
+	message string,
+) {
 	dedupeKey := runID + ":" + key
 	o.alertMu.Lock()
 	if _, exists := o.alerts[dedupeKey]; exists {
@@ -397,7 +464,7 @@ func (o *Orchestrator) alertOnce(ctx context.Context, runID, key, message string
 	}
 	o.alerts[dedupeKey] = struct{}{}
 	o.alertMu.Unlock()
-	o.alert(ctx, dedupeKey, message)
+	o.alert(ctx, dedupeKey, severity, message)
 }
 
 func (o *Orchestrator) forgetAlerts(runID string) {
@@ -449,7 +516,10 @@ func (o *Orchestrator) loadCurrent(ctx context.Context) (*RunState, StateLoadMet
 		o.warn(ctx, "funding state recovered from backup",
 			slog.String("event", "state_snapshot_recovered_from_backup"),
 			slog.String("run_id", runID), slog.Bool("primary_invalid", metadata.PrimaryInvalid))
-		o.alertOnce(ctx, runID, "state_corruption", "funding state recovered from backup")
+		o.alertOnce(
+			ctx, runID, "state_corruption",
+			AlertSeverityWarning, "funding state recovered from backup",
+		)
 	}
 	return current, metadata, err
 }

@@ -79,7 +79,8 @@ The test always uses `[aws]` and `[notification.ses]` and intentionally ignores
 `notification.enabled`, so SES can be verified before runtime notifications are
 enabled. It does not decrypt private keys, initialize MySQL, acquire the funding
 process lock, or start the scheduler. `--test-ses` and `--run-on-start` cannot be
-used together.
+used together. The message exercises the same UTF-8 status subject ordering,
+HTML rendering, and inbox preheader used by runtime reports.
 
 Startup always recovers `data/current.json` before starting a new run. The data
 directory retains `LOCK`, checksummed current and backup snapshots, and history

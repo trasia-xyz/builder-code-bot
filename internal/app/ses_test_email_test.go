@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"builder-code-bot/internal/config"
+	"builder-code-bot/internal/funding"
+	"builder-code-bot/internal/logging"
 	"builder-code-bot/internal/notification"
 )
 
@@ -37,7 +39,9 @@ func TestSendSESTestEmailSendsConfiguredMessageWhenNotificationsDisabled(t *test
 	if factoryCalls != 1 || fake.calls != 1 {
 		t.Fatalf("factory calls = %d, notify calls = %d", factoryCalls, fake.calls)
 	}
-	if fake.message.Subject != sesTestSubject || fake.message.Body != sesTestBody {
+	if fake.message.Status != notification.StatusInfo ||
+		fake.message.Subject != sesTestSubject ||
+		fake.message.HTMLBody != sesTestBody {
 		t.Fatalf("message = %#v", fake.message)
 	}
 }
@@ -58,6 +62,29 @@ func TestSendSESTestEmailRejectsNilNotifier(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "notifier is nil") {
 		t.Fatalf("sendSESTestEmail() error = %v", err)
+	}
+}
+
+func TestDispatcherFundingNotifierMapsAlertSeverity(t *testing.T) {
+	fake := &recordingNotifier{}
+	notifier := dispatcherFundingNotifier{
+		dispatcher: notification.NewDispatcher(fake, logging.Logger{}),
+	}
+
+	notifier.Alert(
+		context.Background(), "warning",
+		funding.AlertSeverityWarning, "warning message",
+	)
+	if fake.message.Status != notification.StatusWarning {
+		t.Fatalf("warning status = %q", fake.message.Status)
+	}
+
+	notifier.Alert(
+		context.Background(), "critical",
+		funding.AlertSeverityCritical, "critical message",
+	)
+	if fake.message.Status != notification.StatusCritical {
+		t.Fatalf("critical status = %q", fake.message.Status)
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"builder-code-bot/internal/hyperliquid/signing"
 	"builder-code-bot/internal/logging"
 	"builder-code-bot/internal/notification"
+	"builder-code-bot/internal/notification/fundingreport"
 	"builder-code-bot/internal/notification/mail/ses"
 	"builder-code-bot/internal/repository/mysql"
 	"builder-code-bot/internal/scheduler"
@@ -70,7 +71,8 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 	password, err := resolvePassword(cfg.Signing.DecryptPassword, newTerminalPromptFile())
 	if err != nil {
 		dispatcher.Alert(ctx, "startup_signing", notification.Message{
-			Subject: "Funding service startup failed", Body: "Private key password resolution failed.",
+			Status: notification.StatusCritical, Subject: "Funding service startup failed",
+			Body: "Private key password resolution failed.",
 		})
 		return nil, err
 	}
@@ -80,7 +82,8 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 	signers, err := buildSigners(cfg, password)
 	if err != nil {
 		dispatcher.Alert(ctx, "startup_signing", notification.Message{
-			Subject: "Funding service startup failed", Body: "Private key decryption or address validation failed.",
+			Status: notification.StatusCritical, Subject: "Funding service startup failed",
+			Body: "Private key decryption or address validation failed.",
 		})
 		return nil, err
 	}
@@ -165,8 +168,17 @@ func (a *App) Run(ctx context.Context) error {
 	if a == nil || a.scheduler == nil || a.orchestrator == nil {
 		return fmt.Errorf("app is not initialized")
 	}
+	attempt := 1
+	maxAttempts := scheduler.MaxNonfatalRetries + 1
 	return a.scheduler.Run(ctx, func(runCtx context.Context) error {
-		return a.orchestrator.Run(runCtx, funding.TriggerUTC)
+		runErr := a.orchestrator.RunScheduled(runCtx, funding.TriggerUTC, attempt, maxAttempts)
+		switch {
+		case runErr == nil:
+			attempt = 1
+		case !funding.IsFatal(runErr) && attempt < maxAttempts:
+			attempt++
+		}
+		return runErr
 	})
 }
 
@@ -216,20 +228,24 @@ func assembleOrchestrator(
 	retryObserver := notification.NewMySQLRetryObserver(dispatcher, logger)
 	repository := mysql.NewRepository(db, mysql.NewRetryer(retryObserver))
 	builders := make([]string, len(cfg.Builders))
+	builderNames := make(map[string]string, len(cfg.Builders))
 	for index, builder := range cfg.Builders {
 		builders[index] = builder.Address
+		builderNames[strings.ToLower(builder.Address)] = builder.Name
 	}
 	return funding.NewOrchestrator(funding.OrchestratorConfig{
-		Repository: repository,
-		Store:      state.NewStore(state.DataDir),
-		Chain:      hyperliquidChain{info: infoClient, exchange: exchangeClient},
-		Notifier:   notifier,
-		Logger:     logger,
-		Builders:   builders,
-		Settlement: cfg.Settlement.Address,
-		Recipient:  cfg.Payout.RecipientAddress,
-		Clock:      systemClock{},
-		Nonce:      signing.NewNonceGenerator(),
+		Repository:   repository,
+		Store:        state.NewStore(state.DataDir),
+		Chain:        hyperliquidChain{info: infoClient, exchange: exchangeClient},
+		Notifier:     notifier,
+		Logger:       logger,
+		Builders:     builders,
+		BuilderNames: builderNames,
+		Settlement:   cfg.Settlement.Address,
+		Recipient:    cfg.Payout.RecipientAddress,
+		Network:      cfg.Hyperliquid.Network,
+		Clock:        systemClock{},
+		Nonce:        signing.NewNonceGenerator(),
 	})
 }
 
@@ -268,15 +284,26 @@ func (c hyperliquidChain) Submit(ctx context.Context, action exchange.PreparedAc
 
 type dispatcherFundingNotifier struct{ dispatcher *notification.Dispatcher }
 
-func (n dispatcherFundingNotifier) Alert(ctx context.Context, key, message string) {
+func (n dispatcherFundingNotifier) Alert(
+	ctx context.Context,
+	key string,
+	severity funding.AlertSeverity,
+	message string,
+) {
 	if n.dispatcher != nil {
-		n.dispatcher.Alert(ctx, key, notification.Message{Subject: "Funding service alert", Body: message})
+		status := notification.StatusWarning
+		if severity == funding.AlertSeverityCritical {
+			status = notification.StatusCritical
+		}
+		n.dispatcher.Alert(ctx, key, notification.Message{
+			Status: status, Subject: "Funding service alert", Body: message,
+		})
 	}
 }
 
-func (n dispatcherFundingNotifier) Report(ctx context.Context, subject, message string) {
+func (n dispatcherFundingNotifier) Report(ctx context.Context, report funding.RunReport) {
 	if n.dispatcher != nil {
-		n.dispatcher.Report(ctx, notification.Message{Subject: subject, Body: message})
+		n.dispatcher.Report(ctx, fundingreport.Render(report))
 	}
 }
 

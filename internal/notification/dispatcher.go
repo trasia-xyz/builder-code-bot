@@ -155,7 +155,12 @@ func (o *MySQLRetryObserver) Recovered(operation string, attempts int, unavailab
 }
 
 func mysqlMessage(subject, operation string, attempts int, unavailableFor time.Duration) Message {
+	status := StatusCritical
+	if subject == "MySQL recovered" {
+		status = StatusSuccess
+	}
 	return Message{
+		Status:  status,
 		Subject: subject,
 		Body: strings.Join([]string{
 			"operation: " + operation,

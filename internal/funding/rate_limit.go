@@ -18,21 +18,32 @@ func rateLimitObservationContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
 	}
-	// Final observability must still run when cancellation is the funding task's
-	// result. Individual Hyperliquid requests retain the HTTP client's timeout.
+	// Final observation after non-cancellation outcomes must not inherit an
+	// already-expired task deadline. Callers skip observation when cancellation
+	// itself is the funding result. Individual requests retain the HTTP timeout.
 	return context.WithoutCancel(ctx)
 }
 
-func (o *Orchestrator) observeUserRateLimits(ctx context.Context) {
+func (o *Orchestrator) observeUserRateLimits(ctx context.Context, report *RunReport) {
 	accounts := make([]controlledAccount, 0, len(o.builders)+1)
 	for _, builder := range o.builders {
 		accounts = append(accounts, controlledAccount{kind: "builder", address: builder})
 	}
-	accounts = append(accounts, controlledAccount{kind: "settlement", address: o.settlement})
+	settlement := o.settlement
+	if report != nil && strings.TrimSpace(report.SettlementBalance.Address) != "" {
+		settlement = report.SettlementBalance.Address
+	}
+	accounts = append(accounts, controlledAccount{kind: "settlement", address: settlement})
 
 	for _, account := range accounts {
 		limit, err := o.chain.UserRateLimit(ctx, account.address)
 		if err != nil {
+			if builderReport := report.builder(account.address); builderReport != nil {
+				builderReport.RateLimitQueryFailed = true
+			} else if report != nil && account.kind == "settlement" {
+				report.SettlementRateLimitQueryFailed = true
+			}
+			report.addWarning(accountLabel(account, report) + "：Rate Limit 查询失败")
 			o.warn(ctx, "Hyperliquid user rate limit query failed",
 				slog.String("event", "funding_user_rate_limit_query_failed"),
 				slog.String("account_kind", account.kind),
@@ -41,6 +52,13 @@ func (o *Orchestrator) observeUserRateLimits(ctx context.Context) {
 		}
 
 		remaining := limit.RemainingRequests()
+		if builderReport := report.builder(account.address); builderReport != nil {
+			builderReport.RateLimitObserved = true
+			builderReport.RateLimitRemaining = remaining
+		} else if report != nil && account.kind == "settlement" {
+			report.SettlementRateLimitObserved = true
+			report.SettlementRateLimitRemaining = remaining
+		}
 		low := remaining < userRateLimitAlertThreshold
 		attrs := []slog.Attr{
 			slog.String("event", "funding_user_rate_limit_observed"),
@@ -50,18 +68,32 @@ func (o *Orchestrator) observeUserRateLimits(ctx context.Context) {
 		}
 		if low {
 			o.warn(ctx, "Hyperliquid user rate limit is low", attrs...)
+			report.addWarning(fmt.Sprintf("%s：Rate Limit 仅剩 %d", accountLabel(account, report), remaining))
 		} else {
 			o.info(ctx, "Hyperliquid user rate limit observed", attrs...)
 		}
 
 		if o.updateRateLimitAlert(account.address, low) {
-			o.alert(ctx, "user_rate_limit_low:"+strings.ToLower(strings.TrimSpace(account.address)),
+			o.alert(
+				ctx, "user_rate_limit_low:"+strings.ToLower(strings.TrimSpace(account.address)),
+				AlertSeverityWarning,
 				fmt.Sprintf(
 					"Hyperliquid user rate limit is low\naccount kind: %s\naddress: %s\nrequests remaining: %d",
 					account.kind, account.address, remaining,
-				))
+				),
+			)
 		}
 	}
+}
+
+func accountLabel(account controlledAccount, report *RunReport) string {
+	if builder := report.builder(account.address); builder != nil {
+		return builder.Name
+	}
+	if account.kind == "settlement" {
+		return "Settlement"
+	}
+	return account.kind
 }
 
 // updateRateLimitAlert returns true only when an account first enters the low
