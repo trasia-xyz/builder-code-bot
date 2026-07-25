@@ -351,7 +351,7 @@ func (o *Orchestrator) logBuilderSubmitResult(
 	if amount != "" {
 		attrs = append(attrs, slog.String("amount", amount))
 	}
-	if len(result.Response) != 0 {
+	if !result.Accepted && len(result.Response) != 0 {
 		attrs = append(attrs, slog.String("response", string(result.Response)))
 	}
 	o.info(ctx, "builder submission returned", attrs...)

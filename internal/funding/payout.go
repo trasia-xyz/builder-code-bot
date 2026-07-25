@@ -96,7 +96,7 @@ func (o *Orchestrator) submitPreparedPayout(ctx context.Context, state *RunState
 	if state.Payout != nil {
 		attrs = append(attrs, slog.String("settlement_total_before", state.Payout.TotalBefore))
 	}
-	if len(result.Response) != 0 {
+	if !result.Accepted && len(result.Response) != 0 {
 		attrs = append(attrs, slog.String("response", string(result.Response)))
 	}
 	o.info(ctx, "final payout submission returned", attrs...)

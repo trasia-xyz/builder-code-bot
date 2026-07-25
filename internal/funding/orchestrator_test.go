@@ -102,6 +102,8 @@ func TestScheduledRetryAddsGenericFailureSummary(t *testing.T) {
 
 func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
 	fx := newFixture(t)
+	fx.chain.claimResult.Response = json.RawMessage(`{"status":"ok"}`)
+	fx.chain.sweepResult.Response = json.RawMessage(`{"status":"ok"}`)
 	fx.chain.payoutResult.Response = json.RawMessage(`{"status":"ok"}`)
 	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
@@ -126,8 +128,10 @@ func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
 	})
 	assertLogFields(t, fx.logger, "funding_payout_submit_result", map[string]any{
 		"payout_total": "1.5", "settlement_total_before": "1.5",
-		"accepted": true, "response": `{"status":"ok"}`,
+		"accepted": true,
 	})
+	assertLogFieldAbsent(t, fx.logger, "funding_builder_submit_result", "response")
+	assertLogFieldAbsent(t, fx.logger, "funding_payout_submit_result", "response")
 	assertLogFields(t, fx.logger, "funding_run_completed", map[string]any{
 		"record_count": int64(2), "raw_total": "1.500000000000000000", "payout_total": "1.5",
 	})
@@ -563,7 +567,9 @@ func TestRecordValidationFailureArchivesOnceAndIsFatal(t *testing.T) {
 
 func TestRejectedPayoutBlocksWithoutBalanceObservation(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.payoutResult = exchange.SubmitResult{Rejected: true}
+	fx.chain.payoutResult = exchange.SubmitResult{
+		Rejected: true, Response: json.RawMessage(`{"status":"err","response":"rejected"}`),
+	}
 	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil || !IsFatal(err) || fx.store.current != nil {
 		t.Fatalf("error = %v, current = %#v", err, fx.store.current)
@@ -575,11 +581,18 @@ func TestRejectedPayoutBlocksWithoutBalanceObservation(t *testing.T) {
 		fx.notifier.alertSeverity[len(fx.notifier.alertSeverity)-1] != AlertSeverityCritical {
 		t.Fatalf("alert severities = %#v, want final critical alert", fx.notifier.alertSeverity)
 	}
+	assertLogFields(t, fx.logger, "funding_payout_submit_result", map[string]any{
+		"accepted": false,
+		"rejected": true,
+		"response": `{"status":"err","response":"rejected"}`,
+	})
 }
 
 func TestBuilderFailuresDoNotBlockPreFundedPayout(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.claimResult = exchange.SubmitResult{Rejected: true}
+	fx.chain.claimResult = exchange.SubmitResult{
+		Rejected: true, Response: json.RawMessage(`{"status":"err","response":"rejected"}`),
+	}
 	fx.chain.balanceErrors["0xbuilder"] = errors.New("unavailable")
 	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
 	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
@@ -594,6 +607,12 @@ func TestBuilderFailuresDoNotBlockPreFundedPayout(t *testing.T) {
 	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusWarning {
 		t.Fatalf("report = %#v, want success with warnings", fx.notifier.reports)
 	}
+	assertLogFields(t, fx.logger, "funding_builder_submit_result", map[string]any{
+		"action_kind": "claimRewards",
+		"accepted":    false,
+		"rejected":    true,
+		"response":    `{"status":"err","response":"rejected"}`,
+	})
 }
 
 func TestRecoverSubmittingPayoutUsesBalanceWithoutResubmitting(t *testing.T) {
@@ -1037,6 +1056,23 @@ func assertLogFields(t *testing.T, logger *fakeLogger, event string, want map[st
 		return
 	}
 	t.Fatalf("event %s was not logged", event)
+}
+
+func assertLogFieldAbsent(t *testing.T, logger *fakeLogger, event, field string) {
+	t.Helper()
+	found := false
+	for _, entry := range logger.entries {
+		if entry.attrs["event"] != event {
+			continue
+		}
+		found = true
+		if value, exists := entry.attrs[field]; exists {
+			t.Fatalf("event %s unexpectedly contains field %s=%#v", event, field, value)
+		}
+	}
+	if !found {
+		t.Fatalf("event %s was not logged", event)
+	}
 }
 
 func assertRateLimitLog(t *testing.T, logger *fakeLogger, address, level string, want map[string]any) {
