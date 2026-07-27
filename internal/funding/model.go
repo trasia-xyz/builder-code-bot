@@ -18,13 +18,14 @@ type Phase string
 type Trigger string
 
 const (
-	PhasePrepared         Phase   = "prepared"
-	PhasePayoutPrepared   Phase   = "payout_prepared"
-	PhasePayoutSubmitting Phase   = "payout_submitting"
-	PhasePayoutConfirmed  Phase   = "payout_confirmed"
-	PhaseBlocked          Phase   = "blocked"
-	TriggerUTC            Trigger = "utc_midnight"
-	TriggerRunOnStart     Trigger = "run_on_start"
+	PhasePrepared          Phase   = "prepared"
+	PhasePayoutPrepared    Phase   = "payout_prepared"
+	PhasePayoutSubmitting  Phase   = "payout_submitting"
+	PhasePayoutConfirmed   Phase   = "payout_confirmed"
+	PhaseBlocked           Phase   = "blocked"
+	TriggerUTC             Trigger = "utc_midnight"
+	TriggerRunOnStart      Trigger = "run_on_start"
+	TriggerConsolidateOnly Trigger = "consolidate_only"
 )
 
 type Manifest struct {

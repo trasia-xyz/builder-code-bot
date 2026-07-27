@@ -30,9 +30,10 @@ import (
 const defaultConfigPath = "./config.toml"
 
 type Options struct {
-	ConfigPath string
-	RunOnStart bool
-	TestSES    bool
+	ConfigPath      string
+	RunOnStart      bool
+	TestSES         bool
+	ConsolidateOnly bool
 }
 
 type scheduledRunner interface {

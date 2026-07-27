@@ -1,6 +1,30 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func TestRunHelpPrintsAvailableFlagsAndSucceeds(t *testing.T) {
+	var output bytes.Buffer
+	if err := runWithOutput([]string{"--help"}, &output); err != nil {
+		t.Fatalf("runWithOutput(--help) error = %v, want nil", err)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"Usage: builder-code-bot [flags]",
+		"Available flags:",
+		"-config",
+		"-consolidate-only",
+		"-run-on-start",
+		"-test-ses",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("--help output missing %q:\n%s", want, got)
+		}
+	}
+}
 
 func TestParseOptionsDefaults(t *testing.T) {
 	opts, err := parseOptions(nil)
@@ -15,6 +39,9 @@ func TestParseOptionsDefaults(t *testing.T) {
 	}
 	if opts.TestSES {
 		t.Fatal("test-ses default = true, want false")
+	}
+	if opts.ConsolidateOnly {
+		t.Fatal("consolidate-only default = true, want false")
 	}
 }
 
@@ -39,6 +66,38 @@ func TestParseOptionsUsesTestSESBooleanValue(t *testing.T) {
 func TestParseOptionsRejectsTestSESWithRunOnStart(t *testing.T) {
 	if _, err := parseOptions([]string{"-test-ses", "-run-on-start"}); err == nil {
 		t.Fatal("parseOptions() error = nil, want mutually exclusive flag error")
+	}
+}
+
+func TestParseOptionsUsesConsolidateOnlyBooleanValue(t *testing.T) {
+	for _, tt := range []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{"-consolidate-only"}, want: true},
+		{args: []string{"-consolidate-only=false"}, want: false},
+	} {
+		opts, err := parseOptions(tt.args)
+		if err != nil {
+			t.Fatalf("parseOptions(%v) error = %v", tt.args, err)
+		}
+		if opts.ConsolidateOnly != tt.want {
+			t.Fatalf(
+				"parseOptions(%v) ConsolidateOnly = %v, want %v",
+				tt.args, opts.ConsolidateOnly, tt.want,
+			)
+		}
+	}
+}
+
+func TestParseOptionsRejectsConsolidateOnlyWithOtherModes(t *testing.T) {
+	for _, args := range [][]string{
+		{"-consolidate-only", "-run-on-start"},
+		{"-consolidate-only", "-test-ses"},
+	} {
+		if _, err := parseOptions(args); err == nil {
+			t.Fatalf("parseOptions(%v) error = nil, want mutually exclusive flag error", args)
+		}
 	}
 }
 

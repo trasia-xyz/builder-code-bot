@@ -37,9 +37,20 @@ Recipient 必须是非零地址，并且不得与任一 builder 或 settlement �
 始终使用同一工作目录，因为状态位于 `./data`：
 
 ```sh
+./bin/builder-code-bot --help
 ./bin/builder-code-bot -config ./config.toml
 ./bin/builder-code-bot -config ./config.toml --run-on-start
+./bin/builder-code-bot -config ./config.toml --consolidate-only
 ```
+
+`--help` 会列出全部可用 flags 并以成功状态退出，不读取配置，也不初始化任何运行组件。
+
+`--consolidate-only` 只执行一次 builder 资金归集并退出：按配置顺序查询、领取符合条件的
+canonical USDC reward，等待余额可见后，把每个 builder 最新的正 available spot balance
+全部发送到 settlement。该模式不连接 MySQL，不读取或修改 funding records、`current`、
+backup 或 history，不发送 recipient payout，也不启动 Scheduler；只解密 builder 私钥，
+不会解密或使用 settlement 私钥。它仍会获取同一个 `data/LOCK`，因此必须先停止同一工作目录
+下的常驻服务。任务结束时仍会记录 settlement 最终余额与账户 rate limit。
 
 EC2 部署后，可单独验证实例凭证、网络和 SES 投递：
 
@@ -50,7 +61,8 @@ EC2 部署后，可单独验证实例凭证、网络和 SES 投递：
 该命令使用 `[aws]` 与 `[notification.ses]` 配置发送一封测试邮件，成功后立即退出。它会忽略
 `notification.enabled`，因此可以在正式启用通知前测试；不会解密私钥、初始化 MySQL、获取资金
 任务锁或启动调度器。测试邮件包含蓝色状态标题、HTML 布局和 preheader，可同时验证 macOS
-Mail 与 iOS Gmail 的标题、列表预览和正文渲染。`--test-ses` 不能与 `--run-on-start` 同时使用。
+Mail 与 iOS Gmail 的标题、列表预览和正文渲染。`--consolidate-only`、`--test-ses` 和
+`--run-on-start` 彼此互斥。
 
 启动阶段最多立即执行一个 funding run：存在 current 时只恢复 current，即使指定
 `--run-on-start` 也不会继续创建新 run；没有 current 且指定 `--run-on-start` 时才创建新
@@ -118,11 +130,23 @@ History 只包含 `completed`、`rejected`、`blocked`、`failed_validation`。�
 每轮先查询所有 builder 的 referral info，并读取 `tokenToState` 中 token index `0` 的
 `unclaimedRewards`；不要使用最外层的全币种汇总字段。该 USDC 数值严格超过 1 才提交 claim，
 等于或低于 1、列表为空或没有 index `0` 时正常跳过且不告警。字段缺失、响应非法、查询失败
-或实际 claim 失败仍会告警。随后最多进行 5 轮查询与 sweep。Builder 的 available
-(`total - hold`) 为正时全部发送到 settlement；每轮检查 settlement available，仍不足就
-等待约 1 秒。有限轮次耗尽会返回普通错误，保留 `prepared` current，并约 1 分钟后自动
-恢复重试，最多重试 5 次，不需要人工清理或 builder action journal。重试全部失败后进程
-退出，current 继续保留，便于排障后人工重启恢复。
+或实际 claim 失败仍会告警。
+
+Builder claim 按配置顺序串行提交。全部提交结束后统一等待约 1 秒，再对已接受或结果不确定的
+claim 查询 spot balance。每个 builder 最多查询 10 次，`available >= claimable` 即停止该
+builder 的查询；否则轮次间等待约 1 秒。程序不会在 claim 前额外读取余额。10 次耗尽后会告警，
+并按最后一次成功读取的 available 尽力归集；一次都未成功读取则在首次归集时跳过该 builder。
+若 settlement 仍不足，后续内部收敛轮次仍会重新查询实时余额。
+
+`--consolidate-only` 使用同一套 claim 与最多 10 次查询逻辑，但只进行一次 sweep，不查询
+funding records 或 payout 所需金额，也不因 settlement 当前余额充足或不足改变归集行为。
+
+上述 builder 告警不会阻止已有 settlement 资金执行 payout。程序随后最多进行 5 轮内部归集：
+Builder 的 available (`total - hold`) 为正时全部发送到 settlement；每轮检查 settlement
+available，足够时立即 payout，仍不足才等待约 1 秒。5 轮耗尽且 settlement 仍不足会返回
+普通错误，保留 `prepared` current，并约 1 分钟后自动恢复重试，最多重试 5 次，不需要人工
+清理或 builder action journal。重试全部失败后进程退出，current 继续保留，便于排障后人工
+重启恢复。
 
 ## Payout 结果处置
 

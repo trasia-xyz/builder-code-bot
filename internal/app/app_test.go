@@ -124,6 +124,35 @@ func TestBuildSignersRejectsAnyDerivedAddressMismatch(t *testing.T) {
 	}
 }
 
+func TestBuildBuilderSignersDoesNotDecryptSettlementKey(t *testing.T) {
+	password := secret.NewString("shared password")
+	builderEncrypted, err := keycipher.Encrypt(secret.NewString(testPrivateKey), password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Builders: []config.BuilderConfig{{
+			Name: "builder", Address: "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+			EncryptedPrivateKey: builderEncrypted,
+		}},
+		Settlement: config.AccountConfig{
+			Address:             "0x0000000000000000000000000000000000000002",
+			EncryptedPrivateKey: secret.NewString("not valid ciphertext"),
+		},
+	}
+
+	signers, err := buildBuilderSigners(cfg, password)
+	if err != nil {
+		t.Fatalf("buildBuilderSigners() error = %v", err)
+	}
+	if len(signers) != 1 {
+		t.Fatalf("signers = %d, want one builder signer", len(signers))
+	}
+	if _, exists := signers[cfg.Settlement.Address]; exists {
+		t.Fatal("builder signer set unexpectedly contains settlement")
+	}
+}
+
 func TestRuntimeRunOnStartUsesCombinedRun(t *testing.T) {
 	runner := &recordingRunner{}
 	if err := startRuntime(context.Background(), runner, true); err != nil {

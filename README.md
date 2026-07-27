@@ -64,9 +64,22 @@ from a controlling TTY at startup.
 Always use the same working directory because state is stored in `./data`.
 
 ```sh
+./bin/builder-code-bot --help
 ./bin/builder-code-bot -config ./config.toml
 ./bin/builder-code-bot -config ./config.toml --run-on-start
+./bin/builder-code-bot -config ./config.toml --consolidate-only
 ```
+
+`--help` prints all available flags and exits successfully without loading the
+configuration or starting any runtime component.
+
+`--consolidate-only` runs one builder-fund consolidation and exits. It queries
+and claims eligible canonical-USDC rewards, waits for claimed balances to become
+visible, and sends each builder's latest positive available spot balance to the
+settlement account. It does not connect to MySQL, read or update funding records
+or durable `current` state, send a recipient payout, or start the scheduler. It
+decrypts only builder keys, but still acquires `data/LOCK`, so it cannot run
+alongside the service in the same working directory.
 
 To verify EC2 credentials, network access, and SES delivery without starting
 the funding runtime, send one test email and exit:
@@ -78,9 +91,10 @@ the funding runtime, send one test email and exit:
 The test always uses `[aws]` and `[notification.ses]` and intentionally ignores
 `notification.enabled`, so SES can be verified before runtime notifications are
 enabled. It does not decrypt private keys, initialize MySQL, acquire the funding
-process lock, or start the scheduler. `--test-ses` and `--run-on-start` cannot be
-used together. The message exercises the same UTF-8 status subject ordering,
-HTML rendering, and inbox preheader used by runtime reports.
+process lock, or start the scheduler. `--consolidate-only`, `--test-ses`, and
+`--run-on-start` are mutually exclusive. The message exercises the same UTF-8
+status subject ordering, HTML rendering, and inbox preheader used by runtime
+reports.
 
 Startup always recovers `data/current.json` before starting a new run. The data
 directory retains `LOCK`, checksummed current and backup snapshots, and history

@@ -34,11 +34,14 @@ func TestRunHappyPathOnlyPersistsFinalPayout(t *testing.T) {
 	if fx.store.current != nil || fx.store.archiveResult != "completed" {
 		t.Fatalf("current = %#v, archive = %q", fx.store.current, fx.store.archiveResult)
 	}
-	if len(fx.sleeper.delays) != 0 {
-		t.Fatalf("delays = %v, want immediate convergence", fx.sleeper.delays)
+	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != 1 {
+		t.Fatalf("claim balance waits = %d, want one shared initial wait", got)
 	}
 	if got := fx.chain.claimableCalls["0xbuilder"]; got != 1 {
 		t.Fatalf("ClaimableUSDC() calls = %d, want 1", got)
+	}
+	if got := fx.chain.balanceCalls["0xbuilder"]; got != 1 {
+		t.Fatalf("SpotBalance(builder) calls = %d, want one post-claim observation", got)
 	}
 	for _, saved := range fx.store.saved {
 		if saved.Payout == nil && saved.Phase != PhasePrepared {
@@ -57,6 +60,52 @@ func TestRunHappyPathOnlyPersistsFinalPayout(t *testing.T) {
 		report.SettlementBalance.Available != "0" {
 		t.Fatalf("run report = %#v", report)
 	}
+}
+
+func TestConsolidatorClaimsAndSweepsWithoutRecordsOrPayout(t *testing.T) {
+	fx := newFixture(t)
+	fx.store.current = &RunState{RunID: "existing", Phase: PhasePrepared}
+	consolidator, err := NewConsolidator(ConsolidatorConfig{
+		Chain: fx.chain, Notifier: fx.notifier, Logger: fx.logger,
+		Builders: []string{"0xbuilder"}, BuilderNames: map[string]string{"0xbuilder": "builder-1"},
+		Settlement: "0xsettlement", Network: "mainnet",
+		Clock: fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
+		Sleeper: fx.sleeper,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := consolidator.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(fx.chain.events, []string{
+		"submit:claimRewards:0xbuilder",
+		"submit:spotSend:0xbuilder",
+	}) {
+		t.Fatalf("chain events = %v", fx.chain.events)
+	}
+	if got := fx.chain.balances["0xbuilder"]; !got.IsZero() {
+		t.Fatalf("builder balance = %s, want zero", got)
+	}
+	if got := fx.chain.balances["0xsettlement"]; !got.Equal(decimal.RequireFromString("1.5")) {
+		t.Fatalf("settlement balance = %s, want 1.5", got)
+	}
+	if fx.repo.listCalls != 0 || len(fx.repo.completedIDs) != 0 {
+		t.Fatalf("repository calls: list=%d completed=%v", fx.repo.listCalls, fx.repo.completedIDs)
+	}
+	if fx.store.current == nil || fx.store.current.RunID != "existing" || len(fx.store.saved) != 0 {
+		t.Fatalf("funding state was changed: current=%#v saved=%#v", fx.store.current, fx.store.saved)
+	}
+	if len(fx.notifier.reports) != 0 {
+		t.Fatalf("consolidation delivered funding reports: %#v", fx.notifier.reports)
+	}
+	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != 1 {
+		t.Fatalf("claim balance waits = %d, want one", got)
+	}
+	assertLogFields(t, fx.logger, "funding_consolidation_completed", map[string]any{
+		"builder_count": int64(1), "warning_count": int64(0),
+	})
 }
 
 func TestScheduledRunReportsRetryAndFinalFailureDifferently(t *testing.T) {
@@ -182,6 +231,48 @@ func TestClaimableRewardQueryFailureAlertsWithoutSubmittingClaim(t *testing.T) {
 	assertLogFields(t, fx.logger, "funding_builder_action_failed", map[string]any{
 		"builder": "0xbuilder", "action_kind": "claimRewards", "outcome": "query",
 	})
+}
+
+func TestAllBuildersClaimBeforeOneSharedBalanceWait(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
+	fx.chain.balances["0xbuilder-2"] = decimal.RequireFromString("1.25")
+	orchestrator, err := NewOrchestrator(OrchestratorConfig{
+		Repository: fx.repo, Store: fx.store, Chain: fx.chain,
+		Notifier: fx.notifier, Logger: fx.logger,
+		Builders: []string{"0xbuilder", "0xbuilder-2"},
+		BuilderNames: map[string]string{
+			"0xbuilder": "builder-1", "0xbuilder-2": "builder-2",
+		},
+		Settlement: "0xsettlement", Recipient: "0xrecipient",
+		Clock: fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
+		Sleeper: fx.sleeper,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.orchestrator = orchestrator
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != 1 {
+		t.Fatalf("claim balance waits = %d, want one shared wait", got)
+	}
+	if !equalStrings(fx.chain.events, []string{
+		"submit:claimRewards:0xbuilder",
+		"submit:claimRewards:0xbuilder-2",
+		"submit:spotSend:0xbuilder",
+		"submit:spotSend:0xbuilder-2",
+		"submit:spotSend:0xsettlement",
+	}) {
+		t.Fatalf("chain events = %v", fx.chain.events)
+	}
+	for _, builder := range []string{"0xbuilder", "0xbuilder-2"} {
+		if got := fx.chain.balanceCalls[builder]; got != 1 {
+			t.Fatalf("SpotBalance(%s) calls = %d, want 1", builder, got)
+		}
+	}
 }
 
 func TestRunObservesBuilderAndSettlementRateLimits(t *testing.T) {
@@ -466,8 +557,8 @@ func TestUnknownPayoutBlocksAfterFiniteBalanceObservations(t *testing.T) {
 	if fx.store.current == nil || fx.store.current.Phase != PhaseBlocked || fx.store.archiveResult != "blocked" {
 		t.Fatalf("current = %#v, archive = %q", fx.store.current, fx.store.archiveResult)
 	}
-	if got := countDelay(fx.sleeper.delays, payoutBalanceObservationInterval); got != payoutBalanceObservationAttempts-1 {
-		t.Fatalf("one-second delays = %d, want bounded observations", got)
+	if got := countDelay(fx.sleeper.delays, payoutBalanceObservationInterval); got != payoutBalanceObservationAttempts {
+		t.Fatalf("one-second delays = %d, want claim wait plus bounded payout observations", got)
 	}
 	if len(fx.repo.completedIDs) != 0 {
 		t.Fatalf("database completed after ambiguous payout: %v", fx.repo.completedIDs)
@@ -517,23 +608,123 @@ func TestAvailableBalanceControlsBuilderSweepAndPayoutSufficiency(t *testing.T) 
 	}
 }
 
-func TestBuilderRewardDelayedVisibilityConvergesWithinFinitePolling(t *testing.T) {
+func TestClaimBalancePollingWaitsForVisibilityWhenSettlementIsPreFunded(t *testing.T) {
 	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
 	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
 	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{zero, zero}
 	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
-	if got := countDelay(fx.sleeper.delays, builderConvergenceInterval); got != 2 {
-		t.Fatalf("convergence delays = %d, want 2", got)
+	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != 3 {
+		t.Fatalf("claim balance waits = %d, want initial wait and two retry waits", got)
+	}
+	if got := fx.chain.balanceCalls["0xbuilder"]; got != 3 {
+		t.Fatalf("SpotBalance(builder) calls = %d, want 3", got)
+	}
+	if !equalStrings(fx.chain.events, []string{
+		"submit:claimRewards:0xbuilder",
+		"submit:spotSend:0xbuilder",
+		"submit:spotSend:0xsettlement",
+	}) {
+		t.Fatalf("chain events = %v", fx.chain.events)
+	}
+	if got := fx.chain.balances["0xbuilder"]; !got.IsZero() {
+		t.Fatalf("builder balance = %s, want zero", got)
 	}
 	if fx.store.archiveResult != "completed" {
 		t.Fatalf("archive = %q", fx.store.archiveResult)
 	}
 }
 
+func TestClaimBalancePollingExhaustionSweepsLatestWithoutBlockingPayout(t *testing.T) {
+	fx := newFixture(t)
+	latest := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("2"), Available: decimal.RequireFromString("0.5"),
+	}
+	fx.chain.balanceSequence["0xbuilder"] = make(
+		[]info.SpotBalanceAmounts, claimBalanceObservationAttempts,
+	)
+	for index := range fx.chain.balanceSequence["0xbuilder"] {
+		fx.chain.balanceSequence["0xbuilder"][index] = latest
+	}
+	fx.chain.balances["0xbuilder"] = latest.Total
+	fx.chain.holds["0xbuilder"] = latest.Total.Sub(latest.Available)
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if got := fx.chain.balanceCalls["0xbuilder"]; got != claimBalanceObservationAttempts {
+		t.Fatalf("SpotBalance(builder) calls = %d, want %d", got, claimBalanceObservationAttempts)
+	}
+	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != claimBalanceObservationAttempts {
+		t.Fatalf("claim balance waits = %d, want %d", got, claimBalanceObservationAttempts)
+	}
+	if !equalStrings(fx.chain.events, []string{
+		"submit:claimRewards:0xbuilder",
+		"submit:spotSend:0xbuilder",
+		"submit:spotSend:0xsettlement",
+	}) {
+		t.Fatalf("chain events = %v", fx.chain.events)
+	}
+	if fx.store.archiveResult != "completed" || len(fx.repo.completedIDs) == 0 {
+		t.Fatalf("archive = %q, completed = %v", fx.store.archiveResult, fx.repo.completedIDs)
+	}
+	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusWarning {
+		t.Fatalf("report = %#v, want completed payout with warning", fx.notifier.reports)
+	}
+	builderReport := fx.notifier.reports[0].Builders[0]
+	if builderReport.SweepAmount != "0.5" || builderReport.SweepStatus != ReportStepWarning {
+		t.Fatalf("builder report = %#v", builderReport)
+	}
+	assertLogFields(t, fx.logger, "funding_builder_claim_balance_observation_exhausted", map[string]any{
+		"builder":          "0xbuilder",
+		"attempt_count":    int64(claimBalanceObservationAttempts),
+		"claimable_usdc":   "1.5",
+		"balance_observed": true,
+		"last_total":       "2",
+		"last_available":   "0.5",
+	})
+}
+
+func TestClaimBalancePollingSkipsSweepAfterTenQueryFailures(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balanceErrors["0xbuilder"] = errors.New("spot balance unavailable")
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if got := fx.chain.balanceCalls["0xbuilder"]; got != claimBalanceObservationAttempts {
+		t.Fatalf("SpotBalance(builder) calls = %d, want %d", got, claimBalanceObservationAttempts)
+	}
+	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != claimBalanceObservationAttempts {
+		t.Fatalf("claim balance waits = %d, want %d", got, claimBalanceObservationAttempts)
+	}
+	if !equalStrings(fx.chain.events, []string{
+		"submit:claimRewards:0xbuilder",
+		"submit:spotSend:0xsettlement",
+	}) {
+		t.Fatalf("chain events = %v", fx.chain.events)
+	}
+	if fx.store.archiveResult != "completed" || len(fx.repo.completedIDs) == 0 {
+		t.Fatalf("archive = %q, completed = %v", fx.store.archiveResult, fx.repo.completedIDs)
+	}
+	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusWarning {
+		t.Fatalf("report = %#v, want completed payout with warning", fx.notifier.reports)
+	}
+	assertLogFields(t, fx.logger, "funding_builder_claim_balance_observation_exhausted", map[string]any{
+		"builder":          "0xbuilder",
+		"attempt_count":    int64(claimBalanceObservationAttempts),
+		"claimable_usdc":   "1.5",
+		"balance_observed": false,
+	})
+}
+
 func TestBuilderConvergenceExhaustionIsOrdinaryError(t *testing.T) {
 	fx := newFixture(t)
+	fx.chain.claimableRewards["0xbuilder"] = decimal.Zero
 	fx.chain.balances["0xbuilder"] = decimal.Zero
 	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil || IsFatal(err) {

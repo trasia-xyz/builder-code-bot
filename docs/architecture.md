@@ -19,6 +19,11 @@ Builder 和 settlement 都归属发送方账户，内部 claim/sweep 可以安�
 settlement -> recipient 是唯一对外资金边界，也是唯一需要 exactly-once 防护的动作。
 服务是单实例串行流程，`data/LOCK` 防止同一工作目录误双开。
 
+`--consolidate-only` 是独立的一次性内部归集入口：复用第 2、3 步的 claim 与 sweep 规则后退出，
+不连接 MySQL，不读取或修改 funding records、current、backup 或 history，不构造或发送
+recipient payout，也不启动 scheduler。该入口只解密 builder 私钥，但仍获取相同的
+`data/LOCK`，因此不能与常驻服务并行操作同一批账户。
+
 ## 2. 余额语义
 
 一次 spot 查询返回两个明确数值：
@@ -39,17 +44,36 @@ settlement -> recipient 是唯一对外资金边界，也是唯一需要 exactly
 token index（当前为 `0`），读取该 token state 的 `unclaimedRewards`。最外层同名字段是所有
 reward 币种折算后的汇总值，不用于判断。USDC reward 严格超过 1 时才提交 claim，等于或低于
 1 时只记录 INFO 并跳过，不发送告警；`tokenToState` 为空或没有 USDC 条目同样视为 0。
-字段缺失、结构或金额非法、查询失败以及实际 claim 失败仍记录并告警。之后最多进行 5 轮
-无持久化收敛：
+字段缺失、结构或金额非法、查询失败以及实际 claim 失败仍记录并告警。Builder 按配置顺序
+串行查询和提交 claim；全部 claim 提交完成后，如果至少存在一个已接受或结果不确定的 claim，
+统一等待约 1 秒，再开始余额可见性查询，不为每个 builder 分别等待。
 
-1. 查询每个 builder 的 available；正数就全部 sweep 到 settlement。
-2. 查询 settlement available；达到 `payout_total` 时立即停止收敛。
-3. 尚不足时等待约 1 秒再进入下一轮。
+对每个需要确认的 builder，最多查询 10 次 spot balance。`Available >= claimable` 时认为本次
+claim 余额已经可见，该 builder 不再继续查询；尚未满足且仍有下一次机会时等待约 1 秒。首次
+查询前的等待加上 9 次轮次间等待，使余额刷新等待最多约 10 秒（不含 HTTP 耗时）。这里不在
+claim 前额外查询余额，也不把该条件当作 payout 的安全证明；它只是内部归集的实用可见性判断。
+查询成功的最新余额会直接复用于 sweep，避免再次调用 info 接口。
 
-单个 builder 的 prepare、submit 或查询失败会记录和告警，但其他 builder 继续。有限轮次
-仍不足时返回普通错误，current 保持 `prepared`，调度器约 1 分钟后通过同一恢复路径再试，
-最多自动重试 5 次。
-内部 submit 结果不确定不建立持久化协议；下一轮继续依据实时余额收敛。
+10 次耗尽后记录 warning，并按照最后一次成功读取的 `Available` 尽力 sweep；如果一次余额都
+没有读取成功，则在首次归集时跳过该 builder。若 settlement 仍不足，后续内部收敛轮次仍会
+重新查询实时余额。余额未确认刷新、查询失败或内部 sweep 失败都不阻塞由已有 settlement
+资金支持的 payout。
+
+完成上述可见性查询后，内部资金仍按最多 5 轮无持久化方式收敛：
+
+1. 将每个 builder 最新的正 `Available` 全部 sweep 到 settlement。
+2. 查询 settlement available；达到 `payout_total` 时立即停止收敛并执行 payout，即使某个
+   builder 存在余额可见性或归集 warning。
+3. settlement 尚不足时等待约 1 秒，再查询实时 builder 余额并进入下一轮。
+
+单个 builder 的 prepare、submit 或查询失败会记录和告警，但其他 builder 继续。5 轮后
+settlement 仍不足时返回普通错误，current 保持 `prepared`，调度器约 1 分钟后通过同一恢复
+路径再试，最多自动重试 5 次。内部 submit 结果不确定不建立持久化协议；下一轮继续依据实时
+余额收敛。
+
+`--consolidate-only` 复用相同的串行 claim、统一等待和最多 10 次余额可见性查询，但只执行一次
+builder sweep。它没有 payout 金额，也不以 settlement 余额是否足够作为继续或成功的条件；
+余额可见性次数耗尽时仍按最后一次成功读取的 available 尽力归集。
 
 ## 4. 数据快照与金额
 
@@ -150,10 +174,11 @@ Scheduler 的普通失败在尚有剩余次数时发送精简的橙色重试通�
 最后一次普通失败发送完整报告。启动恢复实际处理了 current 时也发送完整报告；没有 current
 的启动检查不发送邮件。
 
-成功 funding run 等待下一 UTC 01:00。普通错误（API 暂时失败、reward 未可见、归集不足）
-约 1 分钟后重试，最多重试 5 次；全部失败则返回 retry-exhausted 错误并退出。Fatal payout
-错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL 自身
-的维护恢复仍无限重试。
+成功 funding run 等待下一 UTC 01:00。单个 builder 的 reward 未在 10 次查询内可见只产生
+warning；只有 API 暂时失败或 settlement 归集后仍不足等导致本轮无法 payout 的普通错误，
+才会约 1 分钟后重试，最多重试 5 次。全部失败则返回 retry-exhausted 错误并退出。Fatal
+payout 错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL
+自身的维护恢复仍无限重试。
 
 ## 9. 安全与测试不变量
 
@@ -162,7 +187,8 @@ Scheduler 的普通失败在尚有剩余次数时发送精简的橙色重试通�
 3. 只有 primary `payout_prepared` 可以首次发送。
 4. 可能已发送或 blocked 的 payout 只观察/停止，不自动重发。
 5. Payout 确认后只允许数据库完成和归档。
-6. Builder 内部归集可重复并按实时 available 自动收敛。
+6. Builder 内部归集可重复并按实时 available 自动收敛，但不是已有 settlement 资金执行
+   payout 的硬前提。
 7. Envelope schema version 保持 `1`，没有兼容旧 schema 的分支。
 
 测试保留真实 HTTP mock、签名已知向量、claimRewards/spotSend、primary/backup 恢复、状态原子

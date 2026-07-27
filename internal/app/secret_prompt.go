@@ -68,14 +68,22 @@ func resolvePassword(configured secret.SecretString, prompt SecretPrompt) (secre
 }
 
 func buildSigners(cfg config.Config, password secret.SecretString) (map[string]signing.PrivateKey, error) {
-	signers := make(map[string]signing.PrivateKey, len(cfg.Builders)+1)
+	signers, err := buildBuilderSigners(cfg, password)
+	if err != nil {
+		return nil, err
+	}
+	if err := addSigner(signers, "settlement", cfg.Settlement.Address, cfg.Settlement.EncryptedPrivateKey, password); err != nil {
+		return nil, err
+	}
+	return signers, nil
+}
+
+func buildBuilderSigners(cfg config.Config, password secret.SecretString) (map[string]signing.PrivateKey, error) {
+	signers := make(map[string]signing.PrivateKey, len(cfg.Builders))
 	for _, builder := range cfg.Builders {
 		if err := addSigner(signers, builder.Name, builder.Address, builder.EncryptedPrivateKey, password); err != nil {
 			return nil, err
 		}
-	}
-	if err := addSigner(signers, "settlement", cfg.Settlement.Address, cfg.Settlement.EncryptedPrivateKey, password); err != nil {
-		return nil, err
 	}
 	return signers, nil
 }
