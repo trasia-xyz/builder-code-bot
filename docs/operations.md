@@ -73,8 +73,12 @@ run。启动阶段失败会直接返回，由值守人员处理。进入 UTC Sch
 输入私钥解密密码后，日志会依次报告私钥初始化、MySQL pool、进程锁、current 检查和
 pending records 查询。进入 Scheduler 等待后会通过 `next_run_at` 报告下一轮执行时间；失败
 重试前也会更新该时间。控制台格式会在每次 funding task 或启动恢复检查前插入空行，并用
-`==========` 标记起始日志，便于区分相邻轮次；JSON 格式不插入展示用分隔。MySQL pool 使用
-延迟连接，真正的首次建连发生在 pending 查询期间。
+`==========` 标记起始日志，便于区分相邻轮次。控制台属性使用
+`Label: value` 和 `│` 分隔，不显示与消息重复的 `event`；布尔值显示为 `yes`/`no`，USDC
+金额会带单位。在连接 TTY 且 `logging.color = "auto"` 时，Payout、Claimable、余额和转账
+金额会优先排列并以粗体青色突出显示；重定向到文件或管道时自动关闭 ANSI 颜色。JSON 格式
+保留原始字段和 `event`，且不插入展示用分隔。MySQL pool 使用延迟连接，真正的首次建连发生
+在 pending 查询期间。
 
 每次 funding task 执行结束后（包括成功、失败以及没有 pending records），都会查询所有 builder
 和 settlement 的 Hyperliquid 地址请求额度。`funding_user_rate_limit_observed` 日志包含

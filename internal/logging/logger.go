@@ -189,12 +189,17 @@ func (r *handleErrorReporter) report(now time.Time, level slog.Level, msg string
 		return
 	}
 	if suppressed > 0 {
-		fmt.Fprintf(os.Stderr, "logging: failed to write log record level=%s msg=%q error=%v suppressed=%d\n",
-			levelName(level), msg, err, suppressed)
+		fmt.Fprintf(os.Stderr, "logging: failed to write log record%sLevel: %s%sMessage: %q%sError: %v%sSuppressed: %d\n",
+			consoleFieldSeparator, levelName(level),
+			consoleFieldSeparator, msg,
+			consoleFieldSeparator, err,
+			consoleFieldSeparator, suppressed)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "logging: failed to write log record level=%s msg=%q error=%v\n",
-		levelName(level), msg, err)
+	fmt.Fprintf(os.Stderr, "logging: failed to write log record%sLevel: %s%sMessage: %q%sError: %v\n",
+		consoleFieldSeparator, levelName(level),
+		consoleFieldSeparator, msg,
+		consoleFieldSeparator, err)
 }
 
 func (r *handleErrorReporter) shouldReport(now time.Time) (bool, int) {

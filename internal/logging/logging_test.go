@@ -162,7 +162,7 @@ func TestLoggingNewRedactsSecretString(t *testing.T) {
 	New(Config{Format: FormatConsole, Output: consoleBuf}).Info(context.Background(), "secret string", Any("note", value))
 
 	line := consoleBuf.String()
-	if !strings.Contains(line, "note="+redactedValue) {
+	if !strings.Contains(line, "Note: "+redactedValue) {
 		t.Fatalf("expected console SecretString to be redacted, got %q", line)
 	}
 	if strings.Contains(line, raw) {
@@ -206,10 +206,10 @@ func TestGroupedSensitiveKeyPathsAreRedacted(t *testing.T) {
 	)
 
 	line := consoleBuf.String()
-	if !strings.Contains(line, "wallet.address="+redactedValue) {
+	if !strings.Contains(line, "Wallet / Address: "+redactedValue) {
 		t.Fatalf("expected grouped wallet address to be redacted in console line: %q", line)
 	}
-	if !strings.Contains(line, "public.address=visible") {
+	if !strings.Contains(line, "Public / Address: visible") {
 		t.Fatalf("expected public address to remain visible in console line: %q", line)
 	}
 	if strings.Contains(line, "0xsecret") {
@@ -253,10 +253,10 @@ func TestWithRedactsGroupedSensitiveKeyPaths(t *testing.T) {
 	consoleLogger.Info(context.Background(), "with grouped")
 
 	line := consoleBuf.String()
-	if !strings.Contains(line, "wallet.address="+redactedValue) {
+	if !strings.Contains(line, "Wallet / Address: "+redactedValue) {
 		t.Fatalf("expected grouped wallet address from With to be redacted in console line: %q", line)
 	}
-	if !strings.Contains(line, "public.address=visible") {
+	if !strings.Contains(line, "Public / Address: visible") {
 		t.Fatalf("expected public address from With to remain visible in console line: %q", line)
 	}
 	if strings.Contains(line, "0xsecret") {
@@ -282,10 +282,10 @@ func TestNilErrorAttrIsOmitted(t *testing.T) {
 	consoleLogger.Info(context.Background(), "nil error", Err(nil), String("safe", "visible"))
 
 	line := consoleBuf.String()
-	if strings.Contains(line, "error=") {
+	if strings.Contains(line, "Error:") {
 		t.Fatalf("nil error attr should be omitted from console line: %q", line)
 	}
-	if !strings.Contains(line, "safe=visible") {
+	if !strings.Contains(line, "Safe: visible") {
 		t.Fatalf("expected safe field in console line: %q", line)
 	}
 }
@@ -419,9 +419,9 @@ func TestConsoleFormatWritesHumanReadableLine(t *testing.T) {
 	for _, want := range []string{
 		"DEBUG",
 		"published oracle",
-		"component=oracle",
-		"coin_count=12",
-		"password=" + redactedValue,
+		"Component: oracle",
+		"Coin count: 12",
+		"Password: " + redactedValue,
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("expected %q in console log line %q", want, line)
@@ -429,6 +429,9 @@ func TestConsoleFormatWritesHumanReadableLine(t *testing.T) {
 	}
 	if strings.Contains(line, "\x1b[") {
 		t.Fatalf("buffer output must not be colorized, got %q", line)
+	}
+	if strings.Contains(line, "component=") || strings.Contains(line, "coin_count=") {
+		t.Fatalf("console fields must not use key=value formatting: %q", line)
 	}
 }
 
@@ -446,9 +449,9 @@ func TestConsolePrefixPrefixesMessage(t *testing.T) {
 		t.Fatalf("prefix was not placed before message: %q", line)
 	}
 	if strings.Contains(line, consolePrefixKey) {
-		t.Fatalf("console prefix must not be logged as key=value: %q", line)
+		t.Fatalf("console prefix must not be logged as a field: %q", line)
 	}
-	if !strings.Contains(line, "dex=asia") {
+	if !strings.Contains(line, "DEX: asia") {
 		t.Fatalf("expected ordinary attrs to remain: %q", line)
 	}
 }
@@ -492,7 +495,10 @@ func TestConsoleSeparatorAddsBlankLineBeforeRecord(t *testing.T) {
 		t.Fatalf("task marker was not placed before the message: %q", output)
 	}
 	if strings.Contains(output, consoleSeparatorKey) {
-		t.Fatalf("console separator leaked as key=value: %q", output)
+		t.Fatalf("console separator leaked as a field: %q", output)
+	}
+	if strings.Contains(output, "funding_task_started") || strings.Contains(output, "Event:") {
+		t.Fatalf("machine event metadata leaked into console output: %q", output)
 	}
 }
 
@@ -533,11 +539,11 @@ func TestConsoleFormatExpandsGroupsAndEscapesValues(t *testing.T) {
 
 	line := buf.String()
 	for _, want := range []string{
-		"component=leader",
-		"lease.ddb.pk=dex#prod",
-		"lease.ddb.secret=" + redactedValue,
-		`lease.note="hello world"`,
-		`lease.empty=""`,
+		"Component: leader",
+		"Lease / DDB / PK: dex#prod",
+		"Lease / DDB / Secret: " + redactedValue,
+		"Lease / Note: hello world",
+		`Lease / Empty: ""`,
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("expected %q in console log line %q", want, line)
@@ -552,12 +558,14 @@ func TestConsoleFormatValues(t *testing.T) {
 		attr slog.Attr
 		want string
 	}{
-		{name: "bool", attr: Bool("enabled", true), want: "enabled=true"},
-		{name: "int64", attr: Int64("nonce", 1781153533123), want: "nonce=1781153533123"},
-		{name: "uint64", attr: Uint64("height", 99), want: "height=99"},
-		{name: "duration", attr: Duration("latency", 25*time.Millisecond), want: "latency=25ms"},
-		{name: "time", attr: Time("block_time", when), want: "block_time=2026-06-11T10:12:13.123456Z"},
-		{name: "any nil", attr: Any("payload", nil), want: "payload=<nil>"},
+		{name: "bool", attr: Bool("enabled", true), want: "Enabled: yes"},
+		{name: "int64", attr: Int64("nonce", 1781153533123), want: "Nonce: 1781153533123"},
+		{name: "uint64", attr: Uint64("height", 99), want: "Height: 99"},
+		{name: "duration", attr: Duration("latency", 25*time.Millisecond), want: "Latency: 25ms"},
+		{name: "time", attr: Time("block_time", when), want: "Block time: 2026-06-11T10:12:13.123456Z"},
+		{name: "any nil", attr: Any("payload", nil), want: "Payload: <nil>"},
+		{name: "control character", attr: String("detail", "first\nsecond"), want: `Detail: "first\nsecond"`},
+		{name: "field separator", attr: String("detail", "left │ right"), want: `Detail: "left │ right"`},
 	}
 
 	for _, tt := range tests {
@@ -589,8 +597,8 @@ func TestAnyMapAttrsRemainLoggable(t *testing.T) {
 
 	consoleBuf := new(bytes.Buffer)
 	New(Config{Format: FormatConsole, Output: consoleBuf}).Info(context.Background(), "map payload", Any("payload", map[string]int{"n": 1}))
-	if !strings.Contains(consoleBuf.String(), `payload="{\"n\":1}"`) {
-		t.Fatalf("expected escaped map payload in console line: %q", consoleBuf.String())
+	if !strings.Contains(consoleBuf.String(), `Payload: {"n":1}`) {
+		t.Fatalf("expected readable map payload in console line: %q", consoleBuf.String())
 	}
 }
 
@@ -646,7 +654,7 @@ func TestConsoleFormatAddsRepoRelativeSourceWhenEnabled(t *testing.T) {
 	logger.Info(context.Background(), "with source")
 
 	line := buf.String()
-	if !strings.Contains(line, "source=internal/logging/logging_test.go:") {
+	if !strings.Contains(line, "Source: internal/logging/logging_test.go:") {
 		t.Fatalf("expected repo-relative source in console line %q", line)
 	}
 	if strings.Contains(line, "/builder-code/") {
@@ -714,9 +722,9 @@ func TestLoggerReportsHandleErrorToStderr(t *testing.T) {
 
 	for _, want := range []string{
 		"logging: failed to write log record",
-		"level=INFO",
-		`msg="write_failure"`,
-		"error=write failed",
+		"Level: INFO",
+		`Message: "write_failure"`,
+		"Error: write failed",
 	} {
 		if !strings.Contains(stderr, want) {
 			t.Fatalf("expected %q in stderr diagnostic %q", want, stderr)
@@ -742,13 +750,13 @@ func TestHandleErrorReporterRateLimitsAndReportsSuppressed(t *testing.T) {
 	if count := strings.Count(stderr, "logging: failed to write log record"); count != 2 {
 		t.Fatalf("expected two stderr diagnostics, got %d in %q", count, stderr)
 	}
-	if !strings.Contains(stderr, `msg="first"`) {
+	if !strings.Contains(stderr, `Message: "first"`) {
 		t.Fatalf("expected first diagnostic, got %q", stderr)
 	}
-	if !strings.Contains(stderr, `msg="fourth"`) || !strings.Contains(stderr, "suppressed=2") {
+	if !strings.Contains(stderr, `Message: "fourth"`) || !strings.Contains(stderr, "Suppressed: 2") {
 		t.Fatalf("expected suppressed count on second diagnostic, got %q", stderr)
 	}
-	if strings.Contains(stderr, `msg="second"`) || strings.Contains(stderr, `msg="third"`) {
+	if strings.Contains(stderr, `Message: "second"`) || strings.Contains(stderr, `Message: "third"`) {
 		t.Fatalf("rate-limited diagnostics should not be emitted individually: %q", stderr)
 	}
 }
@@ -772,6 +780,65 @@ func TestConsoleHandlerColorizesLevels(t *testing.T) {
 				t.Fatalf("unexpected colorized level: got %q want containing %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestConsoleHandlerHighlightsUSDCFields(t *testing.T) {
+	buf := new(bytes.Buffer)
+	handler := newConsoleHandler(buf, slog.LevelDebug, false, true, nil)
+	logger := slog.New(handler)
+
+	logger.Info("funding snapshot calculated",
+		slog.String("event", "funding_snapshot_calculated"),
+		slog.String("payout_total", "12.5"),
+		slog.String("claimable_usdc", "2.25"),
+		slog.String("run_id", "run-1"),
+	)
+
+	line := buf.String()
+	for _, want := range []string{
+		ansiBoldCyan + "Payout: 12.5 USDC" + ansiReset,
+		ansiBoldCyan + "Claimable: 2.25 USDC" + ansiReset,
+		"Run ID: run-1",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("expected %q in colorized console line %q", want, line)
+		}
+	}
+	if strings.Contains(line, "funding_snapshot_calculated") || strings.Contains(line, "event=") {
+		t.Fatalf("event metadata must be omitted from console output: %q", line)
+	}
+	if payout, run := strings.Index(line, "Payout:"), strings.Index(line, "Run ID:"); payout < 0 || run < 0 || payout > run {
+		t.Fatalf("prominent amount fields must appear before run metadata: %q", line)
+	}
+}
+
+func TestConsoleHandlerDoesNotAddUSDCColorWhenDisabled(t *testing.T) {
+	buf := new(bytes.Buffer)
+	handler := newConsoleHandler(buf, slog.LevelDebug, false, false, nil)
+	slog.New(handler).Info("snapshot", slog.String("payout_total", "12.5"))
+
+	line := buf.String()
+	if !strings.Contains(line, "Payout: 12.5 USDC") {
+		t.Fatalf("expected human-readable payout field in %q", line)
+	}
+	if strings.Contains(line, "\x1b[") {
+		t.Fatalf("disabled color must not emit ANSI escapes: %q", line)
+	}
+}
+
+func TestJSONPreservesRawAmountAndEventFields(t *testing.T) {
+	buf := new(bytes.Buffer)
+	logger := New(Config{Format: FormatJSON, Output: buf})
+
+	logger.Info(context.Background(), "snapshot",
+		String("event", "funding_snapshot_calculated"),
+		String("payout_total", "12.5"),
+	)
+
+	event := decodeEvent(t, buf.String())
+	if event["event"] != "funding_snapshot_calculated" || event["payout_total"] != "12.5" {
+		t.Fatalf("JSON fields were changed by console presentation: %#v", event)
 	}
 }
 
@@ -1087,7 +1154,7 @@ func TestSourceOmittedWhenAddSourceDisabled(t *testing.T) {
 
 	consoleBuf := new(bytes.Buffer)
 	New(Config{Format: FormatConsole, Output: consoleBuf}).Info(context.Background(), "no source")
-	if strings.Contains(consoleBuf.String(), "source=") {
+	if strings.Contains(consoleBuf.String(), "Source:") {
 		t.Fatalf("source must be omitted from console line: %q", consoleBuf.String())
 	}
 }
@@ -1122,7 +1189,7 @@ func TestConsolePrefixIgnoredInsideGroup(t *testing.T) {
 	if strings.Contains(line, consolePrefixKey) {
 		t.Fatalf("nested ConsolePrefix must not leak as a field: %q", line)
 	}
-	if !strings.Contains(line, "ctx.dex=asia") {
+	if !strings.Contains(line, "Ctx / DEX: asia") {
 		t.Fatalf("ordinary group attrs must remain: %q", line)
 	}
 }
@@ -1162,7 +1229,7 @@ func TestConsoleRedactsSensitiveGroupBeforeResolvingChildren(t *testing.T) {
 	}
 
 	line := buf.String()
-	if !strings.Contains(line, "private_key.value="+redactedValue) {
+	if !strings.Contains(line, "Private key / Value: "+redactedValue) {
 		t.Fatalf("expected sensitive group child to be redacted: %q", line)
 	}
 	if strings.Contains(line, "boom from String") || strings.Contains(line, "{}") {
