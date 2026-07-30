@@ -8,9 +8,17 @@ import (
 )
 
 const (
-	dailyRunHourUTC    = 1
-	NonfatalRetryDelay = time.Minute
-	MaxNonfatalRetries = 5
+	dailySnapshotHourUTC = 0
+	dailyRunHourUTC      = 1
+	NonfatalRetryDelay   = time.Minute
+	MaxNonfatalRetries   = 5
+)
+
+type Task string
+
+const (
+	TaskClaimableSnapshot Task = "claimable_snapshot"
+	TaskFunding           Task = "funding"
 )
 
 // RetryExhaustedError terminates the service after a scheduled funding task
@@ -34,17 +42,32 @@ type Timer interface {
 type Scheduler struct {
 	now      func() time.Time
 	newTimer func(time.Duration) Timer
-	onError  func(error)
-	onWait   func(time.Time)
+	onError  func(Task, error)
+	onWait   func(Task, time.Time)
 }
 
-func New(onError func(error), onWait func(time.Time)) *Scheduler {
+func New(onError func(Task, error), onWait func(Task, time.Time)) *Scheduler {
 	return &Scheduler{
 		now:      time.Now,
 		newTimer: func(delay time.Duration) Timer { return systemTimer{Timer: time.NewTimer(delay)} },
 		onError:  onError,
 		onWait:   onWait,
 	}
+}
+
+func NextScheduledTaskUTC(now time.Time) (Task, time.Time) {
+	utc := now.UTC()
+	snapshotAt := time.Date(
+		utc.Year(), utc.Month(), utc.Day(), dailySnapshotHourUTC, 0, 0, 0, time.UTC,
+	)
+	if !snapshotAt.Before(utc) {
+		return TaskClaimableSnapshot, snapshotAt
+	}
+	runAt := time.Date(utc.Year(), utc.Month(), utc.Day(), dailyRunHourUTC, 0, 0, 0, time.UTC)
+	if !runAt.Before(utc) {
+		return TaskFunding, runAt
+	}
+	return TaskClaimableSnapshot, snapshotAt.AddDate(0, 0, 1)
 }
 
 func NextDailyRunUTC(now time.Time) time.Time {
@@ -56,15 +79,19 @@ func NextDailyRunUTC(now time.Time) time.Time {
 	return nextRunAt
 }
 
-func (s *Scheduler) Run(ctx context.Context, run func(context.Context) error) error {
+func (s *Scheduler) Run(
+	ctx context.Context,
+	captureSnapshot func(context.Context) error,
+	runFunding func(context.Context) error,
+) error {
 	if ctx == nil {
 		return fmt.Errorf("scheduler context is nil")
 	}
 	if s == nil || s.now == nil || s.newTimer == nil {
 		return fmt.Errorf("scheduler is not initialized")
 	}
-	if run == nil {
-		return fmt.Errorf("scheduler callback is nil")
+	if captureSnapshot == nil || runFunding == nil {
+		return fmt.Errorf("scheduler callbacks are required")
 	}
 	retries := 0
 	for {
@@ -72,8 +99,9 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context) error) er
 			return err
 		}
 		now := s.now()
-		nextRunAt := NextDailyRunUTC(now)
+		task, nextRunAt := NextScheduledTaskUTC(now)
 		if retries > 0 {
+			task = TaskFunding
 			nextRunAt = now.UTC().Add(NonfatalRetryDelay)
 		}
 		delay := nextRunAt.Sub(now)
@@ -85,7 +113,7 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context) error) er
 			return fmt.Errorf("scheduler timer is not initialized")
 		}
 		if s.onWait != nil {
-			s.onWait(nextRunAt)
+			s.onWait(task, nextRunAt)
 		}
 		select {
 		case <-ctx.Done():
@@ -94,9 +122,23 @@ func (s *Scheduler) Run(ctx context.Context, run func(context.Context) error) er
 		case <-timer.Chan():
 			timer.Stop()
 		}
-		if err := run(ctx); err != nil {
+		if task == TaskClaimableSnapshot {
+			if err := captureSnapshot(ctx); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				if s.onError != nil {
+					s.onError(task, err)
+				}
+			}
+			continue
+		}
+		if err := runFunding(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			if s.onError != nil {
-				s.onError(err)
+				s.onError(task, err)
 			}
 			if isFatal(err) {
 				return err

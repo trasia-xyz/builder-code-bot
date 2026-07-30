@@ -66,14 +66,21 @@ Mail 与 iOS Gmail 的标题、列表预览和正文渲染。`--consolidate-only
 
 启动阶段最多立即执行一个 funding run：存在 current 时只恢复 current，即使指定
 `--run-on-start` 也不会继续创建新 run；没有 current 且指定 `--run-on-start` 时才创建新
-run。启动阶段失败会直接返回，由值守人员处理。进入 UTC Scheduler 后，普通错误每隔约
-1 分钟最多重试 5 次；全部失败或 payout fatal 都会退出。不要为这些退出配置无间隔自动
-重启，否则进程重启会开启一组新的重试，绕过单次任务的自动重试上限。
+run。启动阶段失败会直接返回，由值守人员处理。进入 UTC Scheduler 后，每天 UTC 00:00
+（北京时间 08:00）先执行只读 claimable 快照，UTC 01:00（北京时间 09:00）再执行资金任务。
+canonical USDC 元数据及每个 builder 的 claimable 查询分别最多尝试 3 次，失败尝试之间等待
+2 秒，并且只重试失败项。重试耗尽后的快照查询失败会记录并留待 01:00 报告展示，不会阻止
+资金任务；资金任务普通
+错误每隔约 1 分钟最多重试 5 次，全部失败或 payout fatal 才会退出。不要为这些退出配置
+无间隔自动重启，否则进程重启会开启一组新的重试，绕过单次任务的自动重试上限。
+为保证零点口径，服务不会在错过 UTC 00:00 后用更晚的值冒充补采；若当时服务未运行，
+UTC 01:00 报告会明确显示当日快照未捕获。
 
 输入私钥解密密码后，日志会依次报告私钥初始化、MySQL pool、进程锁、current 检查和
-pending records 查询。进入 Scheduler 等待后会通过 `next_run_at` 报告下一轮执行时间；失败
-重试前也会更新该时间。控制台格式会在每次 funding task 或启动恢复检查前插入空行，并用
-`==========` 标记起始日志，便于区分相邻轮次。控制台属性使用
+pending records 查询。进入 Scheduler 等待后会通过 `scheduled_task` 与 `next_run_at`
+报告下一项任务及执行时间；funding 失败重试前也会更新该时间。控制台格式会在每次 funding
+task 或启动恢复检查前插入空行，并用 `==========` 标记起始日志，便于区分相邻轮次。
+控制台属性使用
 `Label: value` 和 `│` 分隔，不显示与消息重复的 `event`；布尔值显示为 `yes`/`no`，USDC
 金额会带单位。在连接 TTY 且 `logging.color = "auto"` 时，Payout、Claimable、余额和转账
 金额会优先排列并以粗体青色突出显示；重定向到文件或管道时自动关闭 ANSI 颜色。JSON 格式
@@ -102,6 +109,21 @@ Funding report 的标题状态如下：
 `Hold`、`Available` 与完整地址。最终余额查询失败只会把报告标记为有告警，不会改变原
 funding 结果。
 
+报告中的“UTC 00:00 Claimable 快照”是后端零点结算的对账口径，单独展示捕获时间、
+各 builder claimable、成功覆盖数、合计、本轮数据库 Payout 及 `Claimable - Payout` 差额。
+Builder 明细的“执行时 Reward”
+来自 01:00 主任务实时查询，可能包含零点后一个小时新增的 reward。快照只读，不参与 claim、
+归集、资金充足性或 Payout 判断；定时任务报告中快照缺失、损坏或部分查询失败会显示 warning，
+但主资金任务照常执行。精简重试邮件也保留该快照区块。
+
+当快照完整且 `Claimable >= Payout` 时，对账正常，快照区块显示
+“完整，Claimable ≥ Payout”以及绿色的零或正差额，不新增对账 warning；主任务没有其他
+异常时，报告维持 success。
+
+当快照完整且 `Claimable < Payout` 时，邮件状态升级为 warning，快照区块标红并展示
+Claimable、Payout、负差额和短缺金额，要求人工核查结算口径。该告警绝不作为付款门槛；
+Settlement available 足够时，主任务必须继续正常 payout。
+
 从 `payout_prepared`、`payout_submitting` 或 `payout_confirmed` 恢复时，历史 Builder 报告
 明细无法从 durable state 重建。邮件会明确标记为“历史明细未持久化，本次恢复未重复执行”，
 不会把未知的 Reward 或 Sweep 结果显示为成功。
@@ -111,15 +133,20 @@ funding 结果。
 ```text
 data/
 ├── LOCK
+├── claimable-snapshots/
+│   └── YYYY-MM-DD.json
 ├── current.json
 ├── current.json.bak
 └── history/
 ```
 
 备份时先优雅停止服务，再一起复制 `config.toml` 和完整 `data/`，保留目录 `0700`、文件
-`0600`。恢复后先不带 `--run-on-start` 启动。不要在运行中修改 current、backup 或 history。
+`0600`。恢复后先不带 `--run-on-start` 启动。不要在运行中修改 claimable snapshots、
+current、backup 或 history。
 
-Primary 无效时自动使用有效 backup 并告警。Primary `payout_prepared` 可以首次发送；从
+`claimable-snapshots` 按 UTC 日期保存首次零点观察，使用 checksum 和私有文件权限；它不属于
+payout journal，损坏或缺失时不得通过复制其他日期的文件来伪造。Primary 无效时自动使用有效
+backup 并告警。Primary `payout_prepared` 可以首次发送；从
 backup 恢复同一 phase 时，更新的 primary 可能已提交，因此只观察 total，不会重发。
 Schema version 当前且始终从 `1` 开始；项目没有 migration 或旧 schema fallback。
 
@@ -131,10 +158,15 @@ History 只包含 `completed`、`rejected`、`blocked`、`failed_validation`。�
 
 ## Builder 归集与普通错误
 
-每轮先查询所有 builder 的 referral info，并读取 `tokenToState` 中 token index `0` 的
-`unclaimedRewards`；不要使用最外层的全币种汇总字段。该 USDC 数值严格超过 1 才提交 claim，
-等于或低于 1、列表为空或没有 index `0` 时正常跳过且不告警。字段缺失、响应非法、查询失败
+UTC 00:00 快照和 UTC 01:00 主任务都会查询所有 builder 的 referral info，并读取
+`tokenToState` 中 token index `0` 的 `unclaimedRewards`；不要使用最外层的全币种汇总字段。
+该 USDC 数值严格超过 1 才提交 claim，等于或低于 1、列表为空或没有 index `0` 时正常跳过且
+不告警。字段缺失、响应非法、查询失败
 或实际 claim 失败仍会告警。
+
+零点快照阶段只读取并保存 `unclaimedRewards`，绝不根据阈值提交 claim；上述“超过 1 才
+claim”只适用于 01:00 主任务。若当日快照文件已存在，Scheduler 会跳过重复查询，避免覆盖
+首次零点口径。单个 builder 的查询成功后不会因其他 builder 重试而被再次查询。
 
 Builder claim 按配置顺序串行提交。全部提交结束后统一等待约 1 秒，再对已接受或结果不确定的
 claim 查询 spot balance。每个 builder 最多查询 10 次，`available >= claimable` 即停止该

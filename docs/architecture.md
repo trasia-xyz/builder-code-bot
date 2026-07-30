@@ -5,15 +5,28 @@
 
 ## 1. 系统目标与边界
 
-服务在 UTC 01:00 运行，也可用 `--run-on-start` 在启动时立即运行。一次触发最多处理一个
-funding run：存在 current 时只恢复该 run，不再连续创建新 run；没有 current 时才读取
-pending records 并创建新 run。
+服务每天在 UTC 00:00（北京时间 08:00）只读查询一次所有 builder 的 canonical USDC
+claimable reward，并按 UTC 日期持久化对账快照；UTC 01:00（北京时间 09:00）执行资金任务。
+也可用 `--run-on-start` 在启动时立即执行资金任务。一次资金触发最多处理一个 funding run：
+存在 current 时只恢复该 run，不再连续创建新 run；没有 current 时才读取 pending records
+并创建新 run。
 
 1. 从 MySQL 冻结全部 `status = 0` records。
 2. 查询所有 builder 的 claimable USDC，仅在超过 1 USDC 时执行 `claimRewards`。
 3. 依据实时 available spot USDC 将 builder 资金归集到 settlement。
 4. settlement 向固定 recipient 发送一笔 payout。
 5. payout 确认后将冻结 records 标记完成。
+
+00:00 快照与上述状态机隔离：它不读取 funding records，不 claim、不归集、不付款，也不参与
+资金充足性或 payout 判断。01:00 资金任务仍按执行时的实时 claimable 值操作，因此邮件同时
+保留两个口径：零点快照用于和后端零点结算对账，执行时值可能包含 00:00–01:00 新增奖励。
+零点任务对 canonical USDC 元数据和每个 builder 的 claimable 读取分别最多尝试 3 次，失败
+尝试之间等待 2 秒；只重试失败的请求，不重复查询已经成功的 builder。有限重试耗尽后的部分
+或全部失败不会阻止 01:00 主任务，也不消耗主任务的自动重试次数。
+完整零点快照的 Claimable 合计大于或等于数据库 Payout 时，对账正常：报告展示非负差额，
+不增加对账 warning；主任务没有其他异常时保持 success。若 Claimable 低于 Payout，最终
+报告增加对账 warning，展示两者及短缺金额。两种比较结果都只用于报告，不参与 Settlement
+充足性判断；尤其不得因 Claimable 不足而阻断已有充足 Settlement 余额支持的 payout。
 
 Builder 和 settlement 都归属发送方账户，内部 claim/sweep 可以安全重复，不需要 journal。
 settlement -> recipient 是唯一对外资金边界，也是唯一需要 exactly-once 防护的动作。
@@ -130,6 +143,8 @@ Complete 与归档之间崩溃，恢复 `payout_confirmed` 后幂等地再次 Co
 ```text
 data/
 ├── LOCK
+├── claimable-snapshots/
+│   └── YYYY-MM-DD.json
 ├── current.json
 ├── current.json.bak
 └── history/
@@ -138,6 +153,11 @@ data/
 目录权限为 `0700`，文件为 `0600`。Envelope schema version 固定为 `1`，checksum 覆盖完整
 RunState。保存通过同目录临时文件、`fsync`、primary -> backup rename、新 primary 安装及目录
 `fsync` 完成。Primary 无效时自动尝试 backup；两份均无效则停止。
+
+`claimable-snapshots/YYYY-MM-DD.json` 也使用 version `1` 的 checksum envelope、同目录临时
+文件、`fsync` 和原子安装，但与 `current`/backup 的 payout 恢复协议完全独立。每个 UTC 日期
+只保留首次成功写入的观察文件，进程在查询前若发现当日文件已存在会直接跳过，避免用稍后的
+claimable 值覆盖零点口径。快照文件损坏、缺失或查询不完整只影响报告完整性。
 
 有效 history 类别为 `completed`、`rejected`、`blocked` 和 `failed_validation`。Blocked 保留
 current；其他终态在相应安全条件满足后不阻止新运行。项目没有旧 schema 或 migration 分支。
@@ -158,6 +178,11 @@ builder 和 settlement，只记录 requests remaining；remaining 严格小于 2
 
 SES 通知只发送 UTF-8 HTML。Funding report 使用结构化的运行期数据生成移动端仪表盘，包含
 阶段状态、records/金额、builder claim 与 sweep、payout 证据、rate limit、告警和处置建议。
+报告有独立的“UTC 00:00 Claimable 快照”区块，展示捕获时间、成功覆盖数、各 builder
+claimable 合计、本轮数据库 payout 及两者差额；Builder 明细中的 Reward 明确标为执行时实时值。
+定时任务缺少、无法读取或未完整查询零点快照时，报告标记 warning，但资金结果不被覆盖。
+完整快照低于 payout 时同样升级为 warning，并将快照区块标记为“完整但低于 Payout”；资金
+状态机和 payout 结果保持原样。
 报告数据不写入 durable `RunState`，因此不会改变 payout 恢复协议或 schema。邮件标题将状态
 指示器置于配置前缀之前：🟢 成功、🟡 成功但有告警、🔵 无数据、🟠 等待自动重试、🔴 需要人工
 处理。HTML preheader 提供金额、记录数或失败摘要，便于移动端邮件列表快速判断状态。
@@ -166,19 +191,21 @@ SES 通知只发送 UTF-8 HTML。Funding report 使用结构化的运行期数�
 资金任务原本的结果。随后查询 address-based rate limit，以反映本轮所有 chain action
 完成后的剩余额度；spot balance 和其他 info 请求本身不计入该地址额度。
 
-运行期报告数据不持久化。恢复 `payout_prepared`、`payout_submitting` 或 `payout_confirmed`
-时，Reward 和 Sweep 会标记为“历史明细未持久化，本次恢复未重复执行”，不会凭持久化 phase
-推断此前每个 Builder action 的成功状态。
+除独立的零点 claimable 对账快照外，资金任务的运行期报告数据不持久化。恢复
+`payout_prepared`、`payout_submitting` 或 `payout_confirmed` 时，执行期 Reward 和 Sweep
+会标记为“历史明细未持久化，本次恢复未重复执行”，不会凭持久化 phase 推断此前每个
+Builder action 的成功状态；同一 UTC 日期的零点快照仍可从独立文件恢复展示。
 
 Scheduler 的普通失败在尚有剩余次数时发送精简的橙色重试通知；成功、无数据、fatal 结果以及
 最后一次普通失败发送完整报告。启动恢复实际处理了 current 时也发送完整报告；没有 current
 的启动检查不发送邮件。
 
-成功 funding run 等待下一 UTC 01:00。单个 builder 的 reward 未在 10 次查询内可见只产生
-warning；只有 API 暂时失败或 settlement 归集后仍不足等导致本轮无法 payout 的普通错误，
-才会约 1 分钟后重试，最多重试 5 次。全部失败则返回 retry-exhausted 错误并退出。Fatal
-payout 错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL
-自身的维护恢复仍无限重试。
+Scheduler 串行安排 UTC 00:00 快照和 UTC 01:00 funding run。快照内部的有限读取重试耗尽后
+只记录错误并继续等待 01:00，不自动退出；funding 普通失败才会约 1 分钟后重试，最多重试
+5 次。成功 funding run 等待下一 UTC 00:00 快照。单个 builder 的 reward 未在 10 次查询内
+可见只产生 warning；全部 funding 重试失败则返回 retry-exhausted 错误并退出。Fatal payout
+错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL 自身的
+维护恢复仍无限重试。
 
 ## 9. 安全与测试不变量
 
@@ -190,6 +217,7 @@ payout 错误和确定性的 record 校验错误立即退出；context 取消立
 6. Builder 内部归集可重复并按实时 available 自动收敛，但不是已有 settlement 资金执行
    payout 的硬前提。
 7. Envelope schema version 保持 `1`，没有兼容旧 schema 的分支。
+8. 零点 claimable 快照只读、按日期隔离，失败或缺失不得改变资金状态机和 payout 行为。
 
 测试保留真实 HTTP mock、签名已知向量、claimRewards/spotSend、primary/backup 恢复、状态原子
 写入、MySQL 无限重试、TTY/私钥/地址校验、SES 与敏感信息过滤。

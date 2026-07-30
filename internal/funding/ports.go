@@ -18,6 +18,11 @@ type StateStore interface {
 	Clear(context.Context) error
 }
 
+type ClaimableSnapshotStore interface {
+	LoadClaimableSnapshot(context.Context, string) (*ClaimableSnapshot, error)
+	SaveClaimableSnapshot(context.Context, ClaimableSnapshot) error
+}
+
 type StateLoadMetadata struct {
 	RecoveredFromBackup bool
 	PrimaryInvalid      bool

@@ -48,6 +48,11 @@ func (o *Orchestrator) run(ctx context.Context, trigger Trigger, execution Repor
 		slog.String("event", "funding_task_started"),
 		slog.String("trigger", string(trigger)))
 	current, metadata, err := o.loadCurrent(ctx)
+	snapshotDate := report.StartedAt.Format(time.DateOnly)
+	if current != nil && current.UTCDate != "" {
+		snapshotDate = current.UTCDate
+	}
+	o.attachClaimableSnapshot(ctx, &report, snapshotDate)
 	if err != nil {
 		return err
 	}
@@ -77,6 +82,7 @@ func (o *Orchestrator) Recover(ctx context.Context) (err error) {
 	report.Outcome = "completed"
 	report.syncState(current)
 	report.setStage("snapshot", ReportStepSuccess, "从持久化状态恢复")
+	o.attachClaimableSnapshot(ctx, &report, current.UTCDate)
 	defer func() { o.deliverRunReport(ctx, &report, err) }()
 	defer func() {
 		if !errors.Is(err, context.Canceled) {

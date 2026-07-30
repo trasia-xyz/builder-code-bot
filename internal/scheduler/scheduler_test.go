@@ -58,13 +58,65 @@ func TestNextDailyRunUTCIgnoresDSTBoundaries(t *testing.T) {
 	}
 }
 
-func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T) {
+func TestNextScheduledTaskUTC(t *testing.T) {
+	tests := []struct {
+		name     string
+		now      time.Time
+		wantTask Task
+		wantTime time.Time
+	}{
+		{
+			name:     "before UTC midnight",
+			now:      time.Date(2026, 7, 10, 23, 59, 59, 0, time.UTC),
+			wantTask: TaskClaimableSnapshot,
+			wantTime: time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "at UTC midnight",
+			now:      time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
+			wantTask: TaskClaimableSnapshot,
+			wantTime: time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "between snapshot and funding run",
+			now:      time.Date(2026, 7, 11, 0, 30, 0, 0, time.UTC),
+			wantTask: TaskFunding,
+			wantTime: time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "at funding time",
+			now:      time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC),
+			wantTask: TaskFunding,
+			wantTime: time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "after funding run in non UTC zone",
+			now:      time.Date(2026, 7, 11, 10, 0, 0, 0, time.FixedZone("local", 8*60*60)),
+			wantTask: TaskClaimableSnapshot,
+			wantTime: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task, runAt := NextScheduledTaskUTC(test.now)
+			if task != test.wantTask || !runAt.Equal(test.wantTime) {
+				t.Fatalf(
+					"NextScheduledTaskUTC() = %q, %s; want %q, %s",
+					task, runAt, test.wantTask, test.wantTime,
+				)
+			}
+		})
+	}
+}
+
+func TestRunSchedulesSnapshotThenFundingAndRetriesFunding(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	times := []time.Time{
 		time.Date(2026, 7, 10, 23, 0, 0, 0, time.UTC),
 		time.Date(2026, 7, 11, 0, 0, 30, 0, time.UTC),
+		time.Date(2026, 7, 11, 0, 1, 30, 0, time.UTC),
 	}
 	var nowMu sync.Mutex
 	nowIndex := 0
@@ -77,10 +129,11 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 		}
 		return value
 	}
-	timers := make(chan *fakeTimer, 2)
+	timers := make(chan *fakeTimer, 3)
 	var delaysMu sync.Mutex
 	var delays []time.Duration
 	var nextRuns []time.Time
+	var nextTasks []Task
 	s := &Scheduler{
 		now: now,
 		newTimer: func(delay time.Duration) Timer {
@@ -91,46 +144,68 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 			timers <- timer
 			return timer
 		},
-		onWait: func(nextRunAt time.Time) {
+		onWait: func(task Task, nextRunAt time.Time) {
 			delaysMu.Lock()
+			nextTasks = append(nextTasks, task)
 			nextRuns = append(nextRuns, nextRunAt)
 			delaysMu.Unlock()
 		},
 	}
 	callbackErr := errors.New("run failed")
 	errorsSeen := make(chan error, 1)
-	s.onError = func(err error) { errorsSeen <- err }
-	calls := make(chan struct{}, 2)
-	callCount := 0
+	s.onError = func(task Task, err error) {
+		if task != TaskFunding {
+			t.Errorf("onError task = %q, want funding", task)
+		}
+		errorsSeen <- err
+	}
+	calls := make(chan Task, 3)
+	fundingCalls := 0
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Run(ctx, func(context.Context) error {
-			callCount++
-			calls <- struct{}{}
-			if callCount == 1 {
-				return callbackErr
-			}
-			cancel()
-			return nil
-		})
+		done <- s.Run(
+			ctx,
+			func(context.Context) error {
+				calls <- TaskClaimableSnapshot
+				return nil
+			},
+			func(context.Context) error {
+				fundingCalls++
+				calls <- TaskFunding
+				if fundingCalls == 1 {
+					return callbackErr
+				}
+				cancel()
+				return nil
+			},
+		)
 	}()
 
 	first := <-timers
 	first.fire()
-	<-calls
-	if got := <-errorsSeen; !errors.Is(got, callbackErr) {
-		t.Fatalf("onError = %v", got)
+	if task := <-calls; task != TaskClaimableSnapshot {
+		t.Fatalf("first callback = %q, want snapshot", task)
 	}
 	second := <-timers
 	second.fire()
-	<-calls
+	if task := <-calls; task != TaskFunding {
+		t.Fatalf("second callback = %q, want funding", task)
+	}
+	if got := <-errorsSeen; !errors.Is(got, callbackErr) {
+		t.Fatalf("onError = %v", got)
+	}
+	third := <-timers
+	third.fire()
+	if task := <-calls; task != TaskFunding {
+		t.Fatalf("third callback = %q, want funding retry", task)
+	}
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context canceled", err)
 	}
 
 	delaysMu.Lock()
 	defer delaysMu.Unlock()
-	want := []time.Duration{2 * time.Hour, NonfatalRetryDelay}
+	want := []time.Duration{time.Hour, 59*time.Minute + 30*time.Second, NonfatalRetryDelay}
 	if len(delays) != len(want) {
 		t.Fatalf("delays = %v, want %v", delays, want)
 	}
@@ -139,9 +214,19 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 			t.Errorf("delay[%d] = %s, want %s", i, delays[i], want[i])
 		}
 	}
+	wantTasks := []Task{TaskClaimableSnapshot, TaskFunding, TaskFunding}
+	if len(nextTasks) != len(wantTasks) {
+		t.Fatalf("next tasks = %v, want %v", nextTasks, wantTasks)
+	}
+	for index := range wantTasks {
+		if nextTasks[index] != wantTasks[index] {
+			t.Errorf("next task[%d] = %q, want %q", index, nextTasks[index], wantTasks[index])
+		}
+	}
 	wantNextRuns := []time.Time{
+		time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC),
-		time.Date(2026, 7, 11, 0, 1, 30, 0, time.UTC),
+		time.Date(2026, 7, 11, 0, 2, 30, 0, time.UTC),
 	}
 	if len(nextRuns) != len(wantNextRuns) {
 		t.Fatalf("next runs = %v, want %v", nextRuns, wantNextRuns)
@@ -150,6 +235,60 @@ func TestRunRecomputesDelayAfterEveryCallbackAndContinuesAfterError(t *testing.T
 		if !nextRuns[i].Equal(wantNextRuns[i]) {
 			t.Errorf("next run[%d] = %s, want %s", i, nextRuns[i], wantNextRuns[i])
 		}
+	}
+}
+
+func TestRunContinuesToFundingAfterSnapshotError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	times := []time.Time{
+		time.Date(2026, 7, 10, 23, 59, 0, 0, time.UTC),
+		time.Date(2026, 7, 11, 0, 0, 5, 0, time.UTC),
+	}
+	index := 0
+	timers := make(chan *fakeTimer, 2)
+	snapshotErr := errors.New("partial snapshot")
+	errorsSeen := make(chan error, 1)
+	s := &Scheduler{
+		now: func() time.Time {
+			value := times[index]
+			if index < len(times)-1 {
+				index++
+			}
+			return value
+		},
+		newTimer: func(time.Duration) Timer {
+			timer := newFakeTimer()
+			timers <- timer
+			return timer
+		},
+		onError: func(task Task, err error) {
+			if task != TaskClaimableSnapshot {
+				t.Errorf("onError task = %q, want snapshot", task)
+			}
+			errorsSeen <- err
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Run(
+			ctx,
+			func(context.Context) error { return snapshotErr },
+			func(context.Context) error {
+				t.Error("funding callback ran before its timer")
+				return nil
+			},
+		)
+	}()
+
+	(<-timers).fire()
+	if err := <-errorsSeen; !errors.Is(err, snapshotErr) {
+		t.Fatalf("snapshot error = %v", err)
+	}
+	<-timers
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context canceled", err)
 	}
 }
 
@@ -166,10 +305,17 @@ func TestRunStopsActiveTimerWhenContextIsCanceled(t *testing.T) {
 	done := make(chan error, 1)
 	callbackCalled := make(chan struct{}, 1)
 	go func() {
-		done <- s.Run(ctx, func(context.Context) error {
-			callbackCalled <- struct{}{}
-			return nil
-		})
+		done <- s.Run(
+			ctx,
+			func(context.Context) error {
+				callbackCalled <- struct{}{}
+				return nil
+			},
+			func(context.Context) error {
+				callbackCalled <- struct{}{}
+				return nil
+			},
+		)
 	}()
 	<-timer.created
 	cancel()
@@ -189,13 +335,17 @@ func TestRunStopsActiveTimerWhenContextIsCanceled(t *testing.T) {
 func TestRunReturnsFatalFundingError(t *testing.T) {
 	timer := newFakeTimer()
 	s := &Scheduler{
-		now:      func() time.Time { return time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC) },
+		now:      func() time.Time { return time.Date(2026, 7, 10, 0, 30, 0, 0, time.UTC) },
 		newTimer: func(time.Duration) Timer { return timer },
 	}
 	want := &funding.FatalError{Err: errors.New("payout blocked")}
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Run(context.Background(), func(context.Context) error { return want })
+		done <- s.Run(
+			context.Background(),
+			func(context.Context) error { return nil },
+			func(context.Context) error { return want },
+		)
 	}()
 	timer.fire()
 	if err := <-done; !errors.Is(err, want) {
@@ -210,7 +360,7 @@ func TestRunExitsAfterFiveNonfatalRetries(t *testing.T) {
 		delays []time.Duration
 	)
 	s := &Scheduler{
-		now: func() time.Time { return time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC) },
+		now: func() time.Time { return time.Date(2026, 7, 10, 0, 30, 0, 0, time.UTC) },
 		newTimer: func(delay time.Duration) Timer {
 			timer := newFakeTimer()
 			mu.Lock()
@@ -224,10 +374,14 @@ func TestRunExitsAfterFiveNonfatalRetries(t *testing.T) {
 	done := make(chan error, 1)
 	calls := 0
 	go func() {
-		done <- s.Run(context.Background(), func(context.Context) error {
-			calls++
-			return want
-		})
+		done <- s.Run(
+			context.Background(),
+			func(context.Context) error { return nil },
+			func(context.Context) error {
+				calls++
+				return want
+			},
+		)
 	}()
 	for range MaxNonfatalRetries + 1 {
 		(<-timers).fire()
@@ -242,7 +396,7 @@ func TestRunExitsAfterFiveNonfatalRetries(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(delays) != MaxNonfatalRetries+1 || delays[0] != 13*time.Hour {
+	if len(delays) != MaxNonfatalRetries+1 || delays[0] != 30*time.Minute {
 		t.Fatalf("delays = %v", delays)
 	}
 	for index, delay := range delays[1:] {

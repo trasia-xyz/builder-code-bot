@@ -97,8 +97,18 @@ status subject ordering, HTML rendering, and inbox preheader used by runtime
 reports.
 
 Startup always recovers `data/current.json` before starting a new run. The data
-directory retains `LOCK`, checksummed current and backup snapshots, and history
-archives. Confirmed payouts enter unlimited MySQL retry and are never sent
-again during database recovery. Successful runs wait for the next daily run at
-UTC 01:00; ordinary failures retry at most five times at one-minute intervals,
+directory retains `LOCK`, date-keyed claimable-reward snapshots, checksummed
+current and backup snapshots, and history archives. At UTC 00:00
+(Asia/Shanghai 08:00), the scheduler records a read-only claimable-USDC
+snapshot for settlement reconciliation. At UTC 01:00 (Asia/Shanghai 09:00), it
+runs the funding workflow using live values and includes both views in the SES
+report. Snapshot metadata and per-builder reads each make at most three
+attempts, two seconds apart; exhausted snapshot failures never block funding.
+When a complete snapshot total covers or equals the database payout, the
+reconciliation is normal and the report shows the non-negative difference
+without adding a warning. When it is below the payout, the report is upgraded
+to warning with the shortfall, but a sufficiently funded settlement still pays
+normally. Confirmed payouts enter unlimited MySQL retry and are never sent
+again during database recovery.
+Ordinary funding failures retry at most five times at one-minute intervals,
 while retry exhaustion and fatal payout outcomes exit immediately.

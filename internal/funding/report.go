@@ -46,19 +46,37 @@ type ReportStage struct {
 }
 
 type BuilderReport struct {
-	Name                 string
-	Address              string
-	ClaimableUSDC        string
-	ClaimStatus          ReportStepStatus
-	ClaimSummary         string
-	SweepAmount          string
-	SweepStatus          ReportStepStatus
-	SweepSummary         string
-	FinalTotal           string
-	FinalAvailable       string
-	RateLimitRemaining   uint64
-	RateLimitObserved    bool
-	RateLimitQueryFailed bool
+	Name                  string
+	Address               string
+	SnapshotClaimableUSDC string
+	SnapshotObserved      bool
+	SnapshotQueryFailed   bool
+	ClaimableUSDC         string
+	ClaimStatus           ReportStepStatus
+	ClaimSummary          string
+	SweepAmount           string
+	SweepStatus           ReportStepStatus
+	SweepSummary          string
+	FinalTotal            string
+	FinalAvailable        string
+	RateLimitRemaining    uint64
+	RateLimitObserved     bool
+	RateLimitQueryFailed  bool
+}
+
+type ClaimableSnapshotReport struct {
+	UTCDate            string
+	CapturedAt         time.Time
+	TotalClaimableUSDC string
+	BuilderCount       int
+	ObservedBuilders   int
+	Observed           bool
+	Missing            bool
+	LoadFailed         bool
+	TokenQueryFailed   bool
+	CoversPayout       bool
+	BelowPayout        bool
+	ShortfallUSDC      string
 }
 
 type PayoutReport struct {
@@ -101,6 +119,7 @@ type RunReport struct {
 	PayoutTotal                    string
 	Stages                         []ReportStage
 	Builders                       []BuilderReport
+	ClaimableSnapshot              ClaimableSnapshotReport
 	Payout                         PayoutReport
 	SettlementBalance              SettlementBalanceReport
 	SettlementRateLimitRemaining   uint64
@@ -265,6 +284,7 @@ func (r *RunReport) finalize(now time.Time, runErr error) bool {
 	if errors.Is(runErr, context.Canceled) {
 		return false
 	}
+	r.reconcileClaimableSnapshot()
 	if runErr == nil {
 		switch r.Outcome {
 		case "no_data":
@@ -311,6 +331,36 @@ func (r *RunReport) finalize(now time.Time, runErr error) bool {
 		}
 	}
 	return true
+}
+
+func (r *RunReport) reconcileClaimableSnapshot() {
+	if r == nil {
+		return
+	}
+	snapshot := &r.ClaimableSnapshot
+	snapshot.CoversPayout = false
+	snapshot.BelowPayout = false
+	snapshot.ShortfallUSDC = ""
+	if !snapshot.Observed || snapshot.TokenQueryFailed || snapshot.BuilderCount <= 0 ||
+		snapshot.ObservedBuilders != snapshot.BuilderCount {
+		return
+	}
+	claimable, claimableErr := decimal.NewFromString(snapshot.TotalClaimableUSDC)
+	payout, payoutErr := decimal.NewFromString(r.PayoutTotal)
+	if claimableErr != nil || payoutErr != nil {
+		return
+	}
+	if !claimable.LessThan(payout) {
+		snapshot.CoversPayout = true
+		return
+	}
+	shortfall := payout.Sub(claimable)
+	snapshot.BelowPayout = true
+	snapshot.ShortfallUSDC = shortfall.String()
+	r.addWarning(fmt.Sprintf(
+		"UTC 00:00 Claimable 快照：合计 %s USDC 低于数据库 Payout %s USDC，短缺 %s USDC，请人工核查结算口径",
+		claimable.String(), payout.String(), shortfall.String(),
+	))
 }
 
 func aggregateBuilderStep(builders []BuilderReport, claim bool) ReportStepStatus {

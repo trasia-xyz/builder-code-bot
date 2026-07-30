@@ -37,7 +37,11 @@ type Options struct {
 }
 
 type scheduledRunner interface {
-	Run(context.Context, func(context.Context) error) error
+	Run(
+		context.Context,
+		func(context.Context) error,
+		func(context.Context) error,
+	) error
 }
 
 type App struct {
@@ -129,17 +133,25 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 	}
 
 	utcScheduler := scheduler.New(
-		func(runErr error) {
+		func(task scheduler.Task, runErr error) {
+			if task == scheduler.TaskClaimableSnapshot {
+				logger.Warn(context.Background(), "scheduled claimable snapshot was incomplete",
+					slog.String("event", "scheduled_claimable_snapshot_failed"),
+					slog.String("scheduled_task", string(task)),
+					slog.String("error", "claimable snapshot was incomplete"),
+				)
+				return
+			}
 			logger.Error(context.Background(), "scheduled funding run failed",
 				slog.String("event", "scheduled_funding_run_failed"),
-				slog.String("error", sanitizeRuntimeError(runErr)),
-			)
+				slog.String("scheduled_task", string(task)),
+				slog.String("error", sanitizeRuntimeError(runErr)))
 		},
-		func(nextRunAt time.Time) {
-			logger.Info(context.Background(), "next funding run scheduled",
+		func(task scheduler.Task, nextRunAt time.Time) {
+			logger.Info(context.Background(), "next funding task scheduled",
 				slog.String("event", "funding_next_run_scheduled"),
-				slog.Time("next_run_at", nextRunAt),
-			)
+				slog.String("scheduled_task", string(task)),
+				slog.Time("next_run_at", nextRunAt))
 		},
 	)
 	return &App{
@@ -171,16 +183,20 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	attempt := 1
 	maxAttempts := scheduler.MaxNonfatalRetries + 1
-	return a.scheduler.Run(ctx, func(runCtx context.Context) error {
-		runErr := a.orchestrator.RunScheduled(runCtx, funding.TriggerUTC, attempt, maxAttempts)
-		switch {
-		case runErr == nil:
-			attempt = 1
-		case !funding.IsFatal(runErr) && attempt < maxAttempts:
-			attempt++
-		}
-		return runErr
-	})
+	return a.scheduler.Run(
+		ctx,
+		a.orchestrator.CaptureClaimableSnapshot,
+		func(runCtx context.Context) error {
+			runErr := a.orchestrator.RunScheduled(runCtx, funding.TriggerUTC, attempt, maxAttempts)
+			switch {
+			case runErr == nil:
+				attempt = 1
+			case !funding.IsFatal(runErr) && attempt < maxAttempts:
+				attempt++
+			}
+			return runErr
+		},
+	)
 }
 
 func (a *App) Close() error {
@@ -234,19 +250,21 @@ func assembleOrchestrator(
 		builders[index] = builder.Address
 		builderNames[strings.ToLower(builder.Address)] = builder.Name
 	}
+	stateStore := state.NewStore(state.DataDir)
 	return funding.NewOrchestrator(funding.OrchestratorConfig{
-		Repository:   repository,
-		Store:        state.NewStore(state.DataDir),
-		Chain:        hyperliquidChain{info: infoClient, exchange: exchangeClient},
-		Notifier:     notifier,
-		Logger:       logger,
-		Builders:     builders,
-		BuilderNames: builderNames,
-		Settlement:   cfg.Settlement.Address,
-		Recipient:    cfg.Payout.RecipientAddress,
-		Network:      cfg.Hyperliquid.Network,
-		Clock:        systemClock{},
-		Nonce:        signing.NewNonceGenerator(),
+		Repository:         repository,
+		Store:              stateStore,
+		ClaimableSnapshots: stateStore,
+		Chain:              hyperliquidChain{info: infoClient, exchange: exchangeClient},
+		Notifier:           notifier,
+		Logger:             logger,
+		Builders:           builders,
+		BuilderNames:       builderNames,
+		Settlement:         cfg.Settlement.Address,
+		Recipient:          cfg.Payout.RecipientAddress,
+		Network:            cfg.Hyperliquid.Network,
+		Clock:              systemClock{},
+		Nonce:              signing.NewNonceGenerator(),
 	})
 }
 

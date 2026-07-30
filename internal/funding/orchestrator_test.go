@@ -62,6 +62,282 @@ func TestRunHappyPathOnlyPersistsFinalPayout(t *testing.T) {
 	}
 }
 
+func TestClaimableSnapshotIsReadOnlyAndSeparatedFromExecutionValue(t *testing.T) {
+	fx := newFixture(t)
+	if err := fx.orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fx.chain.events) != 0 {
+		t.Fatalf("snapshot mutated chain state: %v", fx.chain.events)
+	}
+	snapshot := fx.store.snapshots["2026-07-12"]
+	if len(snapshot.Builders) != 1 || snapshot.Builders[0].ClaimableUSDC != "1.5" {
+		t.Fatalf("saved snapshot = %#v", snapshot)
+	}
+
+	fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString("1.75")
+	fx.chain.balances["0xbuilder"] = decimal.RequireFromString("1.75")
+	if err := fx.orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := fx.chain.claimableCalls["0xbuilder"]; got != 1 {
+		t.Fatalf("duplicate snapshot claimable queries = %d, want 1", got)
+	}
+	fx.orchestrator.clock = fixedClock{
+		now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC),
+	}
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := fx.chain.claimableCalls["0xbuilder"]; got != 2 {
+		t.Fatalf("total ClaimableUSDC() calls = %d, want snapshot plus execution", got)
+	}
+	if len(fx.notifier.reports) != 1 {
+		t.Fatalf("reports = %d, want one", len(fx.notifier.reports))
+	}
+	report := fx.notifier.reports[0]
+	if report.Status != ReportStatusSuccess ||
+		!report.ClaimableSnapshot.Observed ||
+		report.ClaimableSnapshot.TotalClaimableUSDC != "1.5" ||
+		report.ClaimableSnapshot.ObservedBuilders != 1 ||
+		!report.ClaimableSnapshot.CoversPayout ||
+		report.ClaimableSnapshot.BelowPayout ||
+		report.ClaimableSnapshot.ShortfallUSDC != "" ||
+		report.Builders[0].SnapshotClaimableUSDC != "1.5" ||
+		report.Builders[0].ClaimableUSDC != "1.75" {
+		t.Fatalf("snapshot/execution report = %#v", report)
+	}
+	assertLogFields(t, fx.logger, "funding_claimable_snapshot_completed", map[string]any{
+		"utc_date": "2026-07-12", "observed_count": int64(1), "complete": true,
+	})
+	assertLogFields(t, fx.logger, "funding_claimable_snapshot_skipped", map[string]any{
+		"utc_date": "2026-07-12",
+	})
+}
+
+func TestClaimableBelowPayoutOnlyWarnsAndDoesNotBlockFundedPayout(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString("1.4")
+	if err := fx.orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	fx.chain.claimableRewards["0xbuilder"] = decimal.Zero
+	fx.chain.balances["0xbuilder"] = decimal.Zero
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.orchestrator.clock = fixedClock{
+		now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC),
+	}
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+
+	if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
+		t.Fatalf("chain events = %v, want funded payout only", fx.chain.events)
+	}
+	if !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
+		t.Fatalf("completed IDs = %v", fx.repo.completedIDs)
+	}
+	report := fx.notifier.reports[0]
+	wantWarning := "UTC 00:00 Claimable 快照：合计 1.4 USDC 低于数据库 Payout 1.5 USDC，短缺 0.1 USDC，请人工核查结算口径"
+	if report.Status != ReportStatusWarning ||
+		report.Payout.Status != ReportStepSuccess ||
+		report.ClaimableSnapshot.CoversPayout ||
+		!report.ClaimableSnapshot.BelowPayout ||
+		report.ClaimableSnapshot.ShortfallUSDC != "0.1" ||
+		!containsString(report.Warnings, wantWarning) {
+		t.Fatalf("claimable reconciliation report = %#v", report)
+	}
+}
+
+func TestClaimableSnapshotRetriesOnlyFailedReadRequests(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.tokenErrors = []error{errors.New("spot metadata unavailable"), nil}
+	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
+	fx.chain.claimableErrorSequence = map[string][]error{
+		"0xbuilder-2": {errors.New("referral endpoint unavailable"), nil},
+	}
+	orchestrator, err := NewOrchestrator(OrchestratorConfig{
+		Repository: fx.repo, Store: fx.store, ClaimableSnapshots: fx.store, Chain: fx.chain,
+		Notifier: fx.notifier, Logger: fx.logger,
+		Builders: []string{"0xbuilder", "0xbuilder-2"},
+		BuilderNames: map[string]string{
+			"0xbuilder": "builder-1", "0xbuilder-2": "builder-2",
+		},
+		Settlement: "0xsettlement", Recipient: "0xrecipient",
+		Clock: fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
+		Sleeper: fx.sleeper,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fx.chain.tokenCalls != 2 {
+		t.Fatalf("CanonicalUSDC() calls = %d, want 2", fx.chain.tokenCalls)
+	}
+	if got := fx.chain.claimableCalls["0xbuilder"]; got != 1 {
+		t.Fatalf("successful builder calls = %d, want 1", got)
+	}
+	if got := fx.chain.claimableCalls["0xbuilder-2"]; got != 2 {
+		t.Fatalf("transiently failing builder calls = %d, want 2", got)
+	}
+	if got := countDelay(fx.sleeper.delays, claimableSnapshotRetryInterval); got != 2 {
+		t.Fatalf("snapshot retry delays = %d, want 2", got)
+	}
+	snapshot := fx.store.snapshots["2026-07-12"]
+	if len(snapshot.Builders) != 2 ||
+		snapshot.Builders[0].ClaimableUSDC != "1.5" ||
+		snapshot.Builders[1].ClaimableUSDC != "1.25" ||
+		snapshot.Builders[0].QueryFailed || snapshot.Builders[1].QueryFailed {
+		t.Fatalf("retried snapshot = %#v", snapshot)
+	}
+	if len(fx.chain.events) != 0 {
+		t.Fatalf("snapshot retries mutated chain state: %v", fx.chain.events)
+	}
+}
+
+func TestClaimableSnapshotPersistsTokenFailureAfterRetryExhaustion(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.tokenError = errors.New("spot metadata unavailable")
+
+	err := fx.orchestrator.CaptureClaimableSnapshot(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "after 3 attempts") {
+		t.Fatalf("CaptureClaimableSnapshot() error = %v, want retry exhaustion", err)
+	}
+	if fx.chain.tokenCalls != claimableSnapshotQueryAttempts {
+		t.Fatalf(
+			"CanonicalUSDC() calls = %d, want %d",
+			fx.chain.tokenCalls, claimableSnapshotQueryAttempts,
+		)
+	}
+	if len(fx.chain.claimableCalls) != 0 {
+		t.Fatalf("claimable calls after token failure = %#v", fx.chain.claimableCalls)
+	}
+	if got := countDelay(fx.sleeper.delays, claimableSnapshotRetryInterval); got != 2 {
+		t.Fatalf("snapshot retry delays = %d, want 2", got)
+	}
+	snapshot := fx.store.snapshots["2026-07-12"]
+	if !snapshot.TokenQueryFailed || len(snapshot.Builders) != 1 ||
+		!snapshot.Builders[0].QueryFailed {
+		t.Fatalf("token-failed snapshot = %#v", snapshot)
+	}
+}
+
+func TestClaimableSnapshotRetryBackoffHonorsCancellation(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.tokenError = errors.New("spot metadata unavailable")
+	ctx, cancel := context.WithCancel(context.Background())
+	sleeper := &cancelingSleeper{cancel: cancel}
+	fx.orchestrator.sleeper = sleeper
+
+	err := fx.orchestrator.CaptureClaimableSnapshot(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CaptureClaimableSnapshot() error = %v, want context canceled", err)
+	}
+	if fx.chain.tokenCalls != 1 || sleeper.calls != 1 {
+		t.Fatalf("token calls = %d, sleeps = %d; want 1, 1", fx.chain.tokenCalls, sleeper.calls)
+	}
+	if len(fx.store.snapshots) != 0 {
+		t.Fatalf("snapshot persisted after cancellation: %#v", fx.store.snapshots)
+	}
+}
+
+func TestPartialClaimableSnapshotWarnsWithoutBlockingScheduledFunding(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableErrors["0xbuilder"] = errors.New("referral endpoint unavailable")
+	err := fx.orchestrator.CaptureClaimableSnapshot(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("CaptureClaimableSnapshot() error = %v, want incomplete", err)
+	}
+	if len(fx.chain.events) != 0 {
+		t.Fatalf("partial snapshot mutated chain state: %v", fx.chain.events)
+	}
+	if got := fx.chain.claimableCalls["0xbuilder"]; got != claimableSnapshotQueryAttempts {
+		t.Fatalf("ClaimableUSDC() calls = %d, want %d", got, claimableSnapshotQueryAttempts)
+	}
+	if got := countDelay(fx.sleeper.delays, claimableSnapshotRetryInterval); got != 2 {
+		t.Fatalf("snapshot retry delays = %d, want 2", got)
+	}
+
+	delete(fx.chain.claimableErrors, "0xbuilder")
+	fx.orchestrator.clock = fixedClock{
+		now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC),
+	}
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+	report := fx.notifier.reports[0]
+	if report.Status != ReportStatusWarning ||
+		!report.ClaimableSnapshot.Observed ||
+		report.ClaimableSnapshot.ObservedBuilders != 0 ||
+		report.ClaimableSnapshot.BelowPayout ||
+		!report.Builders[0].SnapshotQueryFailed ||
+		report.Builders[0].ClaimableUSDC != "1.5" {
+		t.Fatalf("partial snapshot report = %#v", report)
+	}
+	if !containsString(
+		report.Warnings,
+		"UTC 00:00 Claimable 快照：仅成功查询 0/1 个 Builder",
+	) {
+		t.Fatalf("warnings = %#v", report.Warnings)
+	}
+}
+
+func TestScheduledRunReportsMissingClaimableSnapshotWithoutBlockingNoData(t *testing.T) {
+	fx := newFixture(t)
+	fx.repo.records = nil
+	fx.orchestrator.clock = fixedClock{
+		now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC),
+	}
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+	report := fx.notifier.reports[0]
+	if report.Outcome != "no_data" || report.Status != ReportStatusWarning ||
+		!report.ClaimableSnapshot.Missing {
+		t.Fatalf("missing snapshot report = %#v", report)
+	}
+	if !containsString(
+		report.Warnings,
+		"UTC 00:00 Claimable 快照：未找到 2026-07-12 快照",
+	) {
+		t.Fatalf("warnings = %#v", report.Warnings)
+	}
+}
+
+func TestRecoveryLoadsClaimableSnapshotForPersistedUTCDate(t *testing.T) {
+	fx := newFixture(t)
+	state := fx.positiveState(t, PhasePayoutConfirmed)
+	state.UTCDate = "2026-07-11"
+	fx.store.current = &state
+	fx.store.snapshots = map[string]ClaimableSnapshot{
+		"2026-07-11": {
+			UTCDate:    "2026-07-11",
+			CapturedAt: time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
+			Builders: []ClaimableSnapshotBuilder{{
+				Address: "0xbuilder", ClaimableUSDC: "1.6",
+			}},
+		},
+	}
+
+	if err := fx.orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	report := fx.notifier.reports[0]
+	if report.UTCDate != "2026-07-11" ||
+		report.ClaimableSnapshot.UTCDate != "2026-07-11" ||
+		report.ClaimableSnapshot.TotalClaimableUSDC != "1.6" ||
+		!report.ClaimableSnapshot.CoversPayout ||
+		report.ClaimableSnapshot.BelowPayout ||
+		report.Builders[0].SnapshotClaimableUSDC != "1.6" {
+		t.Fatalf("recovery snapshot report = %#v", report)
+	}
+}
+
 func TestConsolidatorClaimsAndSweepsWithoutRecordsOrPayout(t *testing.T) {
 	fx := newFixture(t)
 	fx.store.current = &RunState{RunID: "existing", Phase: PhasePrepared}
@@ -238,7 +514,7 @@ func TestAllBuildersClaimBeforeOneSharedBalanceWait(t *testing.T) {
 	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
 	fx.chain.balances["0xbuilder-2"] = decimal.RequireFromString("1.25")
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: fx.repo, Store: fx.store, Chain: fx.chain,
+		Repository: fx.repo, Store: fx.store, ClaimableSnapshots: fx.store, Chain: fx.chain,
 		Notifier: fx.notifier, Logger: fx.logger,
 		Builders: []string{"0xbuilder", "0xbuilder-2"},
 		BuilderNames: map[string]string{
@@ -935,7 +1211,7 @@ func TestNewOrchestratorRejectsUnsafeRecipient(t *testing.T) {
 	for _, recipient := range []string{"0xbuilder", zeroEthereumAddress} {
 		t.Run(recipient, func(t *testing.T) {
 			_, err := NewOrchestrator(OrchestratorConfig{
-				Repository: fx.repo, Store: fx.store, Chain: fx.chain,
+				Repository: fx.repo, Store: fx.store, ClaimableSnapshots: fx.store, Chain: fx.chain,
 				Builders: []string{"0xbuilder"}, Settlement: "0xsettlement", Recipient: recipient,
 				Clock: fx.clock, Nonce: &fakeNonce{next: 1}, Sleeper: fx.sleeper,
 			})
@@ -1027,7 +1303,8 @@ func newFixture(t *testing.T) *fixture {
 	logger := &fakeLogger{}
 	clock := fixedClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: repo, Store: store, Chain: chain, Notifier: notifier, Logger: logger,
+		Repository: repo, Store: store, ClaimableSnapshots: store,
+		Chain: chain, Notifier: notifier, Logger: logger,
 		Builders: []string{"0xbuilder"}, BuilderNames: map[string]string{"0xbuilder": "builder-1"},
 		Settlement: "0xsettlement", Recipient: "0xrecipient",
 		Clock: clock, Nonce: &fakeNonce{next: uint64(clock.now.UnixMilli())}, Sleeper: sleeper,
@@ -1069,12 +1346,15 @@ func (r *fakeRepository) Complete(_ context.Context, ids []uint64) error {
 }
 
 type fakeStore struct {
-	current       *RunState
-	saved         []RunState
-	archived      RunState
-	archiveResult string
-	failPhase     Phase
-	metadata      StateLoadMetadata
+	current         *RunState
+	saved           []RunState
+	archived        RunState
+	archiveResult   string
+	failPhase       Phase
+	metadata        StateLoadMetadata
+	snapshots       map[string]ClaimableSnapshot
+	snapshotLoadErr error
+	snapshotSaveErr error
 }
 
 func (s *fakeStore) LoadWithMetadata(context.Context) (*RunState, StateLoadMetadata, error) {
@@ -1094,12 +1374,45 @@ func (s *fakeStore) Archive(_ context.Context, state RunState, result string) er
 	return nil
 }
 func (s *fakeStore) Clear(context.Context) error { s.current = nil; return nil }
+func (s *fakeStore) LoadClaimableSnapshot(
+	_ context.Context,
+	utcDate string,
+) (*ClaimableSnapshot, error) {
+	if s.snapshotLoadErr != nil {
+		return nil, s.snapshotLoadErr
+	}
+	snapshot, exists := s.snapshots[utcDate]
+	if !exists {
+		return nil, nil
+	}
+	copy := snapshot
+	copy.Builders = append([]ClaimableSnapshotBuilder(nil), snapshot.Builders...)
+	return &copy, nil
+}
+func (s *fakeStore) SaveClaimableSnapshot(
+	_ context.Context,
+	snapshot ClaimableSnapshot,
+) error {
+	if s.snapshotSaveErr != nil {
+		return s.snapshotSaveErr
+	}
+	if s.snapshots == nil {
+		s.snapshots = make(map[string]ClaimableSnapshot)
+	}
+	copy := snapshot
+	copy.Builders = append([]ClaimableSnapshotBuilder(nil), snapshot.Builders...)
+	s.snapshots[snapshot.UTCDate] = copy
+	return nil
+}
 
 type fakeChain struct {
 	token                   info.Token
 	tokenError              error
+	tokenErrors             []error
+	tokenCalls              int
 	claimableRewards        map[string]decimal.Decimal
 	claimableErrors         map[string]error
+	claimableErrorSequence  map[string][]error
 	claimableCalls          map[string]int
 	balances                map[string]decimal.Decimal
 	holds                   map[string]decimal.Decimal
@@ -1119,6 +1432,15 @@ type fakeChain struct {
 }
 
 func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) {
+	c.tokenCalls++
+	if len(c.tokenErrors) > 0 {
+		err := c.tokenErrors[0]
+		c.tokenErrors = c.tokenErrors[1:]
+		if err != nil {
+			return info.Token{}, err
+		}
+		return c.token, nil
+	}
 	return c.token, c.tokenError
 }
 func (c *fakeChain) ClaimableUSDC(_ context.Context, address string, _ info.Token) (decimal.Decimal, error) {
@@ -1126,6 +1448,14 @@ func (c *fakeChain) ClaimableUSDC(_ context.Context, address string, _ info.Toke
 		c.claimableCalls = make(map[string]int)
 	}
 	c.claimableCalls[address]++
+	if sequence := c.claimableErrorSequence[address]; len(sequence) > 0 {
+		err := sequence[0]
+		c.claimableErrorSequence[address] = sequence[1:]
+		if err != nil {
+			return decimal.Zero, err
+		}
+		return c.claimableRewards[address], nil
+	}
 	if err := c.claimableErrors[address]; err != nil {
 		return decimal.Zero, err
 	}
@@ -1191,6 +1521,17 @@ func (s *fakeSleeper) Sleep(ctx context.Context, delay time.Duration) error {
 	}
 	s.delays = append(s.delays, delay)
 	return nil
+}
+
+type cancelingSleeper struct {
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (s *cancelingSleeper) Sleep(ctx context.Context, _ time.Duration) error {
+	s.calls++
+	s.cancel()
+	return ctx.Err()
 }
 
 type fakeNotifier struct {

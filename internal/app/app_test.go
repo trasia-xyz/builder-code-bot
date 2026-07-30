@@ -225,7 +225,11 @@ type recordingRunner struct{ calls []string }
 
 type recordingScheduler struct{ ctx context.Context }
 
-func (s *recordingScheduler) Run(ctx context.Context, _ func(context.Context) error) error {
+func (s *recordingScheduler) Run(
+	ctx context.Context,
+	_ func(context.Context) error,
+	_ func(context.Context) error,
+) error {
 	s.ctx = ctx
 	return ctx.Err()
 }

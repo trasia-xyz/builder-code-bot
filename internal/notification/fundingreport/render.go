@@ -9,38 +9,41 @@ import (
 
 	"builder-code-bot/internal/funding"
 	"builder-code-bot/internal/notification"
+
+	"github.com/shopspring/decimal"
 )
 
 type view struct {
-	StatusLabel    string
-	StatusColor    string
-	StatusTint     string
-	Subject        string
-	Preheader      string
-	Compact        bool
-	PayoutTotal    string
-	RawTotal       string
-	RecordCount    string
-	BuilderCount   int
-	Duration       string
-	Stages         []stageView
-	Builders       []builderView
-	Settlement     settlementView
-	ShowPayout     bool
-	Payout         payoutView
-	Warnings       []string
-	ShowFailure    bool
-	FailureStage   string
-	FailureSummary string
-	NextAction     string
-	RunID          string
-	Trigger        string
-	Execution      string
-	Network        string
-	UTCDate        string
-	Phase          string
-	StartedAt      string
-	FinishedAt     string
+	StatusLabel       string
+	StatusColor       string
+	StatusTint        string
+	Subject           string
+	Preheader         string
+	Compact           bool
+	PayoutTotal       string
+	RawTotal          string
+	RecordCount       string
+	BuilderCount      int
+	Duration          string
+	Stages            []stageView
+	Builders          []builderView
+	ClaimableSnapshot claimableSnapshotView
+	Settlement        settlementView
+	ShowPayout        bool
+	Payout            payoutView
+	Warnings          []string
+	ShowFailure       bool
+	FailureStage      string
+	FailureSummary    string
+	NextAction        string
+	RunID             string
+	Trigger           string
+	Execution         string
+	Network           string
+	UTCDate           string
+	Phase             string
+	StartedAt         string
+	FinishedAt        string
 }
 
 type stageView struct {
@@ -61,6 +64,30 @@ type builderView struct {
 	SweepColor string
 	RateLimit  string
 	RateColor  string
+}
+
+type claimableSnapshotView struct {
+	Show            bool
+	Status          string
+	Color           string
+	Tint            string
+	UTCDate         string
+	CapturedAt      string
+	Total           string
+	TotalLabel      string
+	Coverage        string
+	PayoutTotal     string
+	Difference      string
+	DifferenceColor string
+	Builders        []claimableSnapshotBuilderView
+}
+
+type claimableSnapshotBuilderView struct {
+	Name    string
+	Address string
+	Amount  string
+	Status  string
+	Color   string
 }
 
 type payoutView struct {
@@ -116,31 +143,32 @@ func buildView(report funding.RunReport) view {
 		duration = 0
 	}
 	data := view{
-		StatusLabel:    statusLabel,
-		StatusColor:    statusColor,
-		StatusTint:     statusTint,
-		Subject:        subject(report, statusLabel),
-		Preheader:      preheader(report, duration),
-		Compact:        report.Compact,
-		PayoutTotal:    displayAmount(report.PayoutTotal),
-		RawTotal:       displayAmount(report.RawTotal),
-		RecordCount:    recordCount(report),
-		BuilderCount:   len(report.Builders),
-		Duration:       formatDuration(duration),
-		Warnings:       append([]string(nil), report.Warnings...),
-		ShowFailure:    report.FailureSummary != "",
-		FailureStage:   stageLabel(report.FailureStage),
-		FailureSummary: report.FailureSummary,
-		NextAction:     report.NextAction,
-		RunID:          fallback(report.RunID, "—"),
-		Trigger:        triggerLabel(report.Trigger),
-		Execution:      executionLabel(report),
-		Network:        fallback(strings.ToUpper(report.Network), "—"),
-		UTCDate:        fallback(report.UTCDate, "—"),
-		Phase:          fallback(string(report.Phase), "—"),
-		StartedAt:      formatTime(report.StartedAt),
-		FinishedAt:     formatTime(report.FinishedAt),
-		Settlement:     buildSettlementView(report.SettlementBalance),
+		StatusLabel:       statusLabel,
+		StatusColor:       statusColor,
+		StatusTint:        statusTint,
+		Subject:           subject(report, statusLabel),
+		Preheader:         preheader(report, duration),
+		Compact:           report.Compact,
+		PayoutTotal:       displayAmount(report.PayoutTotal),
+		RawTotal:          displayAmount(report.RawTotal),
+		RecordCount:       recordCount(report),
+		BuilderCount:      len(report.Builders),
+		Duration:          formatDuration(duration),
+		Warnings:          append([]string(nil), report.Warnings...),
+		ShowFailure:       report.FailureSummary != "",
+		FailureStage:      stageLabel(report.FailureStage),
+		FailureSummary:    report.FailureSummary,
+		NextAction:        report.NextAction,
+		RunID:             fallback(report.RunID, "—"),
+		Trigger:           triggerLabel(report.Trigger),
+		Execution:         executionLabel(report),
+		Network:           fallback(strings.ToUpper(report.Network), "—"),
+		UTCDate:           fallback(report.UTCDate, "—"),
+		Phase:             fallback(string(report.Phase), "—"),
+		StartedAt:         formatTime(report.StartedAt),
+		FinishedAt:        formatTime(report.FinishedAt),
+		Settlement:        buildSettlementView(report.SettlementBalance),
+		ClaimableSnapshot: buildClaimableSnapshotView(report),
 	}
 
 	for _, stage := range report.Stages {
@@ -208,6 +236,73 @@ func buildView(report funding.RunReport) view {
 		} else {
 			data.Payout.Nonce = "—"
 		}
+	}
+	return data
+}
+
+func buildClaimableSnapshotView(report funding.RunReport) claimableSnapshotView {
+	snapshot := report.ClaimableSnapshot
+	if snapshot.UTCDate == "" && !snapshot.Observed && !snapshot.Missing && !snapshot.LoadFailed {
+		return claimableSnapshotView{}
+	}
+	data := claimableSnapshotView{
+		Show:            true,
+		Status:          "未捕获",
+		Color:           "#b45309",
+		Tint:            "#fffbeb",
+		UTCDate:         fallback(snapshot.UTCDate, "—"),
+		CapturedAt:      formatTime(snapshot.CapturedAt),
+		Total:           displayAmount(snapshot.TotalClaimableUSDC),
+		TotalLabel:      "Claimable 合计",
+		Coverage:        fmt.Sprintf("%d/%d", snapshot.ObservedBuilders, snapshot.BuilderCount),
+		PayoutTotal:     displayAmount(report.PayoutTotal),
+		Difference:      "—",
+		DifferenceColor: "#64748b",
+	}
+	switch {
+	case snapshot.LoadFailed:
+		data.Status, data.Color, data.Tint = "读取失败", "#b91c1c", "#fef2f2"
+	case snapshot.Missing:
+		data.Status, data.Color, data.Tint = "未捕获", "#b45309", "#fffbeb"
+	case snapshot.Observed && snapshot.TokenQueryFailed:
+		data.Status, data.Color, data.Tint = "USDC 元数据查询失败", "#b45309", "#fffbeb"
+		data.TotalLabel = "已查询 Claimable 合计"
+	case snapshot.Observed && snapshot.BelowPayout:
+		data.Status, data.Color, data.Tint = "完整但低于 Payout", "#b91c1c", "#fef2f2"
+	case snapshot.Observed && snapshot.CoversPayout:
+		data.Status, data.Color, data.Tint = "完整，Claimable ≥ Payout", "#15803d", "#ecfdf3"
+	case snapshot.Observed && snapshot.ObservedBuilders == snapshot.BuilderCount:
+		data.Status, data.Color, data.Tint = "完整", "#15803d", "#ecfdf3"
+	case snapshot.Observed:
+		data.Status, data.Color, data.Tint = "部分查询失败", "#b45309", "#fffbeb"
+		data.TotalLabel = "已查询 Claimable 合计"
+	}
+	if snapshot.Observed && snapshot.ObservedBuilders == snapshot.BuilderCount {
+		claimable, claimableErr := decimal.NewFromString(snapshot.TotalClaimableUSDC)
+		payout, payoutErr := decimal.NewFromString(report.PayoutTotal)
+		if claimableErr == nil && payoutErr == nil {
+			difference := claimable.Sub(payout)
+			data.Difference = difference.String()
+			if difference.IsNegative() {
+				data.DifferenceColor = "#b91c1c"
+			} else {
+				data.DifferenceColor = "#15803d"
+			}
+		}
+	}
+	for _, builder := range report.Builders {
+		row := claimableSnapshotBuilderView{
+			Name: fallback(builder.Name, "Builder"), Address: shortAddress(builder.Address),
+			Amount: "—", Status: "未观察", Color: "#64748b",
+		}
+		switch {
+		case builder.SnapshotObserved:
+			row.Amount = displayAmount(builder.SnapshotClaimableUSDC) + " USDC"
+			row.Status, row.Color = "已捕获", "#15803d"
+		case builder.SnapshotQueryFailed:
+			row.Status, row.Color = "查询失败", "#b45309"
+		}
+		data.Builders = append(data.Builders, row)
 	}
 	return data
 }
@@ -504,6 +599,7 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
 	            </td></tr>
 	          </table>
         </td></tr>
+        {{if .ClaimableSnapshot.Show}}{{template "claimable-snapshot" .ClaimableSnapshot}}{{end}}
         {{else}}
         <tr><td style="padding:0;">
           <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
@@ -523,6 +619,8 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
             </tr>
           </table>
         </td></tr>
+
+        {{if .ClaimableSnapshot.Show}}{{template "claimable-snapshot" .ClaimableSnapshot}}{{end}}
 
         <tr><td class="pad" style="padding:26px 30px 8px;border-top:1px solid #e5e9f0;">
           <div style="font-size:16px;font-weight:750;color:#0f172a;">执行流程</div>
@@ -564,7 +662,7 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
           <table role="presentation" class="builder-table" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#f8fafc;color:#64748b;">
               <th align="left" style="padding:10px 8px;">Builder</th>
-              <th align="left" style="padding:10px 8px;">Reward</th>
+              <th align="left" style="padding:10px 8px;">执行时 Reward</th>
               <th align="left" style="padding:10px 8px;">Sweep</th>
               <th align="left" style="padding:10px 8px;">Rate Limit</th>
             </tr>
@@ -633,4 +731,38 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
     </td></tr>
   </table>
 </body>
-</html>`))
+</html>
+
+{{define "claimable-snapshot"}}
+<tr><td class="pad" style="padding:22px 30px 24px;border-top:1px solid #e5e9f0;">
+  <div style="font-size:16px;font-weight:750;color:#0f172a;">UTC 00:00 Claimable 快照</div>
+  <div style="margin-top:7px;font-size:13px;line-height:1.55;color:#64748b;">
+    用于与 UTC 零点结算结果对账；01:00 主任务中的实时 Reward 可能包含零点后新增奖励。该快照不参与 claim、归集或 Payout 决策。
+  </div>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:12px;font-size:13px;line-height:1.55;background:{{.Tint}};border:1px solid #e2e8f0;border-radius:10px;">
+    <tr><td style="padding:13px 16px;color:#64748b;">状态</td><td style="padding:13px 16px;color:{{.Color}};font-weight:700;">{{.Status}}</td></tr>
+    <tr><td style="padding:0 16px 11px;color:#64748b;">快照日期</td><td style="padding:0 16px 11px;">{{.UTCDate}} UTC</td></tr>
+    <tr><td style="padding:0 16px 11px;color:#64748b;">捕获时间</td><td style="padding:0 16px 11px;">{{.CapturedAt}}</td></tr>
+    <tr><td style="padding:0 16px 11px;color:#64748b;">{{.TotalLabel}}</td><td style="padding:0 16px 11px;font-weight:700;">{{.Total}} USDC</td></tr>
+    <tr><td style="padding:0 16px 11px;color:#64748b;">Builder 覆盖</td><td style="padding:0 16px 11px;">{{.Coverage}}</td></tr>
+    <tr><td style="padding:0 16px 11px;color:#64748b;">本轮数据库 Payout</td><td style="padding:0 16px 11px;font-weight:700;">{{.PayoutTotal}} USDC</td></tr>
+    <tr><td style="padding:0 16px 13px;color:#64748b;">对账差额（Claimable - Payout）</td><td style="padding:0 16px 13px;font-weight:700;color:{{.DifferenceColor}};">{{.Difference}} USDC</td></tr>
+  </table>
+  {{if .Builders}}
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:12px;font-size:13px;border-collapse:collapse;">
+    <tr style="background:#f8fafc;color:#64748b;">
+      <th align="left" style="padding:9px 8px;">Builder</th>
+      <th align="left" style="padding:9px 8px;">00:00 Claimable</th>
+      <th align="left" style="padding:9px 8px;">状态</th>
+    </tr>
+    {{range .Builders}}
+    <tr>
+      <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;"><strong style="color:#334155;">{{.Name}}</strong><br><span style="font-size:11px;color:#94a3b8;">{{.Address}}</span></td>
+      <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;">{{.Amount}}</td>
+      <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;color:{{.Color}};">{{.Status}}</td>
+    </tr>
+    {{end}}
+  </table>
+  {{end}}
+</td></tr>
+{{end}}`))

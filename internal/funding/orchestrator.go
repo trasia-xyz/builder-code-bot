@@ -15,38 +15,40 @@ import (
 )
 
 type OrchestratorConfig struct {
-	Repository   Repository
-	Store        StateStore
-	Chain        Chain
-	Notifier     Notifier
-	Logger       Logger
-	Builders     []string
-	BuilderNames map[string]string
-	Settlement   string
-	Recipient    string
-	Network      string
-	Clock        Clock
-	Nonce        NonceSource
-	Sleeper      Sleeper
+	Repository         Repository
+	Store              StateStore
+	ClaimableSnapshots ClaimableSnapshotStore
+	Chain              Chain
+	Notifier           Notifier
+	Logger             Logger
+	Builders           []string
+	BuilderNames       map[string]string
+	Settlement         string
+	Recipient          string
+	Network            string
+	Clock              Clock
+	Nonce              NonceSource
+	Sleeper            Sleeper
 }
 
 type Orchestrator struct {
-	repository   Repository
-	store        StateStore
-	chain        Chain
-	notifier     Notifier
-	logger       Logger
-	builders     []string
-	builderNames map[string]string
-	settlement   string
-	recipient    string
-	network      string
-	clock        Clock
-	nonce        NonceSource
-	sleeper      Sleeper
-	alertMu      sync.Mutex
-	alerts       map[string]struct{}
-	lowLimits    map[string]struct{}
+	repository         Repository
+	store              StateStore
+	claimableSnapshots ClaimableSnapshotStore
+	chain              Chain
+	notifier           Notifier
+	logger             Logger
+	builders           []string
+	builderNames       map[string]string
+	settlement         string
+	recipient          string
+	network            string
+	clock              Clock
+	nonce              NonceSource
+	sleeper            Sleeper
+	alertMu            sync.Mutex
+	alerts             map[string]struct{}
+	lowLimits          map[string]struct{}
 }
 
 const (
@@ -59,7 +61,8 @@ const (
 )
 
 func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
-	if cfg.Repository == nil || cfg.Store == nil || cfg.Chain == nil || cfg.Clock == nil || cfg.Nonce == nil {
+	if cfg.Repository == nil || cfg.Store == nil || cfg.ClaimableSnapshots == nil ||
+		cfg.Chain == nil || cfg.Clock == nil || cfg.Nonce == nil {
 		return nil, fmt.Errorf("funding orchestrator dependencies are required")
 	}
 	if len(cfg.Builders) == 0 || strings.TrimSpace(cfg.Settlement) == "" || strings.TrimSpace(cfg.Recipient) == "" {
@@ -94,7 +97,8 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 		sleeper = timerSleeper{}
 	}
 	return &Orchestrator{
-		repository: cfg.Repository, store: cfg.Store, chain: cfg.Chain,
+		repository: cfg.Repository, store: cfg.Store,
+		claimableSnapshots: cfg.ClaimableSnapshots, chain: cfg.Chain,
 		notifier: cfg.Notifier, logger: cfg.Logger,
 		builders:     append([]string(nil), cfg.Builders...),
 		builderNames: cloneBuilderNames(cfg.BuilderNames),
