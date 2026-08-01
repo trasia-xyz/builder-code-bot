@@ -15,45 +15,47 @@ import (
 )
 
 type OrchestratorConfig struct {
-	Repository         Repository
-	Store              StateStore
-	ClaimableSnapshots ClaimableSnapshotStore
-	Chain              Chain
-	Notifier           Notifier
-	Logger             Logger
-	Builders           []string
-	BuilderNames       map[string]string
-	Settlement         string
-	Recipient          string
-	Network            string
-	Clock              Clock
-	Nonce              NonceSource
-	Sleeper            Sleeper
+	Repository          Repository
+	Store               StateStore
+	DailyConsolidations DailyConsolidationStore
+	Chain               Chain
+	Notifier            Notifier
+	Logger              Logger
+	Builders            []string
+	BuilderNames        map[string]string
+	Settlement          string
+	Recipient           string
+	Network             string
+	Clock               Clock
+	Nonce               NonceSource
+	Sleeper             Sleeper
 }
 
 type Orchestrator struct {
-	repository         Repository
-	store              StateStore
-	claimableSnapshots ClaimableSnapshotStore
-	chain              Chain
-	notifier           Notifier
-	logger             Logger
-	builders           []string
-	builderNames       map[string]string
-	settlement         string
-	recipient          string
-	network            string
-	clock              Clock
-	nonce              NonceSource
-	sleeper            Sleeper
-	alertMu            sync.Mutex
-	alerts             map[string]struct{}
-	lowLimits          map[string]struct{}
+	repository          Repository
+	store               StateStore
+	dailyConsolidations DailyConsolidationStore
+	chain               Chain
+	notifier            Notifier
+	logger              Logger
+	builders            []string
+	builderNames        map[string]string
+	settlement          string
+	recipient           string
+	network             string
+	clock               Clock
+	nonce               NonceSource
+	sleeper             Sleeper
+	alertMu             sync.Mutex
+	alerts              map[string]struct{}
+	lowLimits           map[string]struct{}
 }
 
 const (
-	builderConvergenceAttempts      = 5
-	builderConvergenceInterval      = time.Second
+	claimableQueryAttempts          = 5
+	claimableQueryRetryInterval     = 200 * time.Millisecond
+	claimSubmitAttempts             = 3
+	claimSubmitRetryInterval        = 250 * time.Millisecond
 	claimBalanceObservationAttempts = 10
 	claimBalanceObservationInterval = time.Second
 	claimRewardThresholdUSDC        = int64(1)
@@ -61,7 +63,7 @@ const (
 )
 
 func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
-	if cfg.Repository == nil || cfg.Store == nil || cfg.ClaimableSnapshots == nil ||
+	if cfg.Repository == nil || cfg.Store == nil || cfg.DailyConsolidations == nil ||
 		cfg.Chain == nil || cfg.Clock == nil || cfg.Nonce == nil {
 		return nil, fmt.Errorf("funding orchestrator dependencies are required")
 	}
@@ -98,7 +100,7 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 	}
 	return &Orchestrator{
 		repository: cfg.Repository, store: cfg.Store,
-		claimableSnapshots: cfg.ClaimableSnapshots, chain: cfg.Chain,
+		dailyConsolidations: cfg.DailyConsolidations, chain: cfg.Chain,
 		notifier: cfg.Notifier, logger: cfg.Logger,
 		builders:     append([]string(nil), cfg.Builders...),
 		builderNames: cloneBuilderNames(cfg.BuilderNames),
@@ -123,10 +125,9 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *RunR
 	if len(records) == 0 {
 		report.Outcome = "no_data"
 		report.setStage("snapshot", ReportStepSuccess, "没有待处理记录")
-		for _, key := range []string{"rewards", "sweep", "payout", "database"} {
+		for _, key := range []string{"payout", "database"} {
 			report.setStage(key, ReportStepSkipped, "无需执行")
 		}
-		markBuilderStepsSkipped(report, "无待处理 records")
 		o.info(ctx, "no pending funding records", slog.String("event", "funding_no_data"))
 		return nil
 	}
@@ -178,8 +179,6 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *RunR
 	}
 	report.syncState(&run)
 	if payout == "0" {
-		report.setStage("rewards", ReportStepSkipped, "Payout 为 0")
-		report.setStage("sweep", ReportStepSkipped, "Payout 为 0")
 		report.setStage("payout", ReportStepSkipped, "无需付款")
 		report.Payout.Status = ReportStepSkipped
 		return o.completeDatabase(ctx, &run, report)
@@ -189,101 +188,209 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *RunR
 
 func (o *Orchestrator) runPositive(ctx context.Context, state *RunState, report *RunReport) error {
 	token := *state.Manifest.Token
-	claimBalanceTargets, err := o.claimBuilderRewards(ctx, state, report, token)
-	if err != nil {
-		return err
-	}
 	payout, err := decimalFromString(state.Manifest.PayoutTotal)
 	if err != nil {
 		report.fail("snapshot", "持久化的 Payout 金额无法解析。", "请保留 current 状态并检查数据完整性。")
 		return err
 	}
-	initialBalances, unconvergedClaims, err := o.observeClaimBalances(
-		ctx, state, report, token, claimBalanceTargets,
-	)
+	settlement, err := o.chain.SpotBalance(ctx, state.Manifest.Settlement, token)
 	if err != nil {
-		return err
-	}
-	var settlement info.SpotBalanceAmounts
-	for attempt := 1; attempt <= builderConvergenceAttempts; attempt++ {
-		if err := o.sweepBuilderBalances(
-			ctx, state, report, token, attempt,
-			initialBalances, claimBalanceTargets, unconvergedClaims,
-		); err != nil {
-			return err
-		}
-		settlement, err = o.chain.SpotBalance(ctx, state.Manifest.Settlement, token)
-		if err == nil {
-			sufficient := !settlement.Available.LessThan(payout)
-			o.info(ctx, "settlement balance observed",
-				slog.String("event", "funding_settlement_balance_observed"),
-				slog.String("run_id", state.RunID), slog.Int("attempt", attempt),
-				slog.String("total", settlement.Total.String()),
-				slog.String("hold", settlement.Total.Sub(settlement.Available).String()),
-				slog.String("available", settlement.Available.String()),
-				slog.String("payout_total", payout.String()), slog.Bool("sufficient", sufficient))
-			if sufficient {
-				report.setStage("sweep", aggregateBuilderStep(report.Builders, false), builderStepSummary(report.Builders, false))
-				return o.executePayout(ctx, state, settlement.Total, payout, report)
-			}
-		} else {
-			o.warn(ctx, "settlement balance query failed",
-				slog.String("event", "funding_settlement_balance_query_failed"),
-				slog.String("run_id", state.RunID), slog.Int("attempt", attempt))
-		}
-		if attempt < builderConvergenceAttempts {
-			if sleepErr := o.sleeper.Sleep(ctx, builderConvergenceInterval); sleepErr != nil {
-				return sleepErr
-			}
-		}
-	}
-	if err != nil {
-		report.fail(
-			"sweep",
-			"Settlement 余额查询失败，无法确认是否满足 Payout。",
-			"",
-		)
+		report.fail("payout", "Settlement 余额查询失败，无法确认是否满足 Payout。", "")
 		o.alertOnce(
 			ctx, state.RunID, "settlement_balance_query_failed",
 			AlertSeverityWarning, "settlement spot balance query failed",
 		)
-		return fmt.Errorf("query settlement spot balance after %d attempts: %w", builderConvergenceAttempts, err)
+		return fmt.Errorf("query settlement spot balance: %w", err)
+	}
+	sufficient := !settlement.Available.LessThan(payout)
+	o.info(ctx, "settlement balance observed",
+		slog.String("event", "funding_settlement_balance_observed"),
+		slog.String("run_id", state.RunID),
+		slog.String("total", settlement.Total.String()),
+		slog.String("hold", settlement.Total.Sub(settlement.Available).String()),
+		slog.String("available", settlement.Available.String()),
+		slog.String("payout_total", payout.String()), slog.Bool("sufficient", sufficient))
+	if sufficient {
+		return o.executePayout(ctx, state, settlement.Total, payout, report)
 	}
 	o.alertOnce(
 		ctx, state.RunID, "settlement_underfunded",
 		AlertSeverityWarning, "settlement available balance is below required payout",
 	)
 	report.fail(
-		"sweep",
+		"payout",
 		fmt.Sprintf("Settlement 可用余额 %s USDC，低于所需的 %s USDC。", settlement.Available, payout),
 		"",
 	)
-	return fmt.Errorf("settlement available balance %s is below payout %s after %d attempts", settlement.Available, payout, builderConvergenceAttempts)
+	return fmt.Errorf("settlement available balance %s is below payout %s", settlement.Available, payout)
+}
+
+func (o *Orchestrator) queryConsolidationToken(
+	ctx context.Context,
+	state *RunState,
+) (info.Token, error) {
+	var lastErr error
+	for attempt := 1; attempt <= claimableQueryAttempts; attempt++ {
+		token, err := o.chain.CanonicalUSDC(ctx)
+		if err == nil {
+			return token, nil
+		}
+		lastErr = err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return info.Token{}, ctxErr
+		}
+		willRetry := attempt < claimableQueryAttempts
+		o.warn(ctx, "canonical USDC query for consolidation failed",
+			slog.String("event", "funding_consolidation_token_query_failed"),
+			slog.String("run_id", state.RunID),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", claimableQueryAttempts),
+			slog.Bool("will_retry", willRetry))
+		if willRetry {
+			if err := o.sleeper.Sleep(ctx, claimableQueryRetryInterval); err != nil {
+				return info.Token{}, err
+			}
+		}
+	}
+	return info.Token{}, fmt.Errorf(
+		"query canonical USDC after %d attempts: %w",
+		claimableQueryAttempts, lastErr,
+	)
+}
+
+type claimableQueryResult struct {
+	index  int
+	amount decimal.Decimal
+	err    error
+}
+
+func (o *Orchestrator) captureBuilderClaimables(
+	ctx context.Context,
+	state *RunState,
+	report *RunReport,
+	token info.Token,
+) (map[string]decimal.Decimal, error) {
+	claimables := make(map[string]decimal.Decimal, len(o.builders))
+	pending := make([]bool, len(o.builders))
+	for index := range pending {
+		pending[index] = true
+	}
+
+	for attempt := 1; attempt <= claimableQueryAttempts; attempt++ {
+		indexes := pendingBuilderIndexes(pending)
+		results := make(chan claimableQueryResult, len(indexes))
+		for _, index := range indexes {
+			index := index
+			go func() {
+				amount, err := o.chain.ClaimableUSDC(ctx, o.builders[index], token)
+				if err == nil && amount.IsNegative() {
+					err = fmt.Errorf("claimable amount is negative")
+				}
+				results <- claimableQueryResult{index: index, amount: amount, err: err}
+			}()
+		}
+
+		round := make([]claimableQueryResult, len(o.builders))
+		for range indexes {
+			result := <-results
+			round[result.index] = result
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for _, index := range indexes {
+			builder := o.builders[index]
+			result := round[index]
+			if builderReport := report.builder(builder); builderReport != nil {
+				builderReport.ClaimableQueryAttempts = attempt
+			}
+			if result.err == nil {
+				pending[index] = false
+				claimables[builder] = result.amount
+				if builderReport := report.builder(builder); builderReport != nil {
+					builderReport.ClaimableUSDC = result.amount.String()
+					builderReport.ClaimableObserved = true
+				}
+				o.info(ctx, "builder claimable captured",
+					slog.String("event", "funding_builder_claimable_captured"),
+					slog.String("run_id", state.RunID),
+					slog.String("builder", builder),
+					slog.Int("attempt", attempt),
+					slog.String("claimable_usdc", result.amount.String()))
+				continue
+			}
+			o.warn(ctx, "builder claimable query attempt failed",
+				slog.String("event", "funding_builder_claimable_query_failed"),
+				slog.String("run_id", state.RunID),
+				slog.String("builder", builder),
+				slog.Int("attempt", attempt),
+				slog.Int("max_attempts", claimableQueryAttempts),
+				slog.Bool("will_retry", attempt < claimableQueryAttempts))
+		}
+		if len(pendingBuilderIndexes(pending)) == 0 {
+			break
+		}
+		if attempt < claimableQueryAttempts {
+			if err := o.sleeper.Sleep(ctx, claimableQueryRetryInterval); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	for index, stillPending := range pending {
+		if stillPending {
+			o.builderFailure(ctx, state, report, o.builders[index], "claimable", "query")
+		}
+	}
+	return claimables, nil
+}
+
+func pendingBuilderIndexes(pending []bool) []int {
+	indexes := make([]int, 0, len(pending))
+	for index, isPending := range pending {
+		if isPending {
+			indexes = append(indexes, index)
+		}
+	}
+	return indexes
+}
+
+type claimAttemptResult struct {
+	index      int
+	prepareErr error
+	result     exchange.SubmitResult
+}
+
+type claimRetryState struct {
+	balanceTarget  decimal.Decimal
+	claimableKnown bool
+	hadUnknown     bool
 }
 
 func (o *Orchestrator) claimBuilderRewards(
 	ctx context.Context,
 	state *RunState,
 	report *RunReport,
-	token info.Token,
+	claimables map[string]decimal.Decimal,
 ) (map[string]decimal.Decimal, error) {
 	claimBalanceTargets := make(map[string]decimal.Decimal, len(o.builders))
-	for _, builder := range o.builders {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		claimable, err := o.chain.ClaimableUSDC(ctx, builder, token)
-		if err != nil {
-			o.builderFailure(ctx, state, report, builder, "claimRewards", "query")
-			continue
-		}
-		threshold := decimal.NewFromInt(claimRewardThresholdUSDC)
-		eligible := claimable.GreaterThan(threshold)
-		if builderReport := report.builder(builder); builderReport != nil {
-			builderReport.ClaimableUSDC = claimable.String()
-			if !eligible {
+	threshold := decimal.NewFromInt(claimRewardThresholdUSDC)
+	pending := make([]bool, len(o.builders))
+	states := make([]claimRetryState, len(o.builders))
+	for index, builder := range o.builders {
+		claimable, observed := claimables[builder]
+		eligible := !observed || claimable.GreaterThan(threshold)
+		if !eligible {
+			if builderReport := report.builder(builder); builderReport != nil {
 				builderReport.ClaimStatus = ReportStepSkipped
 				builderReport.ClaimSummary = "未超过 1 USDC 阈值"
+			}
+		} else {
+			pending[index] = true
+			states[index].balanceTarget = claimable
+			states[index].claimableKnown = observed
+			if !observed {
+				states[index].balanceTarget = threshold
 			}
 		}
 		o.info(ctx, "builder claim eligibility checked",
@@ -291,32 +398,139 @@ func (o *Orchestrator) claimBuilderRewards(
 			slog.String("run_id", state.RunID), slog.String("builder", builder),
 			slog.String("claimable_usdc", claimable.String()),
 			slog.String("threshold_usdc", threshold.String()),
+			slog.Bool("claimable_observed", observed),
 			slog.Bool("eligible", eligible))
-		if !eligible {
-			continue
+	}
+
+	for attempt := 1; attempt <= claimSubmitAttempts; attempt++ {
+		indexes := pendingBuilderIndexes(pending)
+		if len(indexes) == 0 {
+			break
 		}
-		prepared, err := o.chain.PrepareClaim(builder, o.nonce.Next())
-		if err != nil {
-			o.builderFailure(ctx, state, report, builder, "claimRewards", "prepare")
-			continue
+		nonces := make(map[int]uint64, len(indexes))
+		for _, index := range indexes {
+			nonces[index] = o.nonce.Next()
 		}
-		result, _ := o.chain.Submit(ctx, prepared)
-		o.logBuilderSubmitResult(ctx, state, builder, "claimRewards", "", result)
-		if result.Accepted {
-			claimBalanceTargets[builder] = claimable
+		results := make(chan claimAttemptResult, len(indexes))
+		for _, index := range indexes {
+			index := index
+			go func() {
+				prepared, err := o.chain.PrepareClaim(o.builders[index], nonces[index])
+				if err != nil {
+					results <- claimAttemptResult{index: index, prepareErr: err}
+					return
+				}
+				result, _ := o.chain.Submit(ctx, prepared)
+				results <- claimAttemptResult{index: index, result: result}
+			}()
+		}
+
+		round := make([]claimAttemptResult, len(o.builders))
+		for range indexes {
+			result := <-results
+			round[result.index] = result
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for _, index := range indexes {
+			builder := o.builders[index]
+			retry := &states[index]
+			result := round[index]
 			if builderReport := report.builder(builder); builderReport != nil {
-				builderReport.ClaimStatus = ReportStepSuccess
-				builderReport.ClaimSummary = "Reward 已领取"
+				builderReport.ClaimAttempts = attempt
 			}
-		} else {
-			if !result.Rejected {
-				claimBalanceTargets[builder] = claimable
+			if result.prepareErr != nil {
+				if retry.hadUnknown {
+					if attempt == claimSubmitAttempts {
+						pending[index] = false
+						claimBalanceTargets[builder] = retry.balanceTarget
+						o.markClaimUncertain(ctx, state, report, builder)
+					} else {
+						o.logClaimRetry(ctx, state, builder, attempt)
+					}
+				} else {
+					pending[index] = false
+					o.builderFailure(ctx, state, report, builder, "claimRewards", "prepare")
+				}
+				continue
 			}
-			o.builderFailure(ctx, state, report, builder, "claimRewards", submitResultName(result))
+			o.logBuilderSubmitResult(ctx, state, builder, "claimRewards", "", result.result)
+			switch {
+			case result.result.Accepted:
+				pending[index] = false
+				claimBalanceTargets[builder] = retry.balanceTarget
+				if builderReport := report.builder(builder); builderReport != nil {
+					builderReport.ClaimStatus = ReportStepSuccess
+					builderReport.ClaimSummary = "Reward 已领取"
+					if !retry.claimableKnown {
+						builderReport.ClaimSummary = "Reward 已领取；零点 Claimable 数据缺失"
+					}
+					if attempt > 1 {
+						builderReport.ClaimSummary = fmt.Sprintf("Reward 已领取（第 %d 次尝试）", attempt)
+						if !retry.claimableKnown {
+							builderReport.ClaimSummary += "；零点 Claimable 数据缺失"
+						}
+					}
+				}
+			case result.result.Rejected:
+				if retry.hadUnknown {
+					if attempt == claimSubmitAttempts {
+						pending[index] = false
+						claimBalanceTargets[builder] = retry.balanceTarget
+						o.markClaimUncertain(ctx, state, report, builder)
+					} else {
+						o.logClaimRetry(ctx, state, builder, attempt)
+					}
+				} else {
+					pending[index] = false
+					o.builderFailure(ctx, state, report, builder, "claimRewards", "rejected")
+				}
+			default:
+				retry.hadUnknown = true
+				if attempt == claimSubmitAttempts {
+					pending[index] = false
+					claimBalanceTargets[builder] = retry.balanceTarget
+					o.markClaimUncertain(ctx, state, report, builder)
+					continue
+				}
+				o.logClaimRetry(ctx, state, builder, attempt)
+			}
+		}
+		if len(pendingBuilderIndexes(pending)) > 0 && attempt < claimSubmitAttempts {
+			if err := o.sleeper.Sleep(ctx, claimSubmitRetryInterval); err != nil {
+				return nil, err
+			}
 		}
 	}
 	report.setStage("rewards", aggregateBuilderStep(report.Builders, true), builderStepSummary(report.Builders, true))
 	return claimBalanceTargets, nil
+}
+
+func (o *Orchestrator) logClaimRetry(
+	ctx context.Context,
+	state *RunState,
+	builder string,
+	attempt int,
+) {
+	o.warn(ctx, "builder claim remains uncertain; retrying",
+		slog.String("event", "funding_builder_claim_retry_planned"),
+		slog.String("run_id", state.RunID),
+		slog.String("builder", builder),
+		slog.Int("attempt", attempt),
+		slog.Int("max_attempts", claimSubmitAttempts))
+}
+
+func (o *Orchestrator) markClaimUncertain(
+	ctx context.Context,
+	state *RunState,
+	report *RunReport,
+	builder string,
+) {
+	if builderReport := report.builder(builder); builderReport != nil {
+		builderReport.ClaimUncertain = true
+	}
+	o.builderFailure(ctx, state, report, builder, "claimRewards", "unknown")
 }
 
 func (o *Orchestrator) sweepBuilderBalances(
@@ -561,7 +775,7 @@ func (o *Orchestrator) builderFailure(
 		slog.String("outcome", outcome))
 	if builderReport := report.builder(builder); builderReport != nil {
 		switch action {
-		case "claimRewards":
+		case "claimable", "claimRewards":
 			builderReport.ClaimStatus = ReportStepWarning
 			builderReport.ClaimSummary = builderActionSummary(action, outcome)
 		default:

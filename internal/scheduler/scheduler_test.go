@@ -68,17 +68,17 @@ func TestNextScheduledTaskUTC(t *testing.T) {
 		{
 			name:     "before UTC midnight",
 			now:      time.Date(2026, 7, 10, 23, 59, 59, 0, time.UTC),
-			wantTask: TaskClaimableSnapshot,
+			wantTask: TaskConsolidation,
 			wantTime: time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
 		},
 		{
 			name:     "at UTC midnight",
 			now:      time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
-			wantTask: TaskClaimableSnapshot,
+			wantTask: TaskConsolidation,
 			wantTime: time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
 		},
 		{
-			name:     "between snapshot and funding run",
+			name:     "between consolidation and funding run",
 			now:      time.Date(2026, 7, 11, 0, 30, 0, 0, time.UTC),
 			wantTask: TaskFunding,
 			wantTime: time.Date(2026, 7, 11, 1, 0, 0, 0, time.UTC),
@@ -92,7 +92,7 @@ func TestNextScheduledTaskUTC(t *testing.T) {
 		{
 			name:     "after funding run in non UTC zone",
 			now:      time.Date(2026, 7, 11, 10, 0, 0, 0, time.FixedZone("local", 8*60*60)),
-			wantTask: TaskClaimableSnapshot,
+			wantTask: TaskConsolidation,
 			wantTime: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC),
 		},
 	}
@@ -109,7 +109,7 @@ func TestNextScheduledTaskUTC(t *testing.T) {
 	}
 }
 
-func TestRunSchedulesSnapshotThenFundingAndRetriesFunding(t *testing.T) {
+func TestRunSchedulesConsolidationThenFundingAndRetriesFunding(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -166,7 +166,7 @@ func TestRunSchedulesSnapshotThenFundingAndRetriesFunding(t *testing.T) {
 		done <- s.Run(
 			ctx,
 			func(context.Context) error {
-				calls <- TaskClaimableSnapshot
+				calls <- TaskConsolidation
 				return nil
 			},
 			func(context.Context) error {
@@ -183,8 +183,8 @@ func TestRunSchedulesSnapshotThenFundingAndRetriesFunding(t *testing.T) {
 
 	first := <-timers
 	first.fire()
-	if task := <-calls; task != TaskClaimableSnapshot {
-		t.Fatalf("first callback = %q, want snapshot", task)
+	if task := <-calls; task != TaskConsolidation {
+		t.Fatalf("first callback = %q, want consolidation", task)
 	}
 	second := <-timers
 	second.fire()
@@ -214,7 +214,7 @@ func TestRunSchedulesSnapshotThenFundingAndRetriesFunding(t *testing.T) {
 			t.Errorf("delay[%d] = %s, want %s", i, delays[i], want[i])
 		}
 	}
-	wantTasks := []Task{TaskClaimableSnapshot, TaskFunding, TaskFunding}
+	wantTasks := []Task{TaskConsolidation, TaskFunding, TaskFunding}
 	if len(nextTasks) != len(wantTasks) {
 		t.Fatalf("next tasks = %v, want %v", nextTasks, wantTasks)
 	}
@@ -238,7 +238,7 @@ func TestRunSchedulesSnapshotThenFundingAndRetriesFunding(t *testing.T) {
 	}
 }
 
-func TestRunContinuesToFundingAfterSnapshotError(t *testing.T) {
+func TestRunContinuesToFundingAfterConsolidationError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	times := []time.Time{
@@ -247,7 +247,7 @@ func TestRunContinuesToFundingAfterSnapshotError(t *testing.T) {
 	}
 	index := 0
 	timers := make(chan *fakeTimer, 2)
-	snapshotErr := errors.New("partial snapshot")
+	consolidationErr := errors.New("daily consolidation failed")
 	errorsSeen := make(chan error, 1)
 	s := &Scheduler{
 		now: func() time.Time {
@@ -263,8 +263,8 @@ func TestRunContinuesToFundingAfterSnapshotError(t *testing.T) {
 			return timer
 		},
 		onError: func(task Task, err error) {
-			if task != TaskClaimableSnapshot {
-				t.Errorf("onError task = %q, want snapshot", task)
+			if task != TaskConsolidation {
+				t.Errorf("onError task = %q, want consolidation", task)
 			}
 			errorsSeen <- err
 		},
@@ -273,7 +273,7 @@ func TestRunContinuesToFundingAfterSnapshotError(t *testing.T) {
 	go func() {
 		done <- s.Run(
 			ctx,
-			func(context.Context) error { return snapshotErr },
+			func(context.Context) error { return consolidationErr },
 			func(context.Context) error {
 				t.Error("funding callback ran before its timer")
 				return nil
@@ -282,8 +282,8 @@ func TestRunContinuesToFundingAfterSnapshotError(t *testing.T) {
 	}()
 
 	(<-timers).fire()
-	if err := <-errorsSeen; !errors.Is(err, snapshotErr) {
-		t.Fatalf("snapshot error = %v", err)
+	if err := <-errorsSeen; !errors.Is(err, consolidationErr) {
+		t.Fatalf("consolidation error = %v", err)
 	}
 	<-timers
 	cancel()

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,329 +19,362 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-func TestRunHappyPathOnlyPersistsFinalPayout(t *testing.T) {
+func TestDailyConsolidationAndFundingAreSeparatePhases(t *testing.T) {
 	fx := newFixture(t)
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := fx.chain.events; !equalStrings(got, []string{
-		"submit:claimRewards:0xbuilder", "submit:spotSend:0xbuilder", "submit:spotSend:0xsettlement",
+	if !equalStrings(fx.chain.events, []string{
+		"submit:claimRewards:0xbuilder",
+		"submit:spotSend:0xbuilder",
 	}) {
-		t.Fatalf("chain events = %v", got)
+		t.Fatalf("UTC 00:00 chain events = %v", fx.chain.events)
 	}
-	if !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
-		t.Fatalf("completed IDs = %v", fx.repo.completedIDs)
+	if fx.repo.listCalls != 0 || len(fx.store.saved) != 0 {
+		t.Fatalf("UTC 00:00 touched payout state: list=%d saved=%d", fx.repo.listCalls, len(fx.store.saved))
 	}
-	if fx.store.current != nil || fx.store.archiveResult != "completed" {
-		t.Fatalf("current = %#v, archive = %q", fx.store.current, fx.store.archiveResult)
+	record := fx.store.consolidations["2026-07-12"]
+	if record.Status != DailyConsolidationCompleted || len(record.Builders) != 1 ||
+		!record.Builders[0].ClaimableObserved || record.Builders[0].ClaimableUSDC != "1.5" ||
+		record.Builders[0].ClaimUncertain || record.Builders[0].SweepAmount != "1.5" {
+		t.Fatalf("daily consolidation = %#v", record)
 	}
-	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != 1 {
-		t.Fatalf("claim balance waits = %d, want one shared initial wait", got)
+	claimCalls := fx.chain.claimableCalls["0xbuilder"]
+	balanceCalls := fx.chain.balanceCalls["0xbuilder"]
+
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
 	}
-	if got := fx.chain.claimableCalls["0xbuilder"]; got != 1 {
-		t.Fatalf("ClaimableUSDC() calls = %d, want 1", got)
+	if !equalStrings(fx.chain.events, []string{
+		"submit:claimRewards:0xbuilder",
+		"submit:spotSend:0xbuilder",
+		"submit:spotSend:0xsettlement",
+	}) {
+		t.Fatalf("full day chain events = %v", fx.chain.events)
 	}
-	if got := fx.chain.balanceCalls["0xbuilder"]; got != 1 {
-		t.Fatalf("SpotBalance(builder) calls = %d, want one post-claim observation", got)
+	if fx.chain.claimableCalls["0xbuilder"] != claimCalls ||
+		fx.chain.balanceCalls["0xbuilder"] != balanceCalls {
+		t.Fatal("UTC 01:00 queried or mutated a builder account")
 	}
-	for _, saved := range fx.store.saved {
-		if saved.Payout == nil && saved.Phase != PhasePrepared {
-			t.Fatalf("unexpected state before payout journal: %#v", saved)
-		}
+	if !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) || fx.store.archiveResult != "completed" {
+		t.Fatalf("completed IDs = %v, archive = %q", fx.repo.completedIDs, fx.store.archiveResult)
 	}
-	if len(fx.notifier.reports) != 1 {
-		t.Fatalf("reports = %d, want one", len(fx.notifier.reports))
-	}
-	report := fx.notifier.reports[0]
+	report := onlyReport(t, fx.notifier)
 	if report.Status != ReportStatusSuccess || report.Payout.Status != ReportStepSuccess ||
-		report.Builders[0].ClaimStatus != ReportStepSuccess ||
-		report.Builders[0].SweepAmount != "1.5" ||
-		!report.SettlementBalance.Observed ||
-		report.SettlementBalance.Total != "0" ||
-		report.SettlementBalance.Available != "0" {
+		!report.DailyConsolidation.Observed ||
+		report.DailyConsolidation.TotalClaimableUSDC != "1.5" ||
+		!report.DailyConsolidation.CoversPayout ||
+		report.Builders[0].ClaimableUSDC != "1.5" ||
+		report.Builders[0].SweepAmount != "1.5" {
 		t.Fatalf("run report = %#v", report)
 	}
 }
 
-func TestClaimableSnapshotIsReadOnlyAndSeparatedFromExecutionValue(t *testing.T) {
+func TestDailyConsolidationRunsOnlyOncePerUTCDate(t *testing.T) {
 	fx := newFixture(t)
-	if err := fx.orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("snapshot mutated chain state: %v", fx.chain.events)
-	}
-	snapshot := fx.store.snapshots["2026-07-12"]
-	if len(snapshot.Builders) != 1 || snapshot.Builders[0].ClaimableUSDC != "1.5" {
-		t.Fatalf("saved snapshot = %#v", snapshot)
-	}
-
-	fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString("1.75")
-	fx.chain.balances["0xbuilder"] = decimal.RequireFromString("1.75")
-	if err := fx.orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
+	wantEvents := append([]string(nil), fx.chain.events...)
+	wantClaimCalls := fx.chain.claimableCalls["0xbuilder"]
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := fx.chain.claimableCalls["0xbuilder"]; got != 1 {
-		t.Fatalf("duplicate snapshot claimable queries = %d, want 1", got)
+	if !equalStrings(fx.chain.events, wantEvents) ||
+		fx.chain.claimableCalls["0xbuilder"] != wantClaimCalls {
+		t.Fatalf("duplicate daily consolidation executed actions: %v", fx.chain.events)
 	}
-	fx.orchestrator.clock = fixedClock{
-		now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC),
-	}
-	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := fx.chain.claimableCalls["0xbuilder"]; got != 2 {
-		t.Fatalf("total ClaimableUSDC() calls = %d, want snapshot plus execution", got)
-	}
-	if len(fx.notifier.reports) != 1 {
-		t.Fatalf("reports = %d, want one", len(fx.notifier.reports))
-	}
-	report := fx.notifier.reports[0]
-	if report.Status != ReportStatusSuccess ||
-		!report.ClaimableSnapshot.Observed ||
-		report.ClaimableSnapshot.TotalClaimableUSDC != "1.5" ||
-		report.ClaimableSnapshot.ObservedBuilders != 1 ||
-		!report.ClaimableSnapshot.CoversPayout ||
-		report.ClaimableSnapshot.BelowPayout ||
-		report.ClaimableSnapshot.ShortfallUSDC != "" ||
-		report.Builders[0].SnapshotClaimableUSDC != "1.5" ||
-		report.Builders[0].ClaimableUSDC != "1.75" {
-		t.Fatalf("snapshot/execution report = %#v", report)
-	}
-	assertLogFields(t, fx.logger, "funding_claimable_snapshot_completed", map[string]any{
-		"utc_date": "2026-07-12", "observed_count": int64(1), "complete": true,
-	})
-	assertLogFields(t, fx.logger, "funding_claimable_snapshot_skipped", map[string]any{
+	assertLogFields(t, fx.logger, "funding_daily_consolidation_skipped", map[string]any{
 		"utc_date": "2026-07-12",
 	})
 }
 
-func TestClaimableBelowPayoutOnlyWarnsAndDoesNotBlockFundedPayout(t *testing.T) {
+func TestDailyClaimablesArePersistedBeforeClaimSubmission(t *testing.T) {
+	fx := newFixture(t)
+	fx.store.consolidationSaved = make(chan DailyConsolidation)
+	fx.chain.claimStarted = make(chan string, 1)
+	fx.chain.claimRelease = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- fx.orchestrator.RunDailyConsolidation(context.Background())
+	}()
+
+	captured := receiveWithin(t, fx.store.consolidationSaved)
+	if captured.Status != DailyConsolidationClaimablesCaptured ||
+		len(captured.Builders) != 1 || !captured.Builders[0].ClaimableObserved ||
+		captured.Builders[0].ClaimableUSDC != "1.5" ||
+		captured.Builders[0].ClaimStatus != ReportStepPending ||
+		!captured.CompletedAt.IsZero() {
+		t.Fatalf("captured daily record = %#v", captured)
+	}
+	if builder := receiveWithin(t, fx.chain.claimStarted); builder != "0xbuilder" {
+		t.Fatalf("claim signer = %q", builder)
+	}
+	close(fx.chain.claimRelease)
+	completed := receiveWithin(t, fx.store.consolidationSaved)
+	if completed.Status != DailyConsolidationCompleted || completed.CompletedAt.IsZero() ||
+		len(completed.Builders) != 1 || completed.Builders[0].ClaimableUSDC != "1.5" {
+		t.Fatalf("completed daily record = %#v", completed)
+	}
+	if err := receiveWithin(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDailyClaimDoesNotStartWhenClaimableRecordCannotBeSaved(t *testing.T) {
+	fx := newFixture(t)
+	fx.store.consolidationSaveErr = errors.New("disk unavailable")
+	err := fx.orchestrator.RunDailyConsolidation(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "save captured daily claimables") {
+		t.Fatalf("RunDailyConsolidation() error = %v", err)
+	}
+	if containsString(fx.chain.events, "submit:claimRewards:0xbuilder") ||
+		containsString(fx.chain.events, "submit:spotSend:0xbuilder") {
+		t.Fatalf("actions ran without a saved claimable boundary: %v", fx.chain.events)
+	}
+}
+
+func TestDailyClaimableQueriesAndClaimsRunInParallel(t *testing.T) {
+	fx := newFixture(t)
+	orchestrator := newTwoBuilderOrchestrator(t, fx)
+	fx.chain.claimableStarted = make(chan string, 2)
+	fx.chain.claimableRelease = make(chan struct{})
+	fx.chain.claimStarted = make(chan string, 2)
+	fx.chain.claimRelease = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- orchestrator.RunDailyConsolidation(context.Background())
+	}()
+
+	queryBuilders := []string{
+		receiveWithin(t, fx.chain.claimableStarted),
+		receiveWithin(t, fx.chain.claimableStarted),
+	}
+	if !sameStrings(queryBuilders, []string{"0xbuilder", "0xbuilder-2"}) {
+		t.Fatalf("parallel claimable builders = %v", queryBuilders)
+	}
+	close(fx.chain.claimableRelease)
+	claimBuilders := []string{
+		receiveWithin(t, fx.chain.claimStarted),
+		receiveWithin(t, fx.chain.claimStarted),
+	}
+	if !sameStrings(claimBuilders, []string{"0xbuilder", "0xbuilder-2"}) {
+		t.Fatalf("parallel claim builders = %v", claimBuilders)
+	}
+	close(fx.chain.claimRelease)
+	if err := receiveWithin(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDailyClaimableQueryRetriesOnlyFailedBuilders(t *testing.T) {
+	fx := newFixture(t)
+	orchestrator := newTwoBuilderOrchestrator(t, fx)
+	fx.chain.claimableErrorSequence["0xbuilder"] = []error{
+		errors.New("temporary info failure"), nil,
+	}
+	if err := orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fx.chain.claimableCalls["0xbuilder"] != 2 ||
+		fx.chain.claimableCalls["0xbuilder-2"] != 1 {
+		t.Fatalf("claimable calls = %#v", fx.chain.claimableCalls)
+	}
+	if countDelay(fx.sleeper.delays, claimableQueryRetryInterval) != 1 {
+		t.Fatalf("retry delays = %v", fx.sleeper.delays)
+	}
+	record := fx.store.consolidations["2026-07-12"]
+	if record.Builders[0].ClaimableQueryAttempts != 2 ||
+		record.Builders[1].ClaimableQueryAttempts != 1 {
+		t.Fatalf("daily query attempts = %#v", record.Builders)
+	}
+}
+
+func TestExhaustedClaimableQueryMarksDailyReconciliationIncomplete(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableErrors["0xbuilder"] = errors.New("info unavailable")
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record := fx.store.consolidations["2026-07-12"]
+	if len(record.Builders) != 1 || record.Builders[0].ClaimableObserved ||
+		record.Builders[0].ClaimableQueryAttempts != claimableQueryAttempts ||
+		record.Builders[0].ClaimAttempts != 1 ||
+		record.Builders[0].ClaimStatus != ReportStepSuccess ||
+		!containsString(fx.chain.events, "submit:claimRewards:0xbuilder") {
+		t.Fatalf("incomplete daily record = %#v, events = %v", record, fx.chain.events)
+	}
+
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+	report := onlyReport(t, fx.notifier)
+	if report.DailyConsolidation.ObservedBuilders != 0 ||
+		report.DailyConsolidation.CoversPayout || report.DailyConsolidation.BelowPayout ||
+		!containsString(report.Warnings, "UTC 00:00 Claimable 仅成功查询 0/1 个 Builder，当日对账数据不完整") {
+		t.Fatalf("incomplete reconciliation report = %#v", report)
+	}
+}
+
+func TestUncertainClaimRetriesUntilAccepted(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		results  []exchange.SubmitResult
+		attempts int
+	}{
+		{name: "accepted after unknown", results: []exchange.SubmitResult{{}, {Accepted: true}}, attempts: 2},
+		{
+			name:     "rejection does not resolve earlier unknown",
+			results:  []exchange.SubmitResult{{}, {Rejected: true}, {Accepted: true}},
+			attempts: 3,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.chain.claimResults = map[string][]exchange.SubmitResult{"0xbuilder": test.results}
+			if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			builder := fx.store.consolidations["2026-07-12"].Builders[0]
+			wantSummary := fmt.Sprintf("Reward 已领取（第 %d 次尝试）", test.attempts)
+			if builder.ClaimAttempts != test.attempts || builder.ClaimUncertain ||
+				builder.ClaimStatus != ReportStepSuccess || builder.ClaimSummary != wantSummary ||
+				countString(fx.chain.events, "submit:claimRewards:0xbuilder") != test.attempts ||
+				countDelay(fx.sleeper.delays, claimSubmitRetryInterval) != test.attempts-1 {
+				t.Fatalf("retried claim builder = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
+			}
+		})
+	}
+}
+
+func TestScheduledFundingNeverClaimsOrSweepsWithoutDailyRecord(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
+		t.Fatalf("UTC 01:00 chain events = %v, want payout only", fx.chain.events)
+	}
+	if fx.chain.claimableCalls["0xbuilder"] != 0 || fx.chain.balanceCalls["0xbuilder"] != 0 {
+		t.Fatal("UTC 01:00 accessed builder claim or balance APIs")
+	}
+	report := onlyReport(t, fx.notifier)
+	if report.Status != ReportStatusWarning || !report.DailyConsolidation.Missing ||
+		!containsString(report.Warnings, "未找到 UTC 00:00 归集记录") {
+		t.Fatalf("missing-consolidation report = %#v", report)
+	}
+}
+
+func TestUnderfundedFundingRetryDoesNotFallBackToBuilderActions(t *testing.T) {
+	fx := newFixture(t)
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
+	err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6)
+	if err == nil || IsFatal(err) {
+		t.Fatalf("RunScheduled() error = %v, want ordinary underfunded error", err)
+	}
+	if len(fx.chain.events) != 0 || fx.chain.claimableCalls["0xbuilder"] != 0 ||
+		fx.chain.balanceCalls["0xbuilder"] != 0 {
+		t.Fatalf("underfunded payout touched builders: events=%v", fx.chain.events)
+	}
+	if fx.store.current == nil || fx.store.current.Phase != PhasePrepared {
+		t.Fatalf("current = %#v, want prepared retry state", fx.store.current)
+	}
+
+	fx.notifier.reports = nil
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 2, 6); err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
+		t.Fatalf("retry events = %v, want payout only", fx.chain.events)
+	}
+}
+
+func TestClaimableBelowPayoutWarnsWithoutBlockingFundedPayout(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString("1.4")
-	if err := fx.orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-
-	fx.chain.claimableRewards["0xbuilder"] = decimal.Zero
-	fx.chain.balances["0xbuilder"] = decimal.Zero
 	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
-	fx.orchestrator.clock = fixedClock{
-		now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC),
-	}
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
 	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
 		t.Fatal(err)
 	}
-
-	if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
-		t.Fatalf("chain events = %v, want funded payout only", fx.chain.events)
-	}
-	if !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
-		t.Fatalf("completed IDs = %v", fx.repo.completedIDs)
-	}
-	report := fx.notifier.reports[0]
-	wantWarning := "UTC 00:00 Claimable 快照：合计 1.4 USDC 低于数据库 Payout 1.5 USDC，短缺 0.1 USDC，请人工核查结算口径"
-	if report.Status != ReportStatusWarning ||
-		report.Payout.Status != ReportStepSuccess ||
-		report.ClaimableSnapshot.CoversPayout ||
-		!report.ClaimableSnapshot.BelowPayout ||
-		report.ClaimableSnapshot.ShortfallUSDC != "0.1" ||
-		!containsString(report.Warnings, wantWarning) {
-		t.Fatalf("claimable reconciliation report = %#v", report)
+	report := onlyReport(t, fx.notifier)
+	warning := "UTC 00:00 Claimable 合计 1.4 USDC，低于数据库 Payout 1.5 USDC，短缺 0.1 USDC，请人工核查结算口径"
+	if report.Status != ReportStatusWarning || report.Payout.Status != ReportStepSuccess ||
+		!report.DailyConsolidation.BelowPayout ||
+		report.DailyConsolidation.ShortfallUSDC != "0.1" ||
+		!containsString(report.Warnings, warning) {
+		t.Fatalf("claimed reconciliation report = %#v", report)
 	}
 }
 
-func TestClaimableSnapshotRetriesOnlyFailedReadRequests(t *testing.T) {
+func TestUncertainClaimRetriesWithoutChangingClaimableReconciliation(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.tokenErrors = []error{errors.New("spot metadata unavailable"), nil}
-	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
-	fx.chain.claimableErrorSequence = map[string][]error{
-		"0xbuilder-2": {errors.New("referral endpoint unavailable"), nil},
-	}
-	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: fx.repo, Store: fx.store, ClaimableSnapshots: fx.store, Chain: fx.chain,
-		Notifier: fx.notifier, Logger: fx.logger,
-		Builders: []string{"0xbuilder", "0xbuilder-2"},
-		BuilderNames: map[string]string{
-			"0xbuilder": "builder-1", "0xbuilder-2": "builder-2",
-		},
-		Settlement: "0xsettlement", Recipient: "0xrecipient",
-		Clock: fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
-		Sleeper: fx.sleeper,
-	})
-	if err != nil {
+	fx.chain.claimResult = exchange.SubmitResult{}
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-
-	if err := orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
-		t.Fatal(err)
+	record := fx.store.consolidations["2026-07-12"]
+	if len(record.Builders) != 1 || !record.Builders[0].ClaimUncertain ||
+		record.Builders[0].ClaimableUSDC != "1.5" ||
+		record.Builders[0].ClaimAttempts != claimSubmitAttempts {
+		t.Fatalf("uncertain daily consolidation = %#v", record)
 	}
-	if fx.chain.tokenCalls != 2 {
-		t.Fatalf("CanonicalUSDC() calls = %d, want 2", fx.chain.tokenCalls)
-	}
-	if got := fx.chain.claimableCalls["0xbuilder"]; got != 1 {
-		t.Fatalf("successful builder calls = %d, want 1", got)
-	}
-	if got := fx.chain.claimableCalls["0xbuilder-2"]; got != 2 {
-		t.Fatalf("transiently failing builder calls = %d, want 2", got)
-	}
-	if got := countDelay(fx.sleeper.delays, claimableSnapshotRetryInterval); got != 2 {
-		t.Fatalf("snapshot retry delays = %d, want 2", got)
-	}
-	snapshot := fx.store.snapshots["2026-07-12"]
-	if len(snapshot.Builders) != 2 ||
-		snapshot.Builders[0].ClaimableUSDC != "1.5" ||
-		snapshot.Builders[1].ClaimableUSDC != "1.25" ||
-		snapshot.Builders[0].QueryFailed || snapshot.Builders[1].QueryFailed {
-		t.Fatalf("retried snapshot = %#v", snapshot)
-	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("snapshot retries mutated chain state: %v", fx.chain.events)
-	}
-}
-
-func TestClaimableSnapshotPersistsTokenFailureAfterRetryExhaustion(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.tokenError = errors.New("spot metadata unavailable")
-
-	err := fx.orchestrator.CaptureClaimableSnapshot(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "after 3 attempts") {
-		t.Fatalf("CaptureClaimableSnapshot() error = %v, want retry exhaustion", err)
-	}
-	if fx.chain.tokenCalls != claimableSnapshotQueryAttempts {
-		t.Fatalf(
-			"CanonicalUSDC() calls = %d, want %d",
-			fx.chain.tokenCalls, claimableSnapshotQueryAttempts,
-		)
-	}
-	if len(fx.chain.claimableCalls) != 0 {
-		t.Fatalf("claimable calls after token failure = %#v", fx.chain.claimableCalls)
-	}
-	if got := countDelay(fx.sleeper.delays, claimableSnapshotRetryInterval); got != 2 {
-		t.Fatalf("snapshot retry delays = %d, want 2", got)
-	}
-	snapshot := fx.store.snapshots["2026-07-12"]
-	if !snapshot.TokenQueryFailed || len(snapshot.Builders) != 1 ||
-		!snapshot.Builders[0].QueryFailed {
-		t.Fatalf("token-failed snapshot = %#v", snapshot)
-	}
-}
-
-func TestClaimableSnapshotRetryBackoffHonorsCancellation(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.tokenError = errors.New("spot metadata unavailable")
-	ctx, cancel := context.WithCancel(context.Background())
-	sleeper := &cancelingSleeper{cancel: cancel}
-	fx.orchestrator.sleeper = sleeper
-
-	err := fx.orchestrator.CaptureClaimableSnapshot(ctx)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("CaptureClaimableSnapshot() error = %v, want context canceled", err)
-	}
-	if fx.chain.tokenCalls != 1 || sleeper.calls != 1 {
-		t.Fatalf("token calls = %d, sleeps = %d; want 1, 1", fx.chain.tokenCalls, sleeper.calls)
-	}
-	if len(fx.store.snapshots) != 0 {
-		t.Fatalf("snapshot persisted after cancellation: %#v", fx.store.snapshots)
-	}
-}
-
-func TestPartialClaimableSnapshotWarnsWithoutBlockingScheduledFunding(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.claimableErrors["0xbuilder"] = errors.New("referral endpoint unavailable")
-	err := fx.orchestrator.CaptureClaimableSnapshot(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "incomplete") {
-		t.Fatalf("CaptureClaimableSnapshot() error = %v, want incomplete", err)
-	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("partial snapshot mutated chain state: %v", fx.chain.events)
-	}
-	if got := fx.chain.claimableCalls["0xbuilder"]; got != claimableSnapshotQueryAttempts {
-		t.Fatalf("ClaimableUSDC() calls = %d, want %d", got, claimableSnapshotQueryAttempts)
-	}
-	if got := countDelay(fx.sleeper.delays, claimableSnapshotRetryInterval); got != 2 {
-		t.Fatalf("snapshot retry delays = %d, want 2", got)
-	}
-
-	delete(fx.chain.claimableErrors, "0xbuilder")
-	fx.orchestrator.clock = fixedClock{
-		now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC),
-	}
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
 	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
 		t.Fatal(err)
 	}
-	report := fx.notifier.reports[0]
-	if report.Status != ReportStatusWarning ||
-		!report.ClaimableSnapshot.Observed ||
-		report.ClaimableSnapshot.ObservedBuilders != 0 ||
-		report.ClaimableSnapshot.BelowPayout ||
-		!report.Builders[0].SnapshotQueryFailed ||
-		report.Builders[0].ClaimableUSDC != "1.5" {
-		t.Fatalf("partial snapshot report = %#v", report)
-	}
-	if !containsString(
-		report.Warnings,
-		"UTC 00:00 Claimable 快照：仅成功查询 0/1 个 Builder",
-	) {
-		t.Fatalf("warnings = %#v", report.Warnings)
+	report := onlyReport(t, fx.notifier)
+	if report.DailyConsolidation.UncertainClaims != 1 ||
+		!report.DailyConsolidation.CoversPayout || report.DailyConsolidation.BelowPayout ||
+		!containsString(report.Warnings, "UTC 00:00 有 1 个 Builder 的 claim 在有限重试后结果仍不确定，请人工核查") {
+		t.Fatalf("uncertain claim report = %#v", report)
 	}
 }
 
-func TestScheduledRunReportsMissingClaimableSnapshotWithoutBlockingNoData(t *testing.T) {
-	fx := newFixture(t)
-	fx.repo.records = nil
-	fx.orchestrator.clock = fixedClock{
-		now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC),
-	}
-	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
-		t.Fatal(err)
-	}
-	report := fx.notifier.reports[0]
-	if report.Outcome != "no_data" || report.Status != ReportStatusWarning ||
-		!report.ClaimableSnapshot.Missing {
-		t.Fatalf("missing snapshot report = %#v", report)
-	}
-	if !containsString(
-		report.Warnings,
-		"UTC 00:00 Claimable 快照：未找到 2026-07-12 快照",
-	) {
-		t.Fatalf("warnings = %#v", report.Warnings)
+func TestClaimAtOrBelowThresholdIsRecordedAsZero(t *testing.T) {
+	for _, amount := range []string{"0", "1"} {
+		t.Run(amount, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString(amount)
+			fx.chain.balances["0xbuilder"] = decimal.Zero
+			if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if containsString(fx.chain.events, "submit:claimRewards:0xbuilder") {
+				t.Fatalf("claim was submitted with %s claimable USDC", amount)
+			}
+			builder := fx.store.consolidations["2026-07-12"].Builders[0]
+			if builder.ClaimableUSDC != amount || !builder.ClaimableObserved ||
+				builder.ClaimStatus != ReportStepSkipped || builder.ClaimAttempts != 0 {
+				t.Fatalf("daily builder = %#v", builder)
+			}
+		})
 	}
 }
 
-func TestRecoveryLoadsClaimableSnapshotForPersistedUTCDate(t *testing.T) {
+func TestConsolidateOnlyDoesNotReadOrWriteDailyRecord(t *testing.T) {
 	fx := newFixture(t)
-	state := fx.positiveState(t, PhasePayoutConfirmed)
-	state.UTCDate = "2026-07-11"
-	fx.store.current = &state
-	fx.store.snapshots = map[string]ClaimableSnapshot{
-		"2026-07-11": {
-			UTCDate:    "2026-07-11",
-			CapturedAt: time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
-			Builders: []ClaimableSnapshotBuilder{{
-				Address: "0xbuilder", ClaimableUSDC: "1.6",
+	fx.store.current = &RunState{RunID: "existing", Phase: PhasePrepared}
+	fx.store.consolidations = map[string]DailyConsolidation{
+		"2026-07-12": {
+			UTCDate: "2026-07-12", Status: DailyConsolidationCompleted,
+			StartedAt: fx.clock.now, ClaimablesCapturedAt: fx.clock.now, CompletedAt: fx.clock.now,
+			Builders: []DailyConsolidationBuilder{{
+				Address: "0xbuilder", ClaimableUSDC: "9", ClaimableObserved: true,
+				ClaimableQueryAttempts: 1,
+				ClaimStatus:            ReportStepSuccess, SweepStatus: ReportStepSuccess,
 			}},
 		},
 	}
-
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	report := fx.notifier.reports[0]
-	if report.UTCDate != "2026-07-11" ||
-		report.ClaimableSnapshot.UTCDate != "2026-07-11" ||
-		report.ClaimableSnapshot.TotalClaimableUSDC != "1.6" ||
-		!report.ClaimableSnapshot.CoversPayout ||
-		report.ClaimableSnapshot.BelowPayout ||
-		report.Builders[0].SnapshotClaimableUSDC != "1.6" {
-		t.Fatalf("recovery snapshot report = %#v", report)
-	}
-}
-
-func TestConsolidatorClaimsAndSweepsWithoutRecordsOrPayout(t *testing.T) {
-	fx := newFixture(t)
-	fx.store.current = &RunState{RunID: "existing", Phase: PhasePrepared}
 	consolidator, err := NewConsolidator(ConsolidatorConfig{
 		Chain: fx.chain, Notifier: fx.notifier, Logger: fx.logger,
 		Builders: []string{"0xbuilder"}, BuilderNames: map[string]string{"0xbuilder": "builder-1"},
@@ -351,663 +385,235 @@ func TestConsolidatorClaimsAndSweepsWithoutRecordsOrPayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	if err := consolidator.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !equalStrings(fx.chain.events, []string{
-		"submit:claimRewards:0xbuilder",
-		"submit:spotSend:0xbuilder",
+		"submit:claimRewards:0xbuilder", "submit:spotSend:0xbuilder",
 	}) {
-		t.Fatalf("chain events = %v", fx.chain.events)
+		t.Fatalf("consolidate-only events = %v", fx.chain.events)
 	}
-	if got := fx.chain.balances["0xbuilder"]; !got.IsZero() {
-		t.Fatalf("builder balance = %s, want zero", got)
-	}
-	if got := fx.chain.balances["0xsettlement"]; !got.Equal(decimal.RequireFromString("1.5")) {
-		t.Fatalf("settlement balance = %s, want 1.5", got)
-	}
-	if fx.repo.listCalls != 0 || len(fx.repo.completedIDs) != 0 {
-		t.Fatalf("repository calls: list=%d completed=%v", fx.repo.listCalls, fx.repo.completedIDs)
-	}
-	if fx.store.current == nil || fx.store.current.RunID != "existing" || len(fx.store.saved) != 0 {
-		t.Fatalf("funding state was changed: current=%#v saved=%#v", fx.store.current, fx.store.saved)
+	if fx.repo.listCalls != 0 || len(fx.repo.completedIDs) != 0 ||
+		len(fx.store.consolidations) != 1 ||
+		fx.store.consolidations["2026-07-12"].Builders[0].ClaimableUSDC != "9" ||
+		len(fx.store.saved) != 0 ||
+		fx.store.current == nil || fx.store.current.RunID != "existing" {
+		t.Fatalf("consolidate-only touched durable state: %#v", fx.store)
 	}
 	if len(fx.notifier.reports) != 0 {
-		t.Fatalf("consolidation delivered funding reports: %#v", fx.notifier.reports)
-	}
-	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != 1 {
-		t.Fatalf("claim balance waits = %d, want one", got)
-	}
-	assertLogFields(t, fx.logger, "funding_consolidation_completed", map[string]any{
-		"builder_count": int64(1), "warning_count": int64(0),
-	})
-}
-
-func TestScheduledRunReportsRetryAndFinalFailureDifferently(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.balances["0xbuilder"] = decimal.Zero
-
-	err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 2, 6)
-	if err == nil {
-		t.Fatal("RunScheduled() error = nil")
-	}
-	if len(fx.notifier.reports) != 1 ||
-		fx.notifier.reports[0].Status != ReportStatusRetrying ||
-		!fx.notifier.reports[0].Compact {
-		t.Fatalf("retry report = %#v", fx.notifier.reports)
-	}
-
-	fx.notifier.reports = nil
-	err = fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 6, 6)
-	if err == nil {
-		t.Fatal("RunScheduled() final error = nil")
-	}
-	if len(fx.notifier.reports) != 1 ||
-		fx.notifier.reports[0].Status != ReportStatusCritical ||
-		fx.notifier.reports[0].Compact ||
-		fx.notifier.reports[0].Outcome != "retry_exhausted" {
-		t.Fatalf("final report = %#v", fx.notifier.reports)
+		t.Fatalf("consolidate-only delivered final reports: %#v", fx.notifier.reports)
 	}
 }
 
-func TestScheduledRetryAddsGenericFailureSummary(t *testing.T) {
-	report := newRunReport(
-		time.Now(), TriggerUTC, ReportExecution{Attempt: 1, MaxAttempts: 6},
-		"mainnet", []string{"0xbuilder"}, nil, "0xsettlement", "0xrecipient",
-	)
-
-	if !report.finalize(time.Now(), errors.New("unclassified failure")) {
-		t.Fatal("finalize() suppressed a non-cancellation error")
-	}
-	if report.Status != ReportStatusRetrying || report.FailureSummary != "资金任务未能完成。" {
-		t.Fatalf("retry report = %#v", report)
-	}
-}
-
-func TestRunLogsFundingBalancesAndAmounts(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.claimResult.Response = json.RawMessage(`{"status":"ok"}`)
-	fx.chain.sweepResult.Response = json.RawMessage(`{"status":"ok"}`)
-	fx.chain.payoutResult.Response = json.RawMessage(`{"status":"ok"}`)
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-
-	assertLogFields(t, fx.logger, "funding_snapshot_calculated", map[string]any{
-		"record_count": int64(2), "raw_total": "1.500000000000000000", "payout_total": "1.5",
-	})
-	assertLogFields(t, fx.logger, "funding_builder_claim_eligibility_checked", map[string]any{
-		"builder": "0xbuilder", "claimable_usdc": "1.5", "threshold_usdc": "1", "eligible": true,
-	})
-	assertLogFields(t, fx.logger, "funding_builder_balance_observed", map[string]any{
-		"builder": "0xbuilder", "attempt": int64(1),
-		"total": "1.5", "hold": "0", "available": "1.5",
-	})
-	assertLogFields(t, fx.logger, "funding_settlement_balance_observed", map[string]any{
-		"attempt": int64(1), "total": "1.5", "hold": "0", "available": "1.5",
-		"payout_total": "1.5", "sufficient": true,
-	})
-	assertLogFields(t, fx.logger, "funding_payout_preparation_started", map[string]any{
-		"payout_total": "1.5", "settlement_total_before": "1.5",
-	})
-	assertLogFields(t, fx.logger, "funding_payout_submit_result", map[string]any{
-		"payout_total": "1.5", "settlement_total_before": "1.5",
-		"accepted": true,
-	})
-	assertLogFieldAbsent(t, fx.logger, "funding_builder_submit_result", "response")
-	assertLogFieldAbsent(t, fx.logger, "funding_payout_submit_result", "response")
-	assertLogFields(t, fx.logger, "funding_run_completed", map[string]any{
-		"record_count": int64(2), "raw_total": "1.500000000000000000", "payout_total": "1.5",
-	})
-	assertLogFields(t, fx.logger, "funding_settlement_final_balance_observed", map[string]any{
-		"settlement": "0xsettlement", "total": "0", "hold": "0", "available": "0",
-	})
-}
-
-func TestClaimRewardIsSkippedWithoutAlertAtOrBelowThreshold(t *testing.T) {
-	for _, amount := range []string{"0", "1"} {
-		t.Run(amount, func(t *testing.T) {
-			fx := newFixture(t)
-			fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString(amount)
-			fx.chain.balances["0xbuilder"] = decimal.Zero
-			fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-
-			if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-				t.Fatal(err)
-			}
-			if containsString(fx.chain.events, "submit:claimRewards:0xbuilder") {
-				t.Fatalf("claim was submitted with %s claimable USDC: %v", amount, fx.chain.events)
-			}
-			if len(fx.notifier.alerts) != 0 {
-				t.Fatalf("alerts = %#v, want none", fx.notifier.alerts)
-			}
-			assertLogFields(t, fx.logger, "funding_builder_claim_eligibility_checked", map[string]any{
-				"builder": "0xbuilder", "claimable_usdc": amount, "threshold_usdc": "1", "eligible": false,
-			})
-		})
-	}
-}
-
-func TestClaimableRewardQueryFailureAlertsWithoutSubmittingClaim(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.claimableErrors["0xbuilder"] = errors.New("referral endpoint unavailable")
-	fx.chain.balances["0xbuilder"] = decimal.Zero
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-	if containsString(fx.chain.events, "submit:claimRewards:0xbuilder") {
-		t.Fatalf("claim was submitted after eligibility query failure: %v", fx.chain.events)
-	}
-	if len(fx.notifier.alerts) != 1 {
-		t.Fatalf("alerts = %#v, want one query failure alert", fx.notifier.alerts)
-	}
-	assertLogFields(t, fx.logger, "funding_builder_action_failed", map[string]any{
-		"builder": "0xbuilder", "action_kind": "claimRewards", "outcome": "query",
-	})
-}
-
-func TestAllBuildersClaimBeforeOneSharedBalanceWait(t *testing.T) {
+func TestDailyConsolidationUsesOneSharedClaimVisibilityWait(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
 	fx.chain.balances["0xbuilder-2"] = decimal.RequireFromString("1.25")
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: fx.repo, Store: fx.store, ClaimableSnapshots: fx.store, Chain: fx.chain,
+		Repository: fx.repo, Store: fx.store, DailyConsolidations: fx.store, Chain: fx.chain,
 		Notifier: fx.notifier, Logger: fx.logger,
-		Builders: []string{"0xbuilder", "0xbuilder-2"},
-		BuilderNames: map[string]string{
-			"0xbuilder": "builder-1", "0xbuilder-2": "builder-2",
-		},
-		Settlement: "0xsettlement", Recipient: "0xrecipient",
+		Builders:     []string{"0xbuilder", "0xbuilder-2"},
+		BuilderNames: map[string]string{"0xbuilder": "builder-1", "0xbuilder-2": "builder-2"},
+		Settlement:   "0xsettlement", Recipient: "0xrecipient",
 		Clock: fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
 		Sleeper: fx.sleeper,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fx.orchestrator = orchestrator
-
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+	if err := orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != 1 {
-		t.Fatalf("claim balance waits = %d, want one shared wait", got)
+	if countDelay(fx.sleeper.delays, claimBalanceObservationInterval) != 1 {
+		t.Fatalf("claim visibility waits = %v", fx.sleeper.delays)
 	}
-	if !equalStrings(fx.chain.events, []string{
-		"submit:claimRewards:0xbuilder",
-		"submit:claimRewards:0xbuilder-2",
-		"submit:spotSend:0xbuilder",
-		"submit:spotSend:0xbuilder-2",
-		"submit:spotSend:0xsettlement",
+	if len(fx.chain.events) != 4 ||
+		!sameStrings(fx.chain.events[:2], []string{
+			"submit:claimRewards:0xbuilder",
+			"submit:claimRewards:0xbuilder-2",
+		}) || !equalStrings(fx.chain.events[2:], []string{
+		"submit:spotSend:0xbuilder", "submit:spotSend:0xbuilder-2",
 	}) {
-		t.Fatalf("chain events = %v", fx.chain.events)
-	}
-	for _, builder := range []string{"0xbuilder", "0xbuilder-2"} {
-		if got := fx.chain.balanceCalls[builder]; got != 1 {
-			t.Fatalf("SpotBalance(%s) calls = %d, want 1", builder, got)
-		}
+		t.Fatalf("events = %v", fx.chain.events)
 	}
 }
 
-func TestRunObservesBuilderAndSettlementRateLimits(t *testing.T) {
+func TestClaimVisibilityExhaustionStillRecordsBestEffortSweep(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.trackRateLimitUsage = true
-	fx.chain.rateLimits["0xbuilder"] = info.UserRateLimit{
-		NRequestsUsed: 798,
-		NRequestsCap:  1000,
+	latest := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("2"), Available: decimal.RequireFromString("0.5"),
 	}
-	fx.chain.rateLimits["0xsettlement"] = info.UserRateLimit{
-		NRequestsUsed: 800,
-		NRequestsCap:  1000,
+	fx.chain.balanceSequence["0xbuilder"] = make([]info.SpotBalanceAmounts, claimBalanceObservationAttempts)
+	for index := range fx.chain.balanceSequence["0xbuilder"] {
+		fx.chain.balanceSequence["0xbuilder"][index] = latest
 	}
-
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for _, address := range []string{"0xbuilder", "0xsettlement"} {
-		if got := fx.chain.rateLimitCalls[address]; got != 1 {
-			t.Fatalf("UserRateLimit(%s) calls = %d, want 1", address, got)
-		}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepAmount != "0.5" || builder.SweepStatus != ReportStepWarning {
+		t.Fatalf("daily builder = %#v", builder)
 	}
-	assertRateLimitLog(t, fx.logger, "0xbuilder", "info", map[string]any{
-		"account_kind": "builder", "requests_remaining": uint64(200),
-	})
-	assertRateLimitLog(t, fx.logger, "0xsettlement", "warn", map[string]any{
-		"account_kind": "settlement", "requests_remaining": uint64(199),
-	})
-	if len(fx.notifier.alerts) != 1 || fx.notifier.alerts[0] != "user_rate_limit_low:0xsettlement" {
-		t.Fatalf("alerts = %#v, want settlement rate limit alert", fx.notifier.alerts)
-	}
-	if fx.notifier.alertSeverity[0] != AlertSeverityWarning {
-		t.Fatalf("alert severity = %q, want warning", fx.notifier.alertSeverity[0])
-	}
-	wantAlertMessage := "Hyperliquid user rate limit is low\naccount kind: settlement\naddress: 0xsettlement\nrequests remaining: 199"
-	if fx.notifier.alertMessages[0] != wantAlertMessage {
-		t.Fatalf("alert message = %q, want %q", fx.notifier.alertMessages[0], wantAlertMessage)
+	if fx.chain.balanceCalls["0xbuilder"] != claimBalanceObservationAttempts {
+		t.Fatalf("balance calls = %d", fx.chain.balanceCalls["0xbuilder"])
 	}
 }
 
-func TestRunObservesRateLimitsAfterOrdinaryAndFatalFailures(t *testing.T) {
-	for _, test := range []struct {
-		name                    string
-		configure               func(*fixture)
-		wantFatal               bool
-		wantBuilderRemaining    uint64
-		wantSettlementRemaining uint64
-	}{
-		{
-			name: "ordinary underfunded failure",
-			configure: func(fx *fixture) {
-				fx.chain.balances["0xbuilder"] = decimal.Zero
-			},
-			wantBuilderRemaining:    9_999,
-			wantSettlementRemaining: 10_000,
-		},
-		{
-			name: "fatal rejected payout",
-			configure: func(fx *fixture) {
-				fx.chain.payoutResult = exchange.SubmitResult{Rejected: true}
-			},
-			wantFatal:               true,
-			wantBuilderRemaining:    9_998,
-			wantSettlementRemaining: 9_999,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			fx := newFixture(t)
-			fx.chain.trackRateLimitUsage = true
-			test.configure(fx)
-
-			err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-			if err == nil || IsFatal(err) != test.wantFatal {
-				t.Fatalf("Run() error = %v, fatal = %v, want fatal %v", err, IsFatal(err), test.wantFatal)
-			}
-			assertRateLimitLog(t, fx.logger, "0xbuilder", "info", map[string]any{
-				"requests_remaining": test.wantBuilderRemaining,
-			})
-			assertRateLimitLog(t, fx.logger, "0xsettlement", "info", map[string]any{
-				"requests_remaining": test.wantSettlementRemaining,
-			})
-		})
-	}
-}
-
-func TestRunSkipsFinalObservationsAfterCancellation(t *testing.T) {
+func TestPayoutUsesAvailableButUncertainConfirmationUsesTotal(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.respectRateLimitContext = true
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+	fx.chain.holds["0xsettlement"] = decimal.NewFromInt(1)
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
+	if err == nil || containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
+		t.Fatalf("held settlement payout error=%v events=%v", err, fx.chain.events)
+	}
 
-	err := fx.orchestrator.Run(ctx, TriggerRunOnStart)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want context canceled", err)
+	fx = newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+	fx.chain.payoutResult = exchange.SubmitResult{}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
+		{Total: decimal.NewFromInt(2), Available: decimal.NewFromInt(2)},
+		{Total: decimal.NewFromInt(2), Available: decimal.RequireFromString("0.4")},
+		{Total: decimal.NewFromInt(2), Available: decimal.RequireFromString("0.3")},
+		{Total: decimal.NewFromInt(2), Available: decimal.RequireFromString("0.2")},
+		{Total: decimal.NewFromInt(2), Available: decimal.RequireFromString("0.1")},
+		{Total: decimal.NewFromInt(2), Available: decimal.Zero},
 	}
-	if len(fx.chain.rateLimitCalls) != 0 || len(fx.chain.balanceCalls) != 0 {
-		t.Fatalf(
-			"final observations after cancellation: rate limits = %#v, balances = %#v",
-			fx.chain.rateLimitCalls, fx.chain.balanceCalls,
-		)
-	}
-	if len(fx.notifier.reports) != 0 {
-		t.Fatalf("reports after cancellation = %#v", fx.notifier.reports)
-	}
-}
-
-func TestRateLimitQueryFailureDoesNotBlockFunding(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.rateLimitErrors["0xbuilder"] = errors.New("unavailable")
-
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-	assertLogFields(t, fx.logger, "funding_user_rate_limit_query_failed", map[string]any{
-		"account_kind": "builder", "address": "0xbuilder",
-	})
-	if fx.store.archiveResult != "completed" {
-		t.Fatalf("archive = %q, want completed", fx.store.archiveResult)
+	err = fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
+	if err == nil || !IsFatal(err) || fx.store.current == nil || fx.store.current.Phase != PhaseBlocked {
+		t.Fatalf("available-only decrease error=%v current=%#v", err, fx.store.current)
 	}
 }
 
-func TestFinalSettlementBalanceQueryFailureOnlyWarnsReport(t *testing.T) {
+func TestUnknownPayoutConfirmsOnlyAfterSettlementTotalDecreases(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.balanceErrors["0xsettlement"] = errors.New("unavailable")
-	report := newRunReport(
-		fx.clock.Now(), TriggerUTC, ReportExecution{}, "mainnet",
-		[]string{"0xbuilder"}, map[string]string{"0xbuilder": "builder-1"},
-		"0xsettlement", "0xrecipient",
-	)
-	report.token = cloneToken(&fx.chain.token)
-
-	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
-
-	if !report.SettlementBalance.QueryFailed || report.SettlementBalance.Observed {
-		t.Fatalf("settlement balance report = %#v", report.SettlementBalance)
-	}
-	if len(report.Warnings) != 1 || report.Warnings[0] != "Settlement：任务结束余额查询失败" {
-		t.Fatalf("warnings = %#v", report.Warnings)
-	}
-	assertLogFields(t, fx.logger, "funding_settlement_final_balance_query_failed", map[string]any{
-		"query_kind": "spot_balance", "settlement": "0xsettlement",
-	})
-}
-
-func TestFinalSettlementTokenQueryFailureOnlyWarnsReport(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.tokenError = errors.New("spot metadata unavailable")
-	report := newRunReport(
-		fx.clock.Now(), TriggerUTC, ReportExecution{}, "mainnet",
-		[]string{"0xbuilder"}, nil, "0xsettlement", "0xrecipient",
-	)
-
-	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
-
-	if !report.SettlementBalance.QueryFailed || report.SettlementBalance.Observed {
-		t.Fatalf("settlement balance report = %#v", report.SettlementBalance)
-	}
-	assertLogFields(t, fx.logger, "funding_settlement_final_balance_query_failed", map[string]any{
-		"query_kind": "canonical_usdc",
-	})
-}
-
-func TestFinalSettlementBalanceFailureMarksSuccessfulRunWarning(t *testing.T) {
-	fx := newFixture(t)
-	fx.repo.records = nil
-	fx.chain.balanceErrors["0xsettlement"] = errors.New("unavailable")
-
-	if err := fx.orchestrator.Run(context.Background(), TriggerUTC); err != nil {
-		t.Fatal(err)
-	}
-	if len(fx.notifier.reports) != 1 ||
-		fx.notifier.reports[0].Status != ReportStatusWarning ||
-		!fx.notifier.reports[0].SettlementBalance.QueryFailed {
-		t.Fatalf("report = %#v", fx.notifier.reports)
-	}
-}
-
-func TestFinalSettlementBalanceUsesPersistedReportAddress(t *testing.T) {
-	fx := newFixture(t)
-	fx.orchestrator.settlement = "0xnew-settlement"
-	fx.chain.balances["0xpersisted-settlement"] = decimal.RequireFromString("7.5")
-	report := newRunReport(
-		fx.clock.Now(), TriggerUTC, ReportExecution{}, "mainnet",
-		[]string{"0xbuilder"}, nil, "0xpersisted-settlement", "0xrecipient",
-	)
-	report.token = cloneToken(&fx.chain.token)
-
-	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
-
-	if report.SettlementBalance.Address != "0xpersisted-settlement" ||
-		report.SettlementBalance.Total != "7.5" ||
-		fx.chain.balanceCalls["0xpersisted-settlement"] != 1 ||
-		fx.chain.balanceCalls["0xnew-settlement"] != 0 {
-		t.Fatalf("settlement observation = %#v, calls = %#v", report.SettlementBalance, fx.chain.balanceCalls)
-	}
-}
-
-func TestFinalSettlementRateLimitUsesPersistedReportAddress(t *testing.T) {
-	fx := newFixture(t)
-	fx.orchestrator.settlement = "0xnew-settlement"
-	fx.chain.rateLimits["0xpersisted-settlement"] = info.UserRateLimit{NRequestsCap: 1_000}
-	report := newRunReport(
-		fx.clock.Now(), TriggerUTC, ReportExecution{}, "mainnet",
-		[]string{"0xbuilder"}, nil, "0xpersisted-settlement", "0xrecipient",
-	)
-
-	fx.orchestrator.observeUserRateLimits(context.Background(), &report)
-
-	if !report.SettlementRateLimitObserved ||
-		report.SettlementRateLimitRemaining != 1_000 ||
-		fx.chain.rateLimitCalls["0xpersisted-settlement"] != 1 ||
-		fx.chain.rateLimitCalls["0xnew-settlement"] != 0 {
-		t.Fatalf("settlement rate limit report = %#v, calls = %#v", report, fx.chain.rateLimitCalls)
-	}
-}
-
-func TestSettlementBalanceQueryFailureIsNotReportedAsUnderfunded(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.balanceErrors["0xsettlement"] = errors.New("unavailable")
-
-	err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6)
-	if err == nil {
-		t.Fatal("RunScheduled() error = nil")
-	}
-	report := fx.notifier.reports[0]
-	if report.FailureSummary != "Settlement 余额查询失败，无法确认是否满足 Payout。" ||
-		strings.Contains(report.FailureSummary, "0 USDC") {
-		t.Fatalf("failure summary = %q", report.FailureSummary)
-	}
-	if len(fx.notifier.alertSeverity) == 0 ||
-		fx.notifier.alertSeverity[len(fx.notifier.alertSeverity)-1] != AlertSeverityWarning {
-		t.Fatalf("alert severities = %#v", fx.notifier.alertSeverity)
-	}
-}
-
-func TestRateLimitAlertIsLatchedUntilTheAccountRecovers(t *testing.T) {
-	fx := newFixture(t)
-	fx.repo.records = nil
-	fx.chain.rateLimits["0xbuilder"] = info.UserRateLimit{NRequestsUsed: 9801, NRequestsCap: 10_000}
-
-	for range 2 {
-		if err := fx.orchestrator.Run(context.Background(), TriggerUTC); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(fx.notifier.alerts) != 1 {
-		t.Fatalf("alerts while continuously low = %#v, want one", fx.notifier.alerts)
-	}
-
-	fx.chain.rateLimits["0xbuilder"] = info.UserRateLimit{NRequestsUsed: 9800, NRequestsCap: 10_000}
-	if err := fx.orchestrator.Run(context.Background(), TriggerUTC); err != nil {
-		t.Fatal(err)
-	}
-	fx.chain.rateLimits["0xbuilder"] = info.UserRateLimit{NRequestsUsed: 9801, NRequestsCap: 10_000}
-	if err := fx.orchestrator.Run(context.Background(), TriggerUTC); err != nil {
-		t.Fatal(err)
-	}
-	if len(fx.notifier.alerts) != 2 {
-		t.Fatalf("alerts after recovery and regression = %#v, want two", fx.notifier.alerts)
-	}
-}
-
-func TestUnknownPayoutConfirmsWhenSettlementBalanceDecreases(t *testing.T) {
-	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
 	fx.chain.payoutResult = exchange.SubmitResult{}
 	fx.chain.applyUnknownPayout = true
 	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
-	if fx.store.archiveResult != "completed" || len(fx.repo.completedIDs) == 0 {
-		t.Fatalf("archive = %q, completed = %v", fx.store.archiveResult, fx.repo.completedIDs)
+	if fx.store.current != nil || fx.store.archiveResult != "completed" ||
+		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
+		t.Fatalf("unknown applied payout current=%#v archive=%q", fx.store.current, fx.store.archiveResult)
+	}
+	report := onlyReport(t, fx.notifier)
+	if report.Payout.ConfirmationEvidence != "settlement_balance_decreased" {
+		t.Fatalf("payout report = %#v", report.Payout)
 	}
 }
 
-func TestUnknownPayoutBlocksAfterFiniteBalanceObservations(t *testing.T) {
+func TestExplicitlyRejectedPayoutIsArchivedAndCleared(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.payoutResult = exchange.SubmitResult{}
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.chain.payoutResult = exchange.SubmitResult{
+		Rejected: true, Response: json.RawMessage("{\"status\":\"err\"}"),
+	}
 	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil || !IsFatal(err) {
-		t.Fatalf("Run() error = %v, want fatal", err)
-	}
-	if fx.store.current == nil || fx.store.current.Phase != PhaseBlocked || fx.store.archiveResult != "blocked" {
-		t.Fatalf("current = %#v, archive = %q", fx.store.current, fx.store.archiveResult)
-	}
-	if got := countDelay(fx.sleeper.delays, payoutBalanceObservationInterval); got != payoutBalanceObservationAttempts {
-		t.Fatalf("one-second delays = %d, want claim wait plus bounded payout observations", got)
-	}
-	if len(fx.repo.completedIDs) != 0 {
-		t.Fatalf("database completed after ambiguous payout: %v", fx.repo.completedIDs)
-	}
-	if got := fx.chain.balanceCalls["0xsettlement"]; got != 2+payoutBalanceObservationAttempts {
-		t.Fatalf("settlement balance calls = %d, want sufficiency, %d observations, and final report balance", got, payoutBalanceObservationAttempts)
+	if err == nil || !IsFatal(err) || fx.store.current != nil || fx.store.archiveResult != "rejected" {
+		t.Fatalf("rejected payout error=%v current=%#v archive=%q", err, fx.store.current, fx.store.archiveResult)
 	}
 }
 
-func TestUnknownPayoutIgnoresAvailableDecreaseWhenTotalIsUnchanged(t *testing.T) {
+func TestPayoutIsNotSubmittedUntilBothDurableBoundariesSucceed(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.payoutResult = exchange.SubmitResult{}
-	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
-		{Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5")},
-		{Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("0.5")},
-	}
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.store.failPhase = PhasePayoutSubmitting
 	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil || !IsFatal(err) || fx.store.current == nil || fx.store.current.Phase != PhaseBlocked {
-		t.Fatalf("Run() = %v, current = %#v", err, fx.store.current)
-	}
-	if len(fx.repo.completedIDs) != 0 {
-		t.Fatalf("database completed after hold-only change: %v", fx.repo.completedIDs)
-	}
-}
-
-func TestAvailableBalanceControlsBuilderSweepAndPayoutSufficiency(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.balances["0xbuilder"] = decimal.NewFromInt(2)
-	fx.chain.holds["0xbuilder"] = decimal.RequireFromString("0.5")
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-	if got := fx.chain.balances["0xbuilder"]; !got.Equal(decimal.RequireFromString("0.5")) {
-		t.Fatalf("builder total after sweep = %s, want held 0.5", got)
-	}
-
-	fx = newFixture(t)
-	fx.chain.balances["0xbuilder"] = decimal.Zero
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-	fx.chain.holds["0xsettlement"] = decimal.NewFromInt(1)
-	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil || IsFatal(err) {
-		t.Fatalf("Run() error = %v, want ordinary underfunded error", err)
+	if err == nil {
+		t.Fatal("Run() error = nil")
 	}
 	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
-		t.Fatalf("payout used total instead of available: %v", fx.chain.events)
+		t.Fatalf("payout submitted after state save failure: %v", fx.chain.events)
+	}
+	if fx.store.current == nil || fx.store.current.Phase != PhasePayoutSubmitting ||
+		fx.store.current.Payout == nil {
+		t.Fatalf("durable current = %#v", fx.store.current)
 	}
 }
 
-func TestClaimBalancePollingWaitsForVisibilityWhenSettlementIsPreFunded(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
-	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{zero, zero}
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != 3 {
-		t.Fatalf("claim balance waits = %d, want initial wait and two retry waits", got)
-	}
-	if got := fx.chain.balanceCalls["0xbuilder"]; got != 3 {
-		t.Fatalf("SpotBalance(builder) calls = %d, want 3", got)
-	}
-	if !equalStrings(fx.chain.events, []string{
-		"submit:claimRewards:0xbuilder",
-		"submit:spotSend:0xbuilder",
-		"submit:spotSend:0xsettlement",
-	}) {
-		t.Fatalf("chain events = %v", fx.chain.events)
-	}
-	if got := fx.chain.balances["0xbuilder"]; !got.IsZero() {
-		t.Fatalf("builder balance = %s, want zero", got)
-	}
-	if fx.store.archiveResult != "completed" {
-		t.Fatalf("archive = %q", fx.store.archiveResult)
-	}
-}
+func TestPayoutRecoveryNeverResubmitsUncertainState(t *testing.T) {
+	t.Run("submitting observes total decrease", func(t *testing.T) {
+		fx := newFixture(t)
+		state := fx.positiveState(t, PhasePayoutSubmitting)
+		state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 900), TotalBefore: "2"}
+		fx.store.current = &state
+		fx.chain.balances["0xsettlement"] = decimal.RequireFromString("0.5")
+		if err := fx.orchestrator.Recover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if len(fx.chain.events) != 0 || fx.store.archiveResult != "completed" {
+			t.Fatalf("recovery events=%v archive=%q", fx.chain.events, fx.store.archiveResult)
+		}
+	})
 
-func TestClaimBalancePollingExhaustionSweepsLatestWithoutBlockingPayout(t *testing.T) {
-	fx := newFixture(t)
-	latest := info.SpotBalanceAmounts{
-		Total: decimal.RequireFromString("2"), Available: decimal.RequireFromString("0.5"),
-	}
-	fx.chain.balanceSequence["0xbuilder"] = make(
-		[]info.SpotBalanceAmounts, claimBalanceObservationAttempts,
-	)
-	for index := range fx.chain.balanceSequence["0xbuilder"] {
-		fx.chain.balanceSequence["0xbuilder"][index] = latest
-	}
-	fx.chain.balances["0xbuilder"] = latest.Total
-	fx.chain.holds["0xbuilder"] = latest.Total.Sub(latest.Available)
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+	t.Run("backup prepared is uncertain", func(t *testing.T) {
+		fx := newFixture(t)
+		state := fx.positiveState(t, PhasePayoutPrepared)
+		state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 901), TotalBefore: "2"}
+		fx.store.current = &state
+		fx.store.metadata = StateLoadMetadata{RecoveredFromBackup: true, PrimaryInvalid: true}
+		fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+		err := fx.orchestrator.Recover(context.Background())
+		if err == nil || !IsFatal(err) || len(fx.chain.events) != 0 {
+			t.Fatalf("backup recovery error=%v events=%v", err, fx.chain.events)
+		}
+	})
 
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-	if got := fx.chain.balanceCalls["0xbuilder"]; got != claimBalanceObservationAttempts {
-		t.Fatalf("SpotBalance(builder) calls = %d, want %d", got, claimBalanceObservationAttempts)
-	}
-	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != claimBalanceObservationAttempts {
-		t.Fatalf("claim balance waits = %d, want %d", got, claimBalanceObservationAttempts)
-	}
-	if !equalStrings(fx.chain.events, []string{
-		"submit:claimRewards:0xbuilder",
-		"submit:spotSend:0xbuilder",
-		"submit:spotSend:0xsettlement",
-	}) {
-		t.Fatalf("chain events = %v", fx.chain.events)
-	}
-	if fx.store.archiveResult != "completed" || len(fx.repo.completedIDs) == 0 {
-		t.Fatalf("archive = %q, completed = %v", fx.store.archiveResult, fx.repo.completedIDs)
-	}
-	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusWarning {
-		t.Fatalf("report = %#v, want completed payout with warning", fx.notifier.reports)
-	}
-	builderReport := fx.notifier.reports[0].Builders[0]
-	if builderReport.SweepAmount != "0.5" || builderReport.SweepStatus != ReportStepWarning {
-		t.Fatalf("builder report = %#v", builderReport)
-	}
-	assertLogFields(t, fx.logger, "funding_builder_claim_balance_observation_exhausted", map[string]any{
-		"builder":          "0xbuilder",
-		"attempt_count":    int64(claimBalanceObservationAttempts),
-		"claimable_usdc":   "1.5",
-		"balance_observed": true,
-		"last_total":       "2",
-		"last_available":   "0.5",
+	t.Run("primary prepared submits persisted request", func(t *testing.T) {
+		fx := newFixture(t)
+		state := fx.positiveState(t, PhasePayoutPrepared)
+		state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 902), TotalBefore: "2"}
+		fx.store.current = &state
+		fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+		if err := fx.orchestrator.Recover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
+			t.Fatalf("events = %v", fx.chain.events)
+		}
 	})
 }
 
-func TestClaimBalancePollingSkipsSweepAfterTenQueryFailures(t *testing.T) {
+func TestConfirmedPayoutRecoveryOnlyCompletesDatabase(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.balanceErrors["0xbuilder"] = errors.New("spot balance unavailable")
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+	state := fx.positiveState(t, PhasePayoutConfirmed)
+	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 903), TotalBefore: "2"}
+	fx.store.current = &state
+	if err := fx.orchestrator.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := fx.chain.balanceCalls["0xbuilder"]; got != claimBalanceObservationAttempts {
-		t.Fatalf("SpotBalance(builder) calls = %d, want %d", got, claimBalanceObservationAttempts)
+	if len(fx.chain.events) != 0 || !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
+		t.Fatalf("chain=%v completed=%v", fx.chain.events, fx.repo.completedIDs)
 	}
-	if got := countDelay(fx.sleeper.delays, claimBalanceObservationInterval); got != claimBalanceObservationAttempts {
-		t.Fatalf("claim balance waits = %d, want %d", got, claimBalanceObservationAttempts)
-	}
-	if !equalStrings(fx.chain.events, []string{
-		"submit:claimRewards:0xbuilder",
-		"submit:spotSend:0xsettlement",
-	}) {
-		t.Fatalf("chain events = %v", fx.chain.events)
-	}
-	if fx.store.archiveResult != "completed" || len(fx.repo.completedIDs) == 0 {
-		t.Fatalf("archive = %q, completed = %v", fx.store.archiveResult, fx.repo.completedIDs)
-	}
-	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusWarning {
-		t.Fatalf("report = %#v, want completed payout with warning", fx.notifier.reports)
-	}
-	assertLogFields(t, fx.logger, "funding_builder_claim_balance_observation_exhausted", map[string]any{
-		"builder":          "0xbuilder",
-		"attempt_count":    int64(claimBalanceObservationAttempts),
-		"claimable_usdc":   "1.5",
-		"balance_observed": false,
-	})
 }
 
-func TestBuilderConvergenceExhaustionIsOrdinaryError(t *testing.T) {
+func TestRecoveryUsesDailyConsolidationForPersistedUTCDate(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.claimableRewards["0xbuilder"] = decimal.Zero
-	fx.chain.balances["0xbuilder"] = decimal.Zero
-	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil || IsFatal(err) {
-		t.Fatalf("Run() error = %v, want ordinary error", err)
+	state := fx.positiveState(t, PhasePayoutConfirmed)
+	state.UTCDate = "2026-07-11"
+	fx.store.current = &state
+	fx.store.consolidations = map[string]DailyConsolidation{
+		"2026-07-11": {
+			UTCDate: "2026-07-11", Status: DailyConsolidationCompleted,
+			StartedAt:            time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
+			ClaimablesCapturedAt: time.Date(2026, 7, 11, 0, 0, 1, 0, time.UTC),
+			CompletedAt:          time.Date(2026, 7, 11, 0, 0, 2, 0, time.UTC),
+			Builders: []DailyConsolidationBuilder{{
+				Address: "0xbuilder", ClaimableUSDC: "1.6", ClaimableObserved: true,
+				ClaimableQueryAttempts: 1,
+				ClaimStatus:            ReportStepSuccess, SweepAmount: "1.6", SweepStatus: ReportStepSuccess,
+			}},
+		},
 	}
-	if got := countDelay(fx.sleeper.delays, builderConvergenceInterval); got != builderConvergenceAttempts-1 {
-		t.Fatalf("convergence delays = %d, want %d", got, builderConvergenceAttempts-1)
+	if err := fx.orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	report := onlyReport(t, fx.notifier)
+	if report.UTCDate != "2026-07-11" || report.DailyConsolidation.UTCDate != "2026-07-11" ||
+		report.DailyConsolidation.TotalClaimableUSDC != "1.6" ||
+		!report.DailyConsolidation.CoversPayout || report.Builders[0].ClaimableUSDC != "1.6" {
+		t.Fatalf("recovery report = %#v", report)
 	}
 }
 
@@ -1018,243 +624,57 @@ func TestRecordValidationFailureArchivesOnceAndIsFatal(t *testing.T) {
 		{ID: 1, PeriodStartAt: 10, Amount: "-0.1"},
 	}
 	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil || !IsFatal(err) {
-		t.Fatalf("Run() error = %v, want fatal validation error", err)
-	}
-	if fx.store.archiveResult != "failed_validation" || fx.store.current != nil {
-		t.Fatalf("archive = %q, current = %#v", fx.store.archiveResult, fx.store.current)
-	}
-	if got := fx.store.archived.Manifest.Records; len(got) != 2 || got[0].ID != 1 || got[1].ID != 2 {
-		t.Fatalf("archived records = %#v", got)
-	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("chain events after validation failure = %v", fx.chain.events)
+	if err == nil || !IsFatal(err) || fx.store.archiveResult != "failed_validation" ||
+		fx.store.current != nil || len(fx.chain.events) != 0 {
+		t.Fatalf("validation error=%v archive=%q current=%#v events=%v", err, fx.store.archiveResult, fx.store.current, fx.chain.events)
 	}
 }
 
-func TestRejectedPayoutBlocksWithoutBalanceObservation(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.payoutResult = exchange.SubmitResult{
-		Rejected: true, Response: json.RawMessage(`{"status":"err","response":"rejected"}`),
-	}
-	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil || !IsFatal(err) || fx.store.current != nil {
-		t.Fatalf("error = %v, current = %#v", err, fx.store.current)
-	}
-	if fx.store.archiveResult != "rejected" {
-		t.Fatalf("archive = %q", fx.store.archiveResult)
-	}
-	if len(fx.notifier.alertSeverity) == 0 ||
-		fx.notifier.alertSeverity[len(fx.notifier.alertSeverity)-1] != AlertSeverityCritical {
-		t.Fatalf("alert severities = %#v, want final critical alert", fx.notifier.alertSeverity)
-	}
-	assertLogFields(t, fx.logger, "funding_payout_submit_result", map[string]any{
-		"accepted": false,
-		"rejected": true,
-		"response": `{"status":"err","response":"rejected"}`,
-	})
-}
-
-func TestBuilderFailuresDoNotBlockPreFundedPayout(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.claimResult = exchange.SubmitResult{
-		Rejected: true, Response: json.RawMessage(`{"status":"err","response":"rejected"}`),
-	}
-	fx.chain.balanceErrors["0xbuilder"] = errors.New("unavailable")
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-	if fx.store.archiveResult != "completed" {
-		t.Fatalf("archive = %q", fx.store.archiveResult)
-	}
-	if len(fx.notifier.alerts) == 0 {
-		t.Fatal("builder failures did not alert")
-	}
-	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusWarning {
-		t.Fatalf("report = %#v, want success with warnings", fx.notifier.reports)
-	}
-	assertLogFields(t, fx.logger, "funding_builder_submit_result", map[string]any{
-		"action_kind": "claimRewards",
-		"accepted":    false,
-		"rejected":    true,
-		"response":    `{"status":"err","response":"rejected"}`,
-	})
-}
-
-func TestRecoverSubmittingPayoutUsesBalanceWithoutResubmitting(t *testing.T) {
-	fx := newFixture(t)
-	state := fx.positiveState(t, PhasePayoutSubmitting)
-	state.Payout = &PayoutJournal{
-		Prepared: validPayout(t, state, 900), TotalBefore: "2",
-	}
-	fx.store.current = &state
-	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("0.5")
-	fx.chain.events = nil
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("recovery resubmitted chain action: %v", fx.chain.events)
-	}
-	if fx.store.archiveResult != "completed" {
-		t.Fatalf("archive = %q", fx.store.archiveResult)
-	}
-	if len(fx.notifier.reports) != 1 || !fx.notifier.reports[0].Recovery ||
-		fx.notifier.reports[0].Status != ReportStatusSuccess {
-		t.Fatalf("recovery report = %#v", fx.notifier.reports)
-	}
-	report := fx.notifier.reports[0]
-	for _, key := range []string{"rewards", "sweep"} {
-		if stage := report.stage(key); stage == nil || stage.Status != ReportStepSkipped ||
-			!strings.Contains(stage.Summary, "历史明细未持久化") {
-			t.Fatalf("recovery %s stage = %#v", key, stage)
-		}
-	}
-	if report.Builders[0].ClaimStatus != ReportStepSkipped ||
-		report.Builders[0].SweepStatus != ReportStepSkipped {
-		t.Fatalf("recovery builder report = %#v", report.Builders[0])
-	}
-}
-
-func TestRecoverPrimaryPreparedPayoutSubmitsPersistedRequest(t *testing.T) {
-	fx := newFixture(t)
-	state := fx.positiveState(t, PhasePayoutPrepared)
-	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 902), TotalBefore: "2"}
-	fx.store.current = &state
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-	fx.chain.events = nil
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
-		t.Fatalf("events = %v", fx.chain.events)
-	}
-}
-
-func TestRecoverBackupPreparedPayoutDoesNotResubmit(t *testing.T) {
-	fx := newFixture(t)
-	state := fx.positiveState(t, PhasePayoutPrepared)
-	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 903), TotalBefore: "2"}
-	fx.store.current = &state
-	fx.store.metadata = StateLoadMetadata{RecoveredFromBackup: true, PrimaryInvalid: true}
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-	fx.chain.events = nil
-	err := fx.orchestrator.Recover(context.Background())
-	if err == nil || !IsFatal(err) {
-		t.Fatalf("Recover() error = %v, want fatal ambiguity", err)
-	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("backup recovery resubmitted payout: %v", fx.chain.events)
-	}
-}
-
-func TestRecoverConfirmedPayoutOnlyCompletesDatabase(t *testing.T) {
-	fx := newFixture(t)
-	state := fx.positiveState(t, PhasePayoutConfirmed)
-	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 901), TotalBefore: "2"}
-	fx.store.current = &state
-	fx.chain.events = nil
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(fx.chain.events) != 0 || len(fx.repo.completedIDs) == 0 {
-		t.Fatalf("chain = %v, completed = %v", fx.chain.events, fx.repo.completedIDs)
-	}
-}
-
-func TestRunRecoversCurrentWithoutStartingAnotherRun(t *testing.T) {
-	fx := newFixture(t)
-	manifest, err := BuildManifest(ManifestInput{
-		Records:    []Record{{ID: 99, PeriodStartAt: 1, Amount: "0"}},
-		Settlement: "0xsettlement", Recipient: "0xrecipient",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fx.store.current = &RunState{
-		RunID: "existing", Trigger: TriggerUTC, UTCDate: "2026-07-11",
-		Phase: PhasePrepared, Manifest: manifest,
-	}
-
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-	if fx.repo.listCalls != 0 {
-		t.Fatalf("ListPending() calls = %d, want 0", fx.repo.listCalls)
-	}
-	if !equalUint64(fx.repo.completedIDs, []uint64{99}) {
-		t.Fatalf("completed IDs = %v, want recovered record only", fx.repo.completedIDs)
-	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("chain events = %v, want no second run", fx.chain.events)
-	}
-}
-
-func TestRunRecoveryReportUsesFinalPhase(t *testing.T) {
-	fx := newFixture(t)
-	state := fx.positiveState(t, PhasePayoutSubmitting)
-	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 904), TotalBefore: "2"}
-	fx.store.current = &state
-	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("0.5")
-
-	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
-		t.Fatal(err)
-	}
-	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Phase != PhasePayoutConfirmed {
-		t.Fatalf("reports = %#v", fx.notifier.reports)
-	}
-}
-
-func TestNewOrchestratorRejectsUnsafeRecipient(t *testing.T) {
-	fx := newFixture(t)
-	for _, recipient := range []string{"0xbuilder", zeroEthereumAddress} {
-		t.Run(recipient, func(t *testing.T) {
-			_, err := NewOrchestrator(OrchestratorConfig{
-				Repository: fx.repo, Store: fx.store, ClaimableSnapshots: fx.store, Chain: fx.chain,
-				Builders: []string{"0xbuilder"}, Settlement: "0xsettlement", Recipient: recipient,
-				Clock: fx.clock, Nonce: &fakeNonce{next: 1}, Sleeper: fx.sleeper,
-			})
-			if err == nil || !strings.Contains(err.Error(), "recipient") {
-				t.Fatalf("NewOrchestrator() error = %v", err)
-			}
-		})
-	}
-}
-
-func TestPayoutIsNotSubmittedUntilBothDurableBoundariesSucceed(t *testing.T) {
-	fx := newFixture(t)
-	fx.store.failPhase = PhasePayoutSubmitting
-	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil {
-		t.Fatal("Run() error = nil")
-	}
-	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
-		t.Fatalf("payout submitted after state save failure: %v", fx.chain.events)
-	}
-	if fx.store.current == nil || fx.store.current.Phase != PhasePayoutSubmitting || fx.store.current.Payout == nil {
-		t.Fatalf("durable current = %#v", fx.store.current)
-	}
-}
-
-func TestRunNoDataArchivesWithoutChainMutation(t *testing.T) {
+func TestRunNoDataDoesNotCreatePayoutState(t *testing.T) {
 	fx := newFixture(t)
 	fx.repo.records = nil
 	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
-	if len(fx.chain.events) != 0 || fx.store.archiveResult != "" {
-		t.Fatalf("chain = %v, archive = %q", fx.chain.events, fx.store.archiveResult)
+	if len(fx.chain.events) != 0 || fx.store.archiveResult != "" || len(fx.store.saved) != 0 {
+		t.Fatalf("no-data events=%v archive=%q saved=%d", fx.chain.events, fx.store.archiveResult, len(fx.store.saved))
 	}
-	if len(fx.notifier.reports) != 1 || fx.notifier.reports[0].Status != ReportStatusNoData {
-		t.Fatalf("report = %#v, want no data", fx.notifier.reports)
+	report := onlyReport(t, fx.notifier)
+	if report.Status != ReportStatusNoData || report.Outcome != "no_data" {
+		t.Fatalf("no-data report = %#v", report)
 	}
-	if !fx.notifier.reports[0].SettlementBalance.Observed {
-		t.Fatalf("no-data report missing final settlement balance: %#v", fx.notifier.reports[0])
+}
+
+func TestRateLimitObservationRunsAfterPayout(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.chain.trackRateLimitUsage = true
+	fx.chain.rateLimits["0xsettlement"] = info.UserRateLimit{NRequestsUsed: 800, NRequestsCap: 1000}
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
 	}
-	if builder := fx.notifier.reports[0].Builders[0]; builder.ClaimStatus != ReportStepSkipped ||
-		builder.SweepStatus != ReportStepSkipped {
-		t.Fatalf("no-data builder report = %#v", builder)
+	if fx.chain.rateLimitCalls["0xsettlement"] != 1 {
+		t.Fatalf("settlement rate limit calls = %d", fx.chain.rateLimitCalls["0xsettlement"])
+	}
+	if !containsString(fx.notifier.alerts, "user_rate_limit_low:0xsettlement") {
+		t.Fatalf("alerts = %#v", fx.notifier.alerts)
+	}
+}
+
+func TestNewOrchestratorRejectsUnsafeAccounts(t *testing.T) {
+	fx := newFixture(t)
+	for _, recipient := range []string{"0xbuilder", zeroEthereumAddress, "0xsettlement"} {
+		t.Run(recipient, func(t *testing.T) {
+			_, err := NewOrchestrator(OrchestratorConfig{
+				Repository: fx.repo, Store: fx.store, DailyConsolidations: fx.store,
+				Chain: fx.chain, Builders: []string{"0xbuilder"},
+				Settlement: "0xsettlement", Recipient: recipient,
+				Clock: fx.clock, Nonce: &fakeNonce{next: 1}, Sleeper: fx.sleeper,
+			})
+			if err == nil {
+				t.Fatalf("NewOrchestrator() accepted recipient %q", recipient)
+			}
+		})
 	}
 }
 
@@ -1269,6 +689,26 @@ type fixture struct {
 	clock        fixedClock
 }
 
+func newTwoBuilderOrchestrator(t *testing.T, fx *fixture) *Orchestrator {
+	t.Helper()
+	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
+	fx.chain.balances["0xbuilder-2"] = decimal.RequireFromString("1.25")
+	fx.chain.rateLimits["0xbuilder-2"] = info.UserRateLimit{NRequestsCap: 10_000}
+	orchestrator, err := NewOrchestrator(OrchestratorConfig{
+		Repository: fx.repo, Store: fx.store, DailyConsolidations: fx.store, Chain: fx.chain,
+		Notifier: fx.notifier, Logger: fx.logger,
+		Builders:     []string{"0xbuilder", "0xbuilder-2"},
+		BuilderNames: map[string]string{"0xbuilder": "builder-1", "0xbuilder-2": "builder-2"},
+		Settlement:   "0xsettlement", Recipient: "0xrecipient",
+		Clock: fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
+		Sleeper: fx.sleeper,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return orchestrator
+}
+
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	repo := &fakeRepository{records: []Record{
@@ -1281,7 +721,8 @@ func newFixture(t *testing.T) *fixture {
 		claimableRewards: map[string]decimal.Decimal{
 			"0xbuilder": decimal.RequireFromString("1.5"),
 		},
-		claimableErrors: map[string]error{},
+		claimableErrors:        map[string]error{},
+		claimableErrorSequence: map[string][]error{},
 		balances: map[string]decimal.Decimal{
 			"0xbuilder": decimal.RequireFromString("1.5"), "0xsettlement": decimal.Zero,
 		},
@@ -1303,10 +744,10 @@ func newFixture(t *testing.T) *fixture {
 	logger := &fakeLogger{}
 	clock := fixedClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: repo, Store: store, ClaimableSnapshots: store,
+		Repository: repo, Store: store, DailyConsolidations: store,
 		Chain: chain, Notifier: notifier, Logger: logger,
 		Builders: []string{"0xbuilder"}, BuilderNames: map[string]string{"0xbuilder": "builder-1"},
-		Settlement: "0xsettlement", Recipient: "0xrecipient",
+		Settlement: "0xsettlement", Recipient: "0xrecipient", Network: "mainnet",
 		Clock: clock, Nonce: &fakeNonce{next: uint64(clock.now.UnixMilli())}, Sleeper: sleeper,
 	})
 	if err != nil {
@@ -1327,7 +768,10 @@ func (f *fixture) positiveState(t *testing.T, phase Phase) RunState {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return RunState{RunID: "run", UTCDate: "2026-07-12", Phase: phase, Manifest: manifest}
+	return RunState{
+		RunID: "run", Trigger: TriggerUTC, UTCDate: "2026-07-12",
+		Phase: phase, Manifest: manifest,
+	}
 }
 
 type fakeRepository struct {
@@ -1340,26 +784,30 @@ func (r *fakeRepository) ListPending(context.Context) ([]Record, error) {
 	r.listCalls++
 	return append([]Record(nil), r.records...), nil
 }
+
 func (r *fakeRepository) Complete(_ context.Context, ids []uint64) error {
 	r.completedIDs = append([]uint64(nil), ids...)
 	return nil
 }
 
 type fakeStore struct {
-	current         *RunState
-	saved           []RunState
-	archived        RunState
-	archiveResult   string
-	failPhase       Phase
-	metadata        StateLoadMetadata
-	snapshots       map[string]ClaimableSnapshot
-	snapshotLoadErr error
-	snapshotSaveErr error
+	current              *RunState
+	saved                []RunState
+	archived             RunState
+	archiveResult        string
+	failPhase            Phase
+	metadata             StateLoadMetadata
+	consolidations       map[string]DailyConsolidation
+	consolidationSaves   []DailyConsolidation
+	consolidationSaved   chan DailyConsolidation
+	consolidationLoadErr error
+	consolidationSaveErr error
 }
 
 func (s *fakeStore) LoadWithMetadata(context.Context) (*RunState, StateLoadMetadata, error) {
 	return cloneState(s.current), s.metadata, nil
 }
+
 func (s *fakeStore) Save(_ context.Context, state RunState) error {
 	copy := cloneState(&state)
 	s.current = copy
@@ -1369,99 +817,137 @@ func (s *fakeStore) Save(_ context.Context, state RunState) error {
 	}
 	return nil
 }
+
 func (s *fakeStore) Archive(_ context.Context, state RunState, result string) error {
 	s.archived, s.archiveResult = *cloneState(&state), result
 	return nil
 }
-func (s *fakeStore) Clear(context.Context) error { s.current = nil; return nil }
-func (s *fakeStore) LoadClaimableSnapshot(
+
+func (s *fakeStore) Clear(context.Context) error {
+	s.current = nil
+	return nil
+}
+
+func (s *fakeStore) LoadDailyConsolidation(
 	_ context.Context,
 	utcDate string,
-) (*ClaimableSnapshot, error) {
-	if s.snapshotLoadErr != nil {
-		return nil, s.snapshotLoadErr
+) (*DailyConsolidation, error) {
+	if s.consolidationLoadErr != nil {
+		return nil, s.consolidationLoadErr
 	}
-	snapshot, exists := s.snapshots[utcDate]
+	record, exists := s.consolidations[utcDate]
 	if !exists {
 		return nil, nil
 	}
-	copy := snapshot
-	copy.Builders = append([]ClaimableSnapshotBuilder(nil), snapshot.Builders...)
+	copy := record
+	copy.Builders = append([]DailyConsolidationBuilder(nil), record.Builders...)
 	return &copy, nil
 }
-func (s *fakeStore) SaveClaimableSnapshot(
+
+func (s *fakeStore) SaveDailyConsolidation(
 	_ context.Context,
-	snapshot ClaimableSnapshot,
+	record DailyConsolidation,
 ) error {
-	if s.snapshotSaveErr != nil {
-		return s.snapshotSaveErr
+	if s.consolidationSaveErr != nil {
+		return s.consolidationSaveErr
 	}
-	if s.snapshots == nil {
-		s.snapshots = make(map[string]ClaimableSnapshot)
+	if s.consolidations == nil {
+		s.consolidations = make(map[string]DailyConsolidation)
 	}
-	copy := snapshot
-	copy.Builders = append([]ClaimableSnapshotBuilder(nil), snapshot.Builders...)
-	s.snapshots[snapshot.UTCDate] = copy
+	copy := record
+	copy.Builders = append([]DailyConsolidationBuilder(nil), record.Builders...)
+	s.consolidations[record.UTCDate] = copy
+	s.consolidationSaves = append(s.consolidationSaves, copy)
+	if s.consolidationSaved != nil {
+		s.consolidationSaved <- copy
+	}
 	return nil
 }
 
 type fakeChain struct {
-	token                   info.Token
-	tokenError              error
-	tokenErrors             []error
-	tokenCalls              int
-	claimableRewards        map[string]decimal.Decimal
-	claimableErrors         map[string]error
-	claimableErrorSequence  map[string][]error
-	claimableCalls          map[string]int
-	balances                map[string]decimal.Decimal
-	holds                   map[string]decimal.Decimal
-	balanceErrors           map[string]error
-	balanceSequence         map[string][]info.SpotBalanceAmounts
-	balanceCalls            map[string]int
-	rateLimits              map[string]info.UserRateLimit
-	rateLimitErrors         map[string]error
-	rateLimitCalls          map[string]int
-	trackRateLimitUsage     bool
-	respectRateLimitContext bool
-	claimResult             exchange.SubmitResult
-	sweepResult             exchange.SubmitResult
-	payoutResult            exchange.SubmitResult
-	applyUnknownPayout      bool
-	events                  []string
+	mu                     sync.Mutex
+	token                  info.Token
+	tokenError             error
+	tokenCalls             int
+	claimableRewards       map[string]decimal.Decimal
+	claimableErrors        map[string]error
+	claimableErrorSequence map[string][]error
+	claimableCalls         map[string]int
+	claimableStarted       chan string
+	claimableRelease       chan struct{}
+	balances               map[string]decimal.Decimal
+	holds                  map[string]decimal.Decimal
+	balanceErrors          map[string]error
+	balanceSequence        map[string][]info.SpotBalanceAmounts
+	balanceCalls           map[string]int
+	rateLimits             map[string]info.UserRateLimit
+	rateLimitErrors        map[string]error
+	rateLimitCalls         map[string]int
+	trackRateLimitUsage    bool
+	claimResult            exchange.SubmitResult
+	claimResults           map[string][]exchange.SubmitResult
+	claimStarted           chan string
+	claimRelease           chan struct{}
+	sweepResult            exchange.SubmitResult
+	payoutResult           exchange.SubmitResult
+	applyUnknownPayout     bool
+	events                 []string
 }
 
 func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.tokenCalls++
-	if len(c.tokenErrors) > 0 {
-		err := c.tokenErrors[0]
-		c.tokenErrors = c.tokenErrors[1:]
-		if err != nil {
-			return info.Token{}, err
-		}
-		return c.token, nil
-	}
 	return c.token, c.tokenError
 }
-func (c *fakeChain) ClaimableUSDC(_ context.Context, address string, _ info.Token) (decimal.Decimal, error) {
+
+func (c *fakeChain) ClaimableUSDC(
+	ctx context.Context,
+	address string,
+	_ info.Token,
+) (decimal.Decimal, error) {
+	c.mu.Lock()
 	if c.claimableCalls == nil {
 		c.claimableCalls = make(map[string]int)
 	}
 	c.claimableCalls[address]++
+	var err error
 	if sequence := c.claimableErrorSequence[address]; len(sequence) > 0 {
-		err := sequence[0]
+		err = sequence[0]
 		c.claimableErrorSequence[address] = sequence[1:]
-		if err != nil {
-			return decimal.Zero, err
-		}
-		return c.claimableRewards[address], nil
+	} else {
+		err = c.claimableErrors[address]
 	}
-	if err := c.claimableErrors[address]; err != nil {
+	amount := c.claimableRewards[address]
+	started, release := c.claimableStarted, c.claimableRelease
+	c.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- address:
+		case <-ctx.Done():
+			return decimal.Zero, ctx.Err()
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return decimal.Zero, ctx.Err()
+		}
+	}
+	if err != nil {
 		return decimal.Zero, err
 	}
-	return c.claimableRewards[address], nil
+	return amount, nil
 }
-func (c *fakeChain) SpotBalance(_ context.Context, address string, _ info.Token) (info.SpotBalanceAmounts, error) {
+
+func (c *fakeChain) SpotBalance(
+	_ context.Context,
+	address string,
+	_ info.Token,
+) (info.SpotBalanceAmounts, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.balanceCalls[address]++
 	if err := c.balanceErrors[address]; err != nil {
 		return info.SpotBalanceAmounts{}, err
@@ -1471,25 +957,64 @@ func (c *fakeChain) SpotBalance(_ context.Context, address string, _ info.Token)
 		c.balanceSequence[address] = sequence[1:]
 		return balance, nil
 	}
-	return info.SpotBalanceAmounts{Total: c.balances[address], Available: c.balances[address].Sub(c.holds[address])}, nil
+	return info.SpotBalanceAmounts{
+		Total: c.balances[address], Available: c.balances[address].Sub(c.holds[address]),
+	}, nil
 }
-func (c *fakeChain) UserRateLimit(ctx context.Context, address string) (info.UserRateLimit, error) {
+
+func (c *fakeChain) UserRateLimit(
+	_ context.Context,
+	address string,
+) (info.UserRateLimit, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.rateLimitCalls[address]++
-	if c.respectRateLimitContext && ctx.Err() != nil {
-		return info.UserRateLimit{}, ctx.Err()
-	}
 	if err := c.rateLimitErrors[address]; err != nil {
 		return info.UserRateLimit{}, err
 	}
 	return c.rateLimits[address], nil
 }
+
 func (c *fakeChain) PrepareClaim(address string, nonce uint64) (exchange.PreparedAction, error) {
 	return preparedAction(tinyTB{}, "claimRewards", address, "", "", "", nonce), nil
 }
-func (c *fakeChain) PrepareSpotSend(address, destination string, token info.Token, amount decimal.Decimal, nonce uint64) (exchange.PreparedAction, error) {
-	return preparedAction(tinyTB{}, "spotSend", address, destination, token.WireToken, amount.String(), nonce), nil
+
+func (c *fakeChain) PrepareSpotSend(
+	address, destination string,
+	token info.Token,
+	amount decimal.Decimal,
+	nonce uint64,
+) (exchange.PreparedAction, error) {
+	return preparedAction(
+		tinyTB{}, "spotSend", address, destination, token.WireToken, amount.String(), nonce,
+	), nil
 }
-func (c *fakeChain) Submit(_ context.Context, action exchange.PreparedAction) (exchange.SubmitResult, error) {
+
+func (c *fakeChain) Submit(
+	ctx context.Context,
+	action exchange.PreparedAction,
+) (exchange.SubmitResult, error) {
+	if action.Kind == "claimRewards" {
+		c.mu.Lock()
+		started, release := c.claimStarted, c.claimRelease
+		c.mu.Unlock()
+		if started != nil {
+			select {
+			case started <- action.Signer:
+			case <-ctx.Done():
+				return exchange.SubmitResult{}, ctx.Err()
+			}
+		}
+		if release != nil {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return exchange.SubmitResult{}, ctx.Err()
+			}
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.events = append(c.events, "submit:"+action.Kind+":"+action.Signer)
 	if c.trackRateLimitUsage {
 		limit := c.rateLimits[action.Signer]
@@ -1497,6 +1022,11 @@ func (c *fakeChain) Submit(_ context.Context, action exchange.PreparedAction) (e
 		c.rateLimits[action.Signer] = limit
 	}
 	if action.Kind == "claimRewards" {
+		if sequence := c.claimResults[action.Signer]; len(sequence) > 0 {
+			result := sequence[0]
+			c.claimResults[action.Signer] = sequence[1:]
+			return result, nil
+		}
 		return c.claimResult, nil
 	}
 	amount := decimal.RequireFromString(action.Amount)
@@ -1523,17 +1053,6 @@ func (s *fakeSleeper) Sleep(ctx context.Context, delay time.Duration) error {
 	return nil
 }
 
-type cancelingSleeper struct {
-	cancel context.CancelFunc
-	calls  int
-}
-
-func (s *cancelingSleeper) Sleep(ctx context.Context, _ time.Duration) error {
-	s.calls++
-	s.cancel()
-	return ctx.Err()
-}
-
 type fakeNotifier struct {
 	alerts        []string
 	alertSeverity []AlertSeverity
@@ -1541,11 +1060,17 @@ type fakeNotifier struct {
 	reports       []RunReport
 }
 
-func (n *fakeNotifier) Alert(_ context.Context, key string, severity AlertSeverity, message string) {
+func (n *fakeNotifier) Alert(
+	_ context.Context,
+	key string,
+	severity AlertSeverity,
+	message string,
+) {
 	n.alerts = append(n.alerts, key)
 	n.alertSeverity = append(n.alertSeverity, severity)
 	n.alertMessages = append(n.alertMessages, message)
 }
+
 func (n *fakeNotifier) Report(_ context.Context, report RunReport) {
 	n.reports = append(n.reports, report)
 }
@@ -1560,12 +1085,15 @@ type fakeLogger struct{ entries []fakeLogEntry }
 func (l *fakeLogger) Info(_ context.Context, _ string, attrs ...slog.Attr) {
 	l.record("info", attrs)
 }
+
 func (l *fakeLogger) Warn(_ context.Context, _ string, attrs ...slog.Attr) {
 	l.record("warn", attrs)
 }
+
 func (l *fakeLogger) Error(_ context.Context, _ string, attrs ...slog.Attr) {
 	l.record("error", attrs)
 }
+
 func (l *fakeLogger) record(level string, attrs []slog.Attr) {
 	values := make(map[string]any, len(attrs))
 	for _, attr := range attrs {
@@ -1590,56 +1118,17 @@ func assertLogFields(t *testing.T, logger *fakeLogger, event string, want map[st
 	t.Fatalf("event %s was not logged", event)
 }
 
-func assertLogFieldAbsent(t *testing.T, logger *fakeLogger, event, field string) {
-	t.Helper()
-	found := false
-	for _, entry := range logger.entries {
-		if entry.attrs["event"] != event {
-			continue
-		}
-		found = true
-		if value, exists := entry.attrs[field]; exists {
-			t.Fatalf("event %s unexpectedly contains field %s=%#v", event, field, value)
-		}
-	}
-	if !found {
-		t.Fatalf("event %s was not logged", event)
-	}
-}
-
-func assertRateLimitLog(t *testing.T, logger *fakeLogger, address, level string, want map[string]any) {
-	t.Helper()
-	for _, entry := range logger.entries {
-		if entry.attrs["event"] != "funding_user_rate_limit_observed" || entry.attrs["address"] != address {
-			continue
-		}
-		if entry.level != level {
-			t.Fatalf("rate limit log for %s level = %q, want %q", address, entry.level, level)
-		}
-		for key, value := range want {
-			if got := entry.attrs[key]; got != value {
-				t.Fatalf("rate limit log for %s field %s = %#v, want %#v", address, key, got, value)
-			}
-		}
-		for _, key := range []string{"requests_cap", "requests_used", "alert_threshold", "below_threshold"} {
-			if _, exists := entry.attrs[key]; exists {
-				t.Fatalf("rate limit log for %s unexpectedly contains field %s", address, key)
-			}
-		}
-		return
-	}
-	t.Fatalf("rate limit observation for %s was not logged", address)
-}
-
 type fixedClock struct{ now time.Time }
 
 func (c fixedClock) Now() time.Time { return c.now }
 
 type fakeNonce struct{ next uint64 }
 
-func (n *fakeNonce) Next() uint64 { n.next++; return n.next }
+func (n *fakeNonce) Next() uint64 {
+	n.next++
+	return n.next
+}
 
-// tinyTB lets fake preparation share the same deterministic request builder.
 type tinyTB struct{}
 
 func (tinyTB) Helper()           {}
@@ -1650,24 +1139,35 @@ type testTB interface {
 	Fatal(...any)
 }
 
-func preparedAction(t testTB, kind, signer, destination, token, amount string, nonce uint64) exchange.PreparedAction {
+func preparedAction(
+	t testTB,
+	kind, signer, destination, token, amount string,
+	nonce uint64,
+) exchange.PreparedAction {
 	t.Helper()
 	body := map[string]any{"action": map[string]any{"type": kind}, "nonce": nonce}
 	if kind == "spotSend" {
-		body["action"] = map[string]any{"type": kind, "destination": destination, "token": token, "amount": amount, "time": nonce}
+		body["action"] = map[string]any{
+			"type": kind, "destination": destination, "token": token,
+			"amount": amount, "time": nonce,
+		}
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(raw)
-	return exchange.PreparedAction{Kind: kind, Signer: signer, Destination: destination, Token: token, Amount: amount,
-		Nonce: nonce, RequestBody: raw, RequestHash: hex.EncodeToString(digest[:])}
+	return exchange.PreparedAction{
+		Kind: kind, Signer: signer, Destination: destination, Token: token, Amount: amount,
+		Nonce: nonce, RequestBody: raw, RequestHash: hex.EncodeToString(digest[:]),
+	}
 }
 
 func validPayout(t *testing.T, state RunState, nonce uint64) exchange.PreparedAction {
-	return preparedAction(t, "spotSend", state.Manifest.Settlement, state.Manifest.Recipient,
-		state.Manifest.Token.WireToken, state.Manifest.PayoutTotal, nonce)
+	return preparedAction(
+		t, "spotSend", state.Manifest.Settlement, state.Manifest.Recipient,
+		state.Manifest.Token.WireToken, state.Manifest.PayoutTotal, nonce,
+	)
 }
 
 func cloneState(state *RunState) *RunState {
@@ -1680,28 +1180,77 @@ func cloneState(state *RunState) *RunState {
 	return &copy
 }
 
+func onlyReport(t *testing.T, notifier *fakeNotifier) RunReport {
+	t.Helper()
+	if len(notifier.reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(notifier.reports))
+	}
+	return notifier.reports[0]
+}
+
 func equalStrings(left, right []string) bool {
 	if len(left) != len(right) {
 		return false
 	}
-	for i := range left {
-		if left[i] != right[i] {
+	for index := range left {
+		if left[index] != right[index] {
 			return false
 		}
 	}
 	return true
 }
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[string]int, len(left))
+	for _, value := range left {
+		counts[value]++
+	}
+	for _, value := range right {
+		counts[value]--
+		if counts[value] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func countString(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
+}
+
+func receiveWithin[T any](t *testing.T, values <-chan T) T {
+	t.Helper()
+	select {
+	case value := <-values:
+		return value
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for concurrent operation")
+		var zero T
+		return zero
+	}
+}
+
 func equalUint64(left, right []uint64) bool {
 	if len(left) != len(right) {
 		return false
 	}
-	for i := range left {
-		if left[i] != right[i] {
+	for index := range left {
+		if left[index] != right[index] {
 			return false
 		}
 	}
 	return true
 }
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
@@ -1710,6 +1259,7 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
 func countDelay(values []time.Duration, want time.Duration) int {
 	count := 0
 	for _, value := range values {

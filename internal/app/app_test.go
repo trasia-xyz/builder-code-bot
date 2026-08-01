@@ -153,7 +153,7 @@ func TestBuildBuilderSignersDoesNotDecryptSettlementKey(t *testing.T) {
 	}
 }
 
-func TestRuntimeRunOnStartUsesCombinedRun(t *testing.T) {
+func TestRuntimeRunOnStartRunsPayoutPhase(t *testing.T) {
 	runner := &recordingRunner{}
 	if err := startRuntime(context.Background(), runner, true); err != nil {
 		t.Fatalf("startRuntime() error = %v", err)

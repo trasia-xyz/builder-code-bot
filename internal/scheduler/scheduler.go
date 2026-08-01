@@ -8,17 +8,17 @@ import (
 )
 
 const (
-	dailySnapshotHourUTC = 0
-	dailyRunHourUTC      = 1
-	NonfatalRetryDelay   = time.Minute
-	MaxNonfatalRetries   = 5
+	dailyConsolidationHourUTC = 0
+	dailyRunHourUTC           = 1
+	NonfatalRetryDelay        = time.Minute
+	MaxNonfatalRetries        = 5
 )
 
 type Task string
 
 const (
-	TaskClaimableSnapshot Task = "claimable_snapshot"
-	TaskFunding           Task = "funding"
+	TaskConsolidation Task = "consolidation"
+	TaskFunding       Task = "funding"
 )
 
 // RetryExhaustedError terminates the service after a scheduled funding task
@@ -57,17 +57,17 @@ func New(onError func(Task, error), onWait func(Task, time.Time)) *Scheduler {
 
 func NextScheduledTaskUTC(now time.Time) (Task, time.Time) {
 	utc := now.UTC()
-	snapshotAt := time.Date(
-		utc.Year(), utc.Month(), utc.Day(), dailySnapshotHourUTC, 0, 0, 0, time.UTC,
+	consolidationAt := time.Date(
+		utc.Year(), utc.Month(), utc.Day(), dailyConsolidationHourUTC, 0, 0, 0, time.UTC,
 	)
-	if !snapshotAt.Before(utc) {
-		return TaskClaimableSnapshot, snapshotAt
+	if !consolidationAt.Before(utc) {
+		return TaskConsolidation, consolidationAt
 	}
 	runAt := time.Date(utc.Year(), utc.Month(), utc.Day(), dailyRunHourUTC, 0, 0, 0, time.UTC)
 	if !runAt.Before(utc) {
 		return TaskFunding, runAt
 	}
-	return TaskClaimableSnapshot, snapshotAt.AddDate(0, 0, 1)
+	return TaskConsolidation, consolidationAt.AddDate(0, 0, 1)
 }
 
 func NextDailyRunUTC(now time.Time) time.Time {
@@ -81,7 +81,7 @@ func NextDailyRunUTC(now time.Time) time.Time {
 
 func (s *Scheduler) Run(
 	ctx context.Context,
-	captureSnapshot func(context.Context) error,
+	consolidate func(context.Context) error,
 	runFunding func(context.Context) error,
 ) error {
 	if ctx == nil {
@@ -90,7 +90,7 @@ func (s *Scheduler) Run(
 	if s == nil || s.now == nil || s.newTimer == nil {
 		return fmt.Errorf("scheduler is not initialized")
 	}
-	if captureSnapshot == nil || runFunding == nil {
+	if consolidate == nil || runFunding == nil {
 		return fmt.Errorf("scheduler callbacks are required")
 	}
 	retries := 0
@@ -122,8 +122,8 @@ func (s *Scheduler) Run(
 		case <-timer.Chan():
 			timer.Stop()
 		}
-		if task == TaskClaimableSnapshot {
-			if err := captureSnapshot(ctx); err != nil {
+		if task == TaskConsolidation {
+			if err := consolidate(ctx); err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return ctxErr
 				}

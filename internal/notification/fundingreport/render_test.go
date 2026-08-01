@@ -23,15 +23,17 @@ func TestRenderBuildsRichSuccessEmailAndEscapesValues(t *testing.T) {
 		},
 		Builders: []funding.BuilderReport{{
 			Name: "<builder-1>", Address: "0x1234567890abcdef1234567890abcdef12345678",
-			SnapshotClaimableUSDC: "1.2", SnapshotObserved: true,
-			ClaimableUSDC: "1.25", ClaimStatus: funding.ReportStepWarning,
+			ClaimableUSDC: "1.2", ClaimableObserved: true, ClaimableQueryAttempts: 1,
+			ClaimAttempts: 3, ClaimStatus: funding.ReportStepWarning,
 			ClaimSummary: "Reward 领取结果不确定",
 			SweepAmount:  "1.5", SweepStatus: funding.ReportStepSuccess,
 			SweepSummary: "资金已归集", RateLimitObserved: true, RateLimitRemaining: 999,
 		}},
-		ClaimableSnapshot: funding.ClaimableSnapshotReport{
-			UTCDate: "2026-07-23", CapturedAt: started.Add(-time.Hour),
-			TotalClaimableUSDC: "1.2", BuilderCount: 1, ObservedBuilders: 1, Observed: true,
+		DailyConsolidation: funding.DailyConsolidationReport{
+			UTCDate: "2026-07-23", Status: funding.DailyConsolidationCompleted,
+			ClaimablesCapturedAt: started.Add(-time.Hour), CompletedAt: started.Add(-30 * time.Minute),
+			TotalClaimableUSDC: "1.2", BuilderCount: 1,
+			RecordedBuilders: 1, ObservedBuilders: 1, Observed: true,
 			BelowPayout: true, ShortfallUSDC: "0.3",
 		},
 		Payout: funding.PayoutReport{
@@ -44,7 +46,7 @@ func TestRenderBuildsRichSuccessEmailAndEscapesValues(t *testing.T) {
 		},
 		Warnings: []string{
 			"builder-1：Reward 领取结果不确定",
-			"UTC 00:00 Claimable 快照：合计 1.2 USDC 低于数据库 Payout 1.5 USDC，短缺 0.3 USDC，请人工核查结算口径",
+			"UTC 00:00 Claimable 合计 1.2 USDC，低于数据库 Payout 1.5 USDC，短缺 0.3 USDC，请人工核查结算口径",
 		},
 	}
 
@@ -59,9 +61,9 @@ func TestRenderBuildsRichSuccessEmailAndEscapesValues(t *testing.T) {
 		"成功但有告警", "Payout 1.5 USDC", "Builder 明细", "Exchange 明确确认",
 		"0x123456…345678", "builder-1：Reward 领取结果不确定",
 		"Settlement 结束余额", "0.15 USDC",
-		"UTC 00:00 Claimable 快照", "Claimable 合计", "1.2 USDC",
-		"执行时 Reward", "可能包含零点后新增奖励", "对账差额", "-0.3 USDC",
-		"完整但低于 Payout", "短缺 0.3 USDC",
+		"UTC 00:00 Claim 与资金归集", "零点 Claimable 合计", "1.2 USDC",
+		"00:00 Reward", "Claimable 作为对账基准", "对账差额", "-0.3 USDC",
+		"查询 1 次", "提交 3 次", "完整但低于 Payout", "短缺 0.3 USDC",
 	} {
 		if !strings.Contains(message.HTMLBody, want) {
 			t.Fatalf("HTML body missing %q", want)
@@ -75,7 +77,7 @@ func TestRenderBuildsRichSuccessEmailAndEscapesValues(t *testing.T) {
 	}
 }
 
-func TestBuildClaimableSnapshotViewShowsCoveredPayoutAsNormal(t *testing.T) {
+func TestBuildDailyConsolidationViewShowsCoveredPayoutAsNormal(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
 		name       string
@@ -88,11 +90,12 @@ func TestBuildClaimableSnapshotViewShowsCoveredPayoutAsNormal(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			view := buildClaimableSnapshotView(funding.RunReport{
+			view := buildDailyConsolidationView(funding.RunReport{
 				PayoutTotal: tt.payout,
-				ClaimableSnapshot: funding.ClaimableSnapshotReport{
-					UTCDate: "2026-07-23", TotalClaimableUSDC: tt.claimable,
-					BuilderCount: 1, ObservedBuilders: 1, Observed: true,
+				DailyConsolidation: funding.DailyConsolidationReport{
+					UTCDate: "2026-07-23", Status: funding.DailyConsolidationCompleted,
+					TotalClaimableUSDC: tt.claimable,
+					BuilderCount:       1, RecordedBuilders: 1, ObservedBuilders: 1, Observed: true,
 					CoversPayout: true,
 				},
 			})
@@ -116,7 +119,7 @@ func TestRenderBuildsCompactRetryEmail(t *testing.T) {
 			Address: "0xsettlement", Total: "1", Hold: "0.25", Available: "0.75", Observed: true,
 		},
 		Builders: []funding.BuilderReport{{Name: "builder-1"}},
-		ClaimableSnapshot: funding.ClaimableSnapshotReport{
+		DailyConsolidation: funding.DailyConsolidationReport{
 			UTCDate: "2026-07-23", Missing: true, BuilderCount: 1,
 		},
 	}
@@ -136,9 +139,9 @@ func TestRenderBuildsCompactRetryEmail(t *testing.T) {
 	if !strings.Contains(message.HTMLBody, "0xsettlement") {
 		t.Fatalf("compact HTML body missing settlement address")
 	}
-	if !strings.Contains(message.HTMLBody, "UTC 00:00 Claimable 快照") ||
-		!strings.Contains(message.HTMLBody, "未捕获") {
-		t.Fatalf("compact HTML body missing claimable snapshot")
+	if !strings.Contains(message.HTMLBody, "UTC 00:00 Claim 与资金归集") ||
+		!strings.Contains(message.HTMLBody, "未记录") {
+		t.Fatalf("compact HTML body missing daily consolidation")
 	}
 	if strings.Contains(message.HTMLBody, "Builder 明细") {
 		t.Fatalf("compact retry unexpectedly contains full builder details")

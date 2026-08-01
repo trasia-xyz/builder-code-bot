@@ -38,12 +38,12 @@ func TestIntegrationFundingFlow(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			env := newIntegrationEnvironment(t, test.ambiguousPayout)
-			if err := env.orchestrator.CaptureClaimableSnapshot(context.Background()); err != nil {
+			if err := env.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			snapshot, err := env.store.LoadClaimableSnapshot(context.Background(), "2026-07-12")
-			if err != nil || snapshot == nil || len(snapshot.Builders) != 2 {
-				t.Fatalf("claimable snapshot = %#v, error = %v", snapshot, err)
+			consolidation, err := env.store.LoadDailyConsolidation(context.Background(), "2026-07-12")
+			if err != nil || consolidation == nil || len(consolidation.Builders) != 2 {
+				t.Fatalf("daily consolidation = %#v, error = %v", consolidation, err)
 			}
 			if err := env.orchestrator.Run(context.Background(), funding.TriggerRunOnStart); err != nil {
 				t.Fatal(err)
@@ -136,7 +136,7 @@ func newIntegrationEnvironment(t *testing.T, ambiguousPayout bool) *integrationE
 	}
 	clock := fixedIntegrationClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	orchestrator, err := funding.NewOrchestrator(funding.OrchestratorConfig{
-		Repository: repository, Store: store, ClaimableSnapshots: store, Chain: chain,
+		Repository: repository, Store: store, DailyConsolidations: store, Chain: chain,
 		Builders:   []string{addresses[0], addresses[1]},
 		Settlement: addresses[2], Recipient: integrationRecipient,
 		Clock: clock, Nonce: signing.NewNonceGenerator(), Sleeper: noWaitSleeper{},

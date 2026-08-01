@@ -76,17 +76,23 @@ func (c *Consolidator) Run(ctx context.Context) error {
 	if c == nil || c.orchestrator == nil {
 		return fmt.Errorf("funding consolidator is not initialized")
 	}
-	return c.orchestrator.runConsolidation(ctx)
+	_, err := c.orchestrator.runConsolidation(ctx, TriggerConsolidateOnly, nil)
+	return err
 }
 
-func (o *Orchestrator) runConsolidation(ctx context.Context) (err error) {
-	state, err := o.newState(TriggerConsolidateOnly)
+func (o *Orchestrator) runConsolidation(
+	ctx context.Context,
+	trigger Trigger,
+	onClaimablesCaptured func(*RunReport) error,
+) (report RunReport, err error) {
+	state, err := o.newState(trigger)
 	if err != nil {
-		return err
+		return report, err
 	}
+	defer o.forgetAlerts(state.RunID)
 	state.Manifest.Settlement = o.settlement
-	report := newRunReport(
-		o.clock.Now(), TriggerConsolidateOnly, ReportExecution{}, o.network,
+	report = newRunReport(
+		o.clock.Now(), trigger, ReportExecution{}, o.network,
 		o.builders, o.builderNames, o.settlement, "",
 	)
 	report.Outcome = "completed"
@@ -112,28 +118,40 @@ func (o *Orchestrator) runConsolidation(ctx context.Context) (err error) {
 		slog.String("run_id", state.RunID),
 		slog.Int("builder_count", len(o.builders)))
 
-	token, err := o.chain.CanonicalUSDC(ctx)
+	token, err := o.queryConsolidationToken(ctx, &state)
 	if err != nil {
 		report.fail("snapshot", "Canonical USDC metadata 查询失败。", "")
-		return err
+		return report, err
 	}
 	state.Manifest.Token = &token
 	report.token = cloneToken(&token)
-	claimBalanceTargets, err := o.claimBuilderRewards(ctx, &state, &report, token)
+	claimables, err := o.captureBuilderClaimables(ctx, &state, &report, token)
 	if err != nil {
-		return err
+		return report, err
+	}
+	report.ClaimablesCapturedAt = o.clock.Now().UTC()
+	if onClaimablesCaptured != nil {
+		if err := onClaimablesCaptured(&report); err != nil {
+			return report, err
+		}
+	}
+	claimBalanceTargets, err := o.claimBuilderRewards(
+		ctx, &state, &report, claimables,
+	)
+	if err != nil {
+		return report, err
 	}
 	initialBalances, unconvergedClaims, err := o.observeClaimBalances(
 		ctx, &state, &report, token, claimBalanceTargets,
 	)
 	if err != nil {
-		return err
+		return report, err
 	}
 	if err := o.sweepBuilderBalances(
 		ctx, &state, &report, token, 1,
 		initialBalances, claimBalanceTargets, unconvergedClaims,
 	); err != nil {
-		return err
+		return report, err
 	}
 	report.setStage("sweep", aggregateBuilderStep(report.Builders, false), builderStepSummary(report.Builders, false))
 	o.info(ctx, "funding consolidation task completed",
@@ -141,5 +159,5 @@ func (o *Orchestrator) runConsolidation(ctx context.Context) (err error) {
 		slog.String("run_id", state.RunID),
 		slog.Int("builder_count", len(o.builders)),
 		slog.Int("warning_count", len(report.Warnings)))
-	return nil
+	return report, nil
 }

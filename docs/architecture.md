@@ -1,223 +1,188 @@
 # 架构说明
 
-本文描述 Hyperliquid Builder Code Bot 的资金流程、恢复模型和安全不变量。部署与处置步骤见
+本文描述 Hyperliquid Builder Code Bot 的资金流程、恢复模型和安全不变量。部署与故障处置见
 [运维指南](operations.md)。
 
-## 1. 系统目标与边界
+## 1. 两阶段日任务
 
-服务每天在 UTC 00:00（北京时间 08:00）只读查询一次所有 builder 的 canonical USDC
-claimable reward，并按 UTC 日期持久化对账快照；UTC 01:00（北京时间 09:00）执行资金任务。
-也可用 `--run-on-start` 在启动时立即执行资金任务。一次资金触发最多处理一个 funding run：
-存在 current 时只恢复该 run，不再连续创建新 run；没有 current 时才读取 pending records
-并创建新 run。
+每天的工作按 UTC 日期拆成两个边界清晰的阶段。
+
+### UTC 00:00：Claim 与资金归集
+
+零点任务不连接 MySQL，也不读取或修改 payout `current` 状态：
+
+1. 查询 canonical USDC；失败时执行有限次短间隔重试。
+2. 同时查询所有 builder 的 canonical-USDC claimable reward。只重试失败的 builder，每个最多
+   查询 5 次，轮次间隔 200 ms。
+3. 把零点 claimable 结果以 `claimables_captured` 状态原子写入当日文件。只有落盘成功才继续。
+4. 对所有符合条件的 builder 并行提交 `claimRewards`。结果不确定时换新 nonce 重试，最多提交
+   3 次，轮次间隔 250 ms；没有更早不确定结果时，明确成功或明确拒绝不重试。
+5. 等待已提交 claim 的 spot 余额可见，然后把每个 builder 最新的正 available 余额全部
+   sweep 到 settlement。
+6. 将 claim/sweep 结果写回当日文件，并把状态更新为 `completed`。
+
+零点 claimable 是与数据库 payout 对账的唯一数值基准；claim 接受状态是独立的执行结果。
+某个 builder 的 `/info` 查询全部失败时，该 builder 标记为零点数据缺失，仍会尝试 claim，
+但当日不能得出完整的数值对账结论。Claim 在有限重试后仍不确定时保留 warning，不会改写已经
+落盘的零点 claimable，也不会阻止其他已成功捕获的数据参与合计。
+
+### UTC 01:00：数据库 Payout
+
+一点任务只处理数据库批次与最终付款：
 
 1. 从 MySQL 冻结全部 `status = 0` records。
-2. 查询所有 builder 的 claimable USDC，仅在超过 1 USDC 时执行 `claimRewards`。
-3. 依据实时 available spot USDC 将 builder 资金归集到 settlement。
-4. settlement 向固定 recipient 发送一笔 payout。
-5. payout 确认后将冻结 records 标记完成。
+2. 计算精确 raw total 和六位向上取整的 payout total。
+3. 查询 settlement available；余额充足时向固定 recipient 发送唯一一笔 payout。
+4. payout 确认后将冻结 records 标记完成。
+5. 读取同一 UTC 日期的零点归集记录，生成最终报告。
 
-00:00 快照与上述状态机隔离：它不读取 funding records，不 claim、不归集、不付款，也不参与
-资金充足性或 payout 判断。01:00 资金任务仍按执行时的实时 claimable 值操作，因此邮件同时
-保留两个口径：零点快照用于和后端零点结算对账，执行时值可能包含 00:00–01:00 新增奖励。
-零点任务对 canonical USDC 元数据和每个 builder 的 claimable 读取分别最多尝试 3 次，失败
-尝试之间等待 2 秒；只重试失败的请求，不重复查询已经成功的 builder。有限重试耗尽后的部分
-或全部失败不会阻止 01:00 主任务，也不消耗主任务的自动重试次数。
-完整零点快照的 Claimable 合计大于或等于数据库 Payout 时，对账正常：报告展示非负差额，
-不增加对账 warning；主任务没有其他异常时保持 success。若 Claimable 低于 Payout，最终
-报告增加对账 warning，展示两者及短缺金额。两种比较结果都只用于报告，不参与 Settlement
-充足性判断；尤其不得因 Claimable 不足而阻断已有充足 Settlement 余额支持的 payout。
+一点任务不会查询 builder claimable、不会 claim，也不会 sweep。Settlement 不足属于普通错误；
+调度器一分钟后重新检查 settlement，最多自动重试五次，但重试仍然只执行 payout 阶段。
 
-Builder 和 settlement 都归属发送方账户，内部 claim/sweep 可以安全重复，不需要 journal。
-settlement -> recipient 是唯一对外资金边界，也是唯一需要 exactly-once 防护的动作。
-服务是单实例串行流程，`data/LOCK` 防止同一工作目录误双开。
+这两个阶段修复了旧实现的核心口径错误：旧实现零点记录 claimable，却在一点才真正 claim，
+导致数据边界和资金动作相隔一小时。现在零点先并行冻结对账量并可靠落盘，紧接着在同一任务
+执行 claim 与归集；一点只消费零点记录并付款。
 
-`--consolidate-only` 是独立的一次性内部归集入口：复用第 2、3 步的 claim 与 sweep 规则后退出，
-不连接 MySQL，不读取或修改 funding records、current、backup 或 history，不构造或发送
-recipient payout，也不启动 scheduler。该入口只解密 builder 私钥，但仍获取相同的
-`data/LOCK`，因此不能与常驻服务并行操作同一批账户。
+## 2. 内部归集规则
 
-## 2. 余额语义
+Claimable 查询只使用 referral info 的 `tokenToState` 中 canonical USDC 对应项的
+`unclaimedRewards`。最外层多币种折算汇总不参与判断。成功读取且金额严格超过 1 USDC 才
+正常 claim；等于或低于阈值时跳过。若零点查询在 5 次后仍失败，因为无法判断阈值，为避免
+漏领会执行一次受相同重试上限保护的 claim，同时将对账数据标记为不完整。`/info` 查询不消耗
+账户的 exchange 请求额度；`/exchange` claim 会消耗额度，因此只有不确定提交才重复发送。
 
-一次 spot 查询返回两个明确数值：
+同一轮的 builder claim 并行提交，但每个 builder 的重试状态相互独立。一次不确定提交之后，
+后续明确拒绝仍不能证明第一次没有执行，因此整体保持不确定；后续任一次明确接受则确认该
+builder 的 claim 已完成。如果至少一个 claim 被接受或仍不确定，统一等待约 1 秒，然后开始
+余额可见性查询。每个相关 builder 最多查询 10 次 spot balance；
+`Available >= claimable` 时认为本次 reward 已可见。查询耗尽后产生 warning，并按最后一次
+成功读取的 available 尽力归集；一次余额都未读取成功则跳过该 builder。零点 claimable 缺失
+时使用 1 USDC 阈值作为可见性目标，仍不会把该值写入或冒充零点对账数据。
+
+随后每个 builder 只执行一次 sweep 尝试。零点任务和 `--consolidate-only` 复用完全相同的
+claim、可见性等待和单轮 sweep 实现。Claim 或 sweep 的单账户失败会告警，但不阻止其他
+builder；这些内部动作只在运营方控制的账户间移动资金，因此不使用 payout journal。
+
+## 3. `--consolidate-only` 隔离
+
+`--consolidate-only` 只执行一次上述内部归集并退出。它：
+
+- 不连接 MySQL；
+- 不读取或修改 funding records、`current`、backup 或 history；
+- 不读取、创建或覆盖 `daily-consolidations/YYYY-MM-DD.json`；
+- 不构造 recipient payout，也不发送最终 funding report；
+- 只解密 builder 私钥。
+
+它仍获取与常驻服务相同的 `data/LOCK`，因此同一工作目录内不能和服务并行运行。即使手工执行
+时间接近 UTC 00:00，也不会直接污染一点报告所使用的零点记录。
+
+## 4. 余额语义
+
+Spot 查询返回两个金额：
 
 - `Total`：链上 spot 总余额；
 - `Available = Total - Hold`：当前可发送余额。
 
-负 available 或无法解析的 decimal 是查询错误。Builder sweep 数额和 settlement 资金充足性
-只使用 `Available`。Payout journal 保存提交前 `Total`；提交结果不确定时只比较
-`TotalAfter < TotalBefore`。Hold 增减不会被误认为 payout，也不会掩盖 total 的真实下降。
+Builder sweep 金额和 payout 资金充足性只使用 `Available`。Payout journal 保存提交前
+settlement `Total`；提交结果不确定时只比较 `TotalAfter < TotalBefore`。Hold 变化不会被误判
+为付款成功。
 
-“total 下降即成功”依赖 settlement 为本服务专用出账账户。不得由人工或其他程序从该
-账户转出 spot USDC。
+“total 下降即成功”要求 settlement 是本服务专用出账账户。人工或其他程序不得从该账户发送
+spot USDC。
 
-## 3. 内部归集的有限收敛
+## 5. Records 与金额
 
-每轮先通过 referral info 查询所有 builder，并从 `tokenToState` 中定位 canonical USDC 的
-token index（当前为 `0`），读取该 token state 的 `unclaimedRewards`。最外层同名字段是所有
-reward 币种折算后的汇总值，不用于判断。USDC reward 严格超过 1 时才提交 claim，等于或低于
-1 时只记录 INFO 并跳过，不发送告警；`tokenToState` 为空或没有 USDC 条目同样视为 0。
-字段缺失、结构或金额非法、查询失败以及实际 claim 失败仍记录并告警。Builder 按配置顺序
-串行查询和提交 claim；全部 claim 提交完成后，如果至少存在一个已接受或结果不确定的 claim，
-统一等待约 1 秒，再开始余额可见性查询，不为每个 builder 分别等待。
+Pending records 按 `period_start_at, id` 排序。Manifest 冻结 records、精确 raw total、六位
+向上取整后的 payout total、canonical token、settlement 和 recipient。Builder 列表属于当前
+配置，不属于 payout 恢复数据。
 
-对每个需要确认的 builder，最多查询 10 次 spot balance。`Available >= claimable` 时认为本次
-claim 余额已经可见，该 builder 不再继续查询；尚未满足且仍有下一次机会时等待约 1 秒。首次
-查询前的等待加上 9 次轮次间等待，使余额刷新等待最多约 10 秒（不含 HTTP 耗时）。这里不在
-claim 前额外查询余额，也不把该条件当作 payout 的安全证明；它只是内部归集的实用可见性判断。
-查询成功的最新余额会直接复用于 sweep，避免再次调用 info 接口。
+金额先按 decimal 文本精确汇总，再执行一次
+`ceil(raw_total × 10^6) / 10^6`。负金额归档为 `failed_validation` 并 fatal 退出；零总额不执行
+链上付款，直接完成冻结 records；没有 pending records 时不创建 current 或 history。
 
-10 次耗尽后记录 warning，并按照最后一次成功读取的 `Available` 尽力 sweep；如果一次余额都
-没有读取成功，则在首次归集时跳过该 builder。若 settlement 仍不足，后续内部收敛轮次仍会
-重新查询实时余额。余额未确认刷新、查询失败或内部 sweep 失败都不阻塞由已有 settlement
-资金支持的 payout。
+## 6. Payout 持久化边界
 
-完成上述可见性查询后，内部资金仍按最多 5 轮无持久化方式收敛：
+Settlement 到 recipient 是唯一对外资金边界，也是唯一需要 exactly-once 防护的动作。
 
-1. 将每个 builder 最新的正 `Available` 全部 sweep 到 settlement。
-2. 查询 settlement available；达到 `payout_total` 时立即停止收敛并执行 payout，即使某个
-   builder 存在余额可见性或归集 warning。
-3. settlement 尚不足时等待约 1 秒，再查询实时 builder 余额并进入下一轮。
+发送前先验证完整可重放请求与 manifest 一致，然后依次：
 
-单个 builder 的 prepare、submit 或查询失败会记录和告警，但其他 builder 继续。5 轮后
-settlement 仍不足时返回普通错误，current 保持 `prepared`，调度器约 1 分钟后通过同一恢复
-路径再试，最多自动重试 5 次。内部 submit 结果不确定不建立持久化协议；下一轮继续依据实时
-余额收敛。
-
-`--consolidate-only` 复用相同的串行 claim、统一等待和最多 10 次余额可见性查询，但只执行一次
-builder sweep。它没有 payout 金额，也不以 settlement 余额是否足够作为继续或成功的条件；
-余额可见性次数耗尽时仍按最后一次成功读取的 available 尽力归集。
-
-## 4. 数据快照与金额
-
-查询按 `period_start_at, id` 排序读取 pending records。Manifest 持久化冻结的 records、
-精确 raw total、六位向上取整后的 payout total、canonical token、settlement 和 recipient。
-Builder 列表来自当前配置，不属于 payout 恢复数据。
-
-金额按 decimal 文本精确汇总，再执行一次 `ceil(raw_total × 10^6) / 10^6`。负金额使本轮
-归档一次 `failed_validation` 并 fatal 退出，不进入自动重试；零总额不执行链上动作，直接
-完成冻结 records。无待处理 records 时只记录并报告，不创建 current 或 `no_data` history。
-
-## 5. Payout 的两道持久化边界
-
-发送前先构造完整可重放请求，并校验 signer、recipient、token、amount、nonce、请求 body
-和 request hash 与 manifest 一致：
-
-1. 保存 `payout_prepared`，其中包含完整 request 和 payout 前 settlement `Total`。
-2. 请求可能离开进程前，再保存 `payout_submitting`。
+1. 保存 `payout_prepared`，包含完整请求和付款前 settlement total。
+2. 保存 `payout_submitting`。
 3. 只有第二次保存成功后才调用 submit。
 
-这保证 primary 与 backup 至少各持有一份完整付款意图。Submit response body 会完整写入
-结构化日志，但不写入 durable state；完整签名请求始终不写日志。
-
-只有成功 HTTP transport 返回的 `status = ok/err` 才属于明确结果。非 2xx、网络错误或无法解析的
-响应即使携带类似 JSON body，也一律视为不确定。提交结果分三类：
+提交结果分三类：
 
 | 结果 | 行为 |
 | --- | --- |
-| 明确成功 | 保存 `payout_confirmed`，然后无限重试 MySQL Complete |
-| 明确拒绝 | 记录错误并告警，归档 `rejected`，清理 current，fatal 退出；不自动重发 |
-| 不确定 | 最多读取 settlement 5 次；任一次 `TotalAfter < TotalBefore` 即确认成功 |
+| 明确成功 | 保存 `payout_confirmed`，随后无限重试 MySQL Complete |
+| 明确拒绝 | 归档 `rejected`、清理 current、fatal 退出，不自动重发 |
+| 不确定 | 最多观察 settlement total 5 次；任何下降都确认成功 |
 
-有限观察后仍无法判断时保存 `blocked`、归档现场、保留 current、告警并 fatal 退出。系统
-绝不自动重发可能已发送的 payout；total 只需变少，不要求精确减少 payout 数额。
+有限观察后仍无法判断时保存 `blocked`、归档现场、保留 current 并 fatal 退出。系统绝不自动
+重发一个可能已经发送的 payout。
 
-## 6. Phase 与恢复
-
-Durable phase 只有：
+## 7. Phase 与恢复
 
 | Phase | 恢复行为 |
 | --- | --- |
-| `prepared` | 重做内部 claim/sweep；达到资金要求后准备 payout |
-| primary `payout_prepared` | 确定提交尚未开始，发送持久化原请求 |
-| backup `payout_prepared` | 更新的 primary 可能已提交，只观察 total，绝不发送 |
-| `payout_submitting` | 请求可能已发，只观察 total |
-| `payout_confirmed` | 只重试数据库 Complete，不再执行链上动作 |
-| `blocked` | 立即 fatal，等待人工判断，不重发 |
+| `prepared` | 只重新检查 settlement 并继续 payout，不执行 builder 动作 |
+| primary `payout_prepared` | 证明提交尚未开始，发送持久化请求 |
+| backup `payout_prepared` | 可能落后于已提交的 primary，只观察 total |
+| `payout_submitting` | 只观察 total |
+| `payout_confirmed` | 只重试数据库 Complete |
+| `blocked` | 立即 fatal，等待人工判断 |
 
-MySQL Complete 成功后直接归档 `completed` 并清理 current，不保存 `completed` phase。如果
-Complete 与归档之间崩溃，恢复 `payout_confirmed` 后幂等地再次 Complete。
+MySQL Complete 成功后归档 `completed` 并清理 current。Complete 与归档之间崩溃时，恢复
+`payout_confirmed` 后会幂等地再次 Complete。
 
-## 7. 本地持久化
+## 8. 本地状态
 
 ```text
 data/
 ├── LOCK
-├── claimable-snapshots/
+├── daily-consolidations/
 │   └── YYYY-MM-DD.json
 ├── current.json
 ├── current.json.bak
 └── history/
 ```
 
-目录权限为 `0700`，文件为 `0600`。Envelope schema version 固定为 `1`，checksum 覆盖完整
-RunState。保存通过同目录临时文件、`fsync`、primary -> backup rename、新 primary 安装及目录
-`fsync` 完成。Primary 无效时自动尝试 backup；两份均无效则停止。
+目录权限为 `0700`，文件为 `0600`。`current` 与 backup 使用 checksummed envelope、原子替换、
+`fsync` 和 backup 恢复协议。
 
-`claimable-snapshots/YYYY-MM-DD.json` 也使用 version `1` 的 checksum envelope、同目录临时
-文件、`fsync` 和原子安装，但与 `current`/backup 的 payout 恢复协议完全独立。每个 UTC 日期
-只保留首次成功写入的观察文件，进程在查询前若发现当日文件已存在会直接跳过，避免用稍后的
-claimable 值覆盖零点口径。快照文件损坏、缺失或查询不完整只影响报告完整性。
+每日归集记录使用便于人工检阅的格式化 JSON，并保留 version 1 checksum envelope、同目录临时
+文件、原子替换和 `fsync`。
+同一零点任务先写 `claimables_captured`，完成后更新为 `completed`。进程若在两次写入之间中断，
+一点报告仍可读取已冻结的 claimable，同时明确标记 claim/sweep 未完成。已经存在任一状态的
+当日文件时，Scheduler 不会自动重跑零点动作；这避免在崩溃边界重复提交不确定的 claim。
+该文件只供报告和人工检阅，不属于 payout 恢复协议，也没有旧格式迁移或兼容分支。
 
-有效 history 类别为 `completed`、`rejected`、`blocked` 和 `failed_validation`。Blocked 保留
-current；其他终态在相应安全条件满足后不阻止新运行。项目没有旧 schema 或 migration 分支。
+## 9. 调度、报告与失败
 
-## 8. MySQL、通知与调度
+Scheduler 串行安排 UTC 00:00 consolidation 和 UTC 01:00 funding。零点顶层失败只记录错误，
+继续等待一点；一点普通失败一分钟后重试，最多五次。Fatal payout 或 records 校验错误立即
+退出。所有 context 取消都会立即停止。
 
-ListPending 和 Complete 对瞬时 MySQL 错误无限重试，退避响应 context cancel。达到持续不可用
-阈值后只发送一次 outage email，期间按间隔记录 progress；恢复后发送一次 recovery email 并
-重置状态，未来 outage 可重新告警。通知投递失败只记录，不中断资金流程。
+最终 funding report 仍只在 UTC 01:00 funding 结束时发送。报告展示：
 
-结构化日志使用 16 位十六进制 run ID，并记录 record/builder 数量、raw/payout total、每个
-builder 的 claimable USDC 与 claim eligibility、builder 与 settlement 的 total/hold/available、
-实际 sweep 数量、payout 前余额和 submit response。每次 funding task 执行结束后，无论成功
-还是失败，都会通过 `userRateLimit` 查询所有
-builder 和 settlement，只记录 requests remaining；remaining 严格小于 200 时按账户告警。
-查询失败只记录警告，不会覆盖原任务结果或改变资金状态机；同一账户持续处于低额度
-时只告警一次，恢复到阈值后再次跌破才重新告警。固定的 service component 不重复写入每条日志。
+- 每个 builder 的零点 claimable、查询次数以及后续 claim/sweep 结果；
+- 完整零点 claimable 合计与数据库 payout 的差额；
+- payout journal 与确认依据；
+- settlement 结束余额、rate limit、告警和处置建议。
 
-SES 通知只发送 UTF-8 HTML。Funding report 使用结构化的运行期数据生成移动端仪表盘，包含
-阶段状态、records/金额、builder claim 与 sweep、payout 证据、rate limit、告警和处置建议。
-报告有独立的“UTC 00:00 Claimable 快照”区块，展示捕获时间、成功覆盖数、各 builder
-claimable 合计、本轮数据库 payout 及两者差额；Builder 明细中的 Reward 明确标为执行时实时值。
-定时任务缺少、无法读取或未完整查询零点快照时，报告标记 warning，但资金结果不被覆盖。
-完整快照低于 payout 时同样升级为 warning，并将快照区块标记为“完整但低于 Payout”；资金
-状态机和 payout 结果保持原样。
-报告数据不写入 durable `RunState`，因此不会改变 payout 恢复协议或 schema。邮件标题将状态
-指示器置于配置前缀之前：🟢 成功、🟡 成功但有告警、🔵 无数据、🟠 等待自动重试、🔴 需要人工
-处理。HTML preheader 提供金额、记录数或失败摘要，便于移动端邮件列表快速判断状态。
-报告发送前还会独立查询一次 settlement canonical USDC spot balance，并展示任务结束时的
-`Total`、`Hold` 和 `Available`。该查询只影响报告完整性；失败会产生 warning，但不会覆盖
-资金任务原本的结果。随后查询 address-based rate limit，以反映本轮所有 chain action
-完成后的剩余额度；spot balance 和其他 info 请求本身不计入该地址额度。
+全部 builder 的零点 claimable 都成功捕获时才进行数值对账；合计低于 payout 时报告升级为
+warning，但 settlement 余额充足时仍正常付款。Claim 结果不确定会单独告警，不会改变已经冻结
+的 claimable 对账口径。`--run-on-start` 立即执行一点侧的数据库 payout 流程；它不会代替已
+错过的零点归集。
 
-除独立的零点 claimable 对账快照外，资金任务的运行期报告数据不持久化。恢复
-`payout_prepared`、`payout_submitting` 或 `payout_confirmed` 时，执行期 Reward 和 Sweep
-会标记为“历史明细未持久化，本次恢复未重复执行”，不会凭持久化 phase 推断此前每个
-Builder action 的成功状态；同一 UTC 日期的零点快照仍可从独立文件恢复展示。
-
-Scheduler 的普通失败在尚有剩余次数时发送精简的橙色重试通知；成功、无数据、fatal 结果以及
-最后一次普通失败发送完整报告。启动恢复实际处理了 current 时也发送完整报告；没有 current
-的启动检查不发送邮件。
-
-Scheduler 串行安排 UTC 00:00 快照和 UTC 01:00 funding run。快照内部的有限读取重试耗尽后
-只记录错误并继续等待 01:00，不自动退出；funding 普通失败才会约 1 分钟后重试，最多重试
-5 次。成功 funding run 等待下一 UTC 00:00 快照。单个 builder 的 reward 未在 10 次查询内
-可见只产生 warning；全部 funding 重试失败则返回 retry-exhausted 错误并退出。Fatal payout
-错误和确定性的 record 校验错误立即退出；context 取消立即退出且不会忙循环。MySQL 自身的
-维护恢复仍无限重试。
-
-## 9. 安全与测试不变量
+## 10. 安全不变量
 
 1. 一个冻结批次的 recipient payout 最多发送一次。
-2. 完整请求和“可能已发送”边界都在发送前持久化。
-3. 只有 primary `payout_prepared` 可以首次发送。
-4. 可能已发送或 blocked 的 payout 只观察/停止，不自动重发。
-5. Payout 确认后只允许数据库完成和归档。
-6. Builder 内部归集可重复并按实时 available 自动收敛，但不是已有 settlement 资金执行
-   payout 的硬前提。
-7. Envelope schema version 保持 `1`，没有兼容旧 schema 的分支。
-8. 零点 claimable 快照只读、按日期隔离，失败或缺失不得改变资金状态机和 payout 行为。
-
-测试保留真实 HTTP mock、签名已知向量、claimRewards/spotSend、primary/backup 恢复、状态原子
-写入、MySQL 无限重试、TTY/私钥/地址校验、SES 与敏感信息过滤。
+2. 完整 payout 请求和“可能已发送”边界都在发送前持久化。
+3. 可能已发送或 blocked 的 payout 只观察或停止，绝不自动重发。
+4. UTC 01:00 及其重试、恢复路径都不得执行 builder claim 或 sweep。
+5. UTC 00:00 与 `--consolidate-only` 使用同一内部归集实现。
+6. `--consolidate-only` 不得读写零点每日归集记录。
+7. 每日归集记录只用于报告，不参与 payout exactly-once 协议。
+8. 零点 claimable 必须在任何 claim 提交前落盘；后续动作不得修改其数值。
+9. Payout 确认后只允许数据库完成和归档。

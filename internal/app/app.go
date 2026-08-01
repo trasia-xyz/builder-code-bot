@@ -134,11 +134,11 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 
 	utcScheduler := scheduler.New(
 		func(task scheduler.Task, runErr error) {
-			if task == scheduler.TaskClaimableSnapshot {
-				logger.Warn(context.Background(), "scheduled claimable snapshot was incomplete",
-					slog.String("event", "scheduled_claimable_snapshot_failed"),
+			if task == scheduler.TaskConsolidation {
+				logger.Warn(context.Background(), "scheduled daily consolidation failed",
+					slog.String("event", "scheduled_daily_consolidation_failed"),
 					slog.String("scheduled_task", string(task)),
-					slog.String("error", "claimable snapshot was incomplete"),
+					slog.String("error", sanitizeRuntimeError(runErr)),
 				)
 				return
 			}
@@ -148,8 +148,8 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 				slog.String("error", sanitizeRuntimeError(runErr)))
 		},
 		func(task scheduler.Task, nextRunAt time.Time) {
-			logger.Info(context.Background(), "next funding task scheduled",
-				slog.String("event", "funding_next_run_scheduled"),
+			logger.Info(context.Background(), "next scheduled task planned",
+				slog.String("event", "scheduled_task_planned"),
 				slog.String("scheduled_task", string(task)),
 				slog.Time("next_run_at", nextRunAt))
 		},
@@ -185,7 +185,7 @@ func (a *App) Run(ctx context.Context) error {
 	maxAttempts := scheduler.MaxNonfatalRetries + 1
 	return a.scheduler.Run(
 		ctx,
-		a.orchestrator.CaptureClaimableSnapshot,
+		a.orchestrator.RunDailyConsolidation,
 		func(runCtx context.Context) error {
 			runErr := a.orchestrator.RunScheduled(runCtx, funding.TriggerUTC, attempt, maxAttempts)
 			switch {
@@ -252,19 +252,19 @@ func assembleOrchestrator(
 	}
 	stateStore := state.NewStore(state.DataDir)
 	return funding.NewOrchestrator(funding.OrchestratorConfig{
-		Repository:         repository,
-		Store:              stateStore,
-		ClaimableSnapshots: stateStore,
-		Chain:              hyperliquidChain{info: infoClient, exchange: exchangeClient},
-		Notifier:           notifier,
-		Logger:             logger,
-		Builders:           builders,
-		BuilderNames:       builderNames,
-		Settlement:         cfg.Settlement.Address,
-		Recipient:          cfg.Payout.RecipientAddress,
-		Network:            cfg.Hyperliquid.Network,
-		Clock:              systemClock{},
-		Nonce:              signing.NewNonceGenerator(),
+		Repository:          repository,
+		Store:               stateStore,
+		DailyConsolidations: stateStore,
+		Chain:               hyperliquidChain{info: infoClient, exchange: exchangeClient},
+		Notifier:            notifier,
+		Logger:              logger,
+		Builders:            builders,
+		BuilderNames:        builderNames,
+		Settlement:          cfg.Settlement.Address,
+		Recipient:           cfg.Payout.RecipientAddress,
+		Network:             cfg.Hyperliquid.Network,
+		Clock:               systemClock{},
+		Nonce:               signing.NewNonceGenerator(),
 	})
 }
 

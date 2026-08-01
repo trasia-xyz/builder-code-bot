@@ -86,7 +86,7 @@ func newOptionFlagSet(opts *app.Options, output io.Writer) *flag.FlagSet {
 		fs.PrintDefaults()
 	}
 	fs.StringVar(&opts.ConfigPath, "config", opts.ConfigPath, "configuration file path")
-	fs.BoolVar(&opts.RunOnStart, "run-on-start", false, "run one funding cycle during startup")
+	fs.BoolVar(&opts.RunOnStart, "run-on-start", false, "run the database payout phase during startup")
 	fs.BoolVar(&opts.TestSES, "test-ses", false, "send one SES test email and exit")
 	fs.BoolVar(&opts.ConsolidateOnly, "consolidate-only", false, "claim and sweep builder funds, then exit")
 	return fs

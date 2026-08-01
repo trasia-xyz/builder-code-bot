@@ -46,37 +46,41 @@ type ReportStage struct {
 }
 
 type BuilderReport struct {
-	Name                  string
-	Address               string
-	SnapshotClaimableUSDC string
-	SnapshotObserved      bool
-	SnapshotQueryFailed   bool
-	ClaimableUSDC         string
-	ClaimStatus           ReportStepStatus
-	ClaimSummary          string
-	SweepAmount           string
-	SweepStatus           ReportStepStatus
-	SweepSummary          string
-	FinalTotal            string
-	FinalAvailable        string
-	RateLimitRemaining    uint64
-	RateLimitObserved     bool
-	RateLimitQueryFailed  bool
+	Name                   string
+	Address                string
+	ClaimableUSDC          string
+	ClaimableObserved      bool
+	ClaimableQueryAttempts int
+	ClaimAttempts          int
+	ClaimUncertain         bool
+	ClaimStatus            ReportStepStatus
+	ClaimSummary           string
+	SweepAmount            string
+	SweepStatus            ReportStepStatus
+	SweepSummary           string
+	FinalTotal             string
+	FinalAvailable         string
+	RateLimitRemaining     uint64
+	RateLimitObserved      bool
+	RateLimitQueryFailed   bool
 }
 
-type ClaimableSnapshotReport struct {
-	UTCDate            string
-	CapturedAt         time.Time
-	TotalClaimableUSDC string
-	BuilderCount       int
-	ObservedBuilders   int
-	Observed           bool
-	Missing            bool
-	LoadFailed         bool
-	TokenQueryFailed   bool
-	CoversPayout       bool
-	BelowPayout        bool
-	ShortfallUSDC      string
+type DailyConsolidationReport struct {
+	UTCDate              string
+	Status               DailyConsolidationStatus
+	ClaimablesCapturedAt time.Time
+	CompletedAt          time.Time
+	TotalClaimableUSDC   string
+	BuilderCount         int
+	RecordedBuilders     int
+	ObservedBuilders     int
+	UncertainClaims      int
+	Observed             bool
+	Missing              bool
+	LoadFailed           bool
+	CoversPayout         bool
+	BelowPayout          bool
+	ShortfallUSDC        string
 }
 
 type PayoutReport struct {
@@ -112,6 +116,7 @@ type RunReport struct {
 	UTCDate                        string
 	Phase                          Phase
 	StartedAt                      time.Time
+	ClaimablesCapturedAt           time.Time
 	FinishedAt                     time.Time
 	RecordCount                    int
 	RecordsRead                    bool
@@ -119,7 +124,7 @@ type RunReport struct {
 	PayoutTotal                    string
 	Stages                         []ReportStage
 	Builders                       []BuilderReport
-	ClaimableSnapshot              ClaimableSnapshotReport
+	DailyConsolidation             DailyConsolidationReport
 	Payout                         PayoutReport
 	SettlementBalance              SettlementBalanceReport
 	SettlementRateLimitRemaining   uint64
@@ -284,7 +289,7 @@ func (r *RunReport) finalize(now time.Time, runErr error) bool {
 	if errors.Is(runErr, context.Canceled) {
 		return false
 	}
-	r.reconcileClaimableSnapshot()
+	r.reconcileDailyConsolidation()
 	if runErr == nil {
 		switch r.Outcome {
 		case "no_data":
@@ -333,32 +338,33 @@ func (r *RunReport) finalize(now time.Time, runErr error) bool {
 	return true
 }
 
-func (r *RunReport) reconcileClaimableSnapshot() {
+func (r *RunReport) reconcileDailyConsolidation() {
 	if r == nil {
 		return
 	}
-	snapshot := &r.ClaimableSnapshot
-	snapshot.CoversPayout = false
-	snapshot.BelowPayout = false
-	snapshot.ShortfallUSDC = ""
-	if !snapshot.Observed || snapshot.TokenQueryFailed || snapshot.BuilderCount <= 0 ||
-		snapshot.ObservedBuilders != snapshot.BuilderCount {
+	consolidation := &r.DailyConsolidation
+	consolidation.CoversPayout = false
+	consolidation.BelowPayout = false
+	consolidation.ShortfallUSDC = ""
+	if !consolidation.Observed || consolidation.BuilderCount <= 0 ||
+		consolidation.RecordedBuilders != consolidation.BuilderCount ||
+		consolidation.ObservedBuilders != consolidation.BuilderCount {
 		return
 	}
-	claimable, claimableErr := decimal.NewFromString(snapshot.TotalClaimableUSDC)
+	claimable, claimableErr := decimal.NewFromString(consolidation.TotalClaimableUSDC)
 	payout, payoutErr := decimal.NewFromString(r.PayoutTotal)
 	if claimableErr != nil || payoutErr != nil {
 		return
 	}
 	if !claimable.LessThan(payout) {
-		snapshot.CoversPayout = true
+		consolidation.CoversPayout = true
 		return
 	}
 	shortfall := payout.Sub(claimable)
-	snapshot.BelowPayout = true
-	snapshot.ShortfallUSDC = shortfall.String()
+	consolidation.BelowPayout = true
+	consolidation.ShortfallUSDC = shortfall.String()
 	r.addWarning(fmt.Sprintf(
-		"UTC 00:00 Claimable 快照：合计 %s USDC 低于数据库 Payout %s USDC，短缺 %s USDC，请人工核查结算口径",
+		"UTC 00:00 Claimable 合计 %s USDC，低于数据库 Payout %s USDC，短缺 %s USDC，请人工核查结算口径",
 		claimable.String(), payout.String(), shortfall.String(),
 	))
 }
@@ -412,6 +418,7 @@ func builderStepSummary(builders []BuilderReport, claim bool) string {
 
 func builderActionSummary(action, outcome string) string {
 	actionName := map[string]string{
+		"claimable":    "零点 Claimable",
 		"claimRewards": "Reward 领取",
 		"spotBalance":  "余额查询",
 		"spotSend":     "资金归集",

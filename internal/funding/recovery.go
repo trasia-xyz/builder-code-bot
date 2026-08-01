@@ -48,11 +48,11 @@ func (o *Orchestrator) run(ctx context.Context, trigger Trigger, execution Repor
 		slog.String("event", "funding_task_started"),
 		slog.String("trigger", string(trigger)))
 	current, metadata, err := o.loadCurrent(ctx)
-	snapshotDate := report.StartedAt.Format(time.DateOnly)
+	consolidationDate := report.StartedAt.Format(time.DateOnly)
 	if current != nil && current.UTCDate != "" {
-		snapshotDate = current.UTCDate
+		consolidationDate = current.UTCDate
 	}
-	o.attachClaimableSnapshot(ctx, &report, snapshotDate)
+	o.attachDailyConsolidation(ctx, &report, consolidationDate)
 	if err != nil {
 		return err
 	}
@@ -82,7 +82,7 @@ func (o *Orchestrator) Recover(ctx context.Context) (err error) {
 	report.Outcome = "completed"
 	report.syncState(current)
 	report.setStage("snapshot", ReportStepSuccess, "从持久化状态恢复")
-	o.attachClaimableSnapshot(ctx, &report, current.UTCDate)
+	o.attachDailyConsolidation(ctx, &report, current.UTCDate)
 	defer func() { o.deliverRunReport(ctx, &report, err) }()
 	defer func() {
 		if !errors.Is(err, context.Canceled) {
@@ -118,15 +118,12 @@ func (o *Orchestrator) recoverState(
 	switch state.Phase {
 	case PhasePrepared:
 		if state.Manifest.PayoutTotal == "0" {
-			report.setStage("rewards", ReportStepSkipped, "Payout 为 0")
-			report.setStage("sweep", ReportStepSkipped, "Payout 为 0")
 			report.setStage("payout", ReportStepSkipped, "无需付款")
 			report.Payout.Status = ReportStepSkipped
 			return o.completeDatabase(ctx, state, report)
 		}
 		return o.runPositive(ctx, state, report)
 	case PhasePayoutPrepared:
-		markRecoveredBuilderSteps(report)
 		// A primary payout_prepared state proves that submission never started.
 		// A backup at the same phase may be one boundary behind a submitted
 		// primary, so it must use balance observation instead of resubmission.
@@ -135,10 +132,8 @@ func (o *Orchestrator) recoverState(
 		}
 		return o.submitPreparedPayout(ctx, state, report)
 	case PhasePayoutSubmitting:
-		markRecoveredBuilderSteps(report)
 		return o.observeUncertainPayout(ctx, state, report)
 	case PhasePayoutConfirmed:
-		markRecoveredBuilderSteps(report)
 		report.Payout.Status = ReportStepSuccess
 		report.setStage("payout", ReportStepSuccess, "已在此前执行中确认")
 		return o.completeDatabase(ctx, state, report)
@@ -157,13 +152,6 @@ func (o *Orchestrator) recoverState(
 	default:
 		return fmt.Errorf("unsupported persisted funding phase %q", state.Phase)
 	}
-}
-
-func markRecoveredBuilderSteps(report *RunReport) {
-	const summary = "历史明细未持久化，本次恢复未重复执行"
-	report.setStage("rewards", ReportStepSkipped, summary)
-	report.setStage("sweep", ReportStepSkipped, summary)
-	markBuilderStepsSkipped(report, summary)
 }
 
 func (o *Orchestrator) deliverRunReport(ctx context.Context, report *RunReport, runErr error) {

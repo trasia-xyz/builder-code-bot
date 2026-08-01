@@ -18,9 +18,9 @@ type StateStore interface {
 	Clear(context.Context) error
 }
 
-type ClaimableSnapshotStore interface {
-	LoadClaimableSnapshot(context.Context, string) (*ClaimableSnapshot, error)
-	SaveClaimableSnapshot(context.Context, ClaimableSnapshot) error
+type DailyConsolidationStore interface {
+	LoadDailyConsolidation(context.Context, string) (*DailyConsolidation, error)
+	SaveDailyConsolidation(context.Context, DailyConsolidation) error
 }
 
 type StateLoadMetadata struct {

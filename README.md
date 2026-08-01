@@ -1,9 +1,11 @@
 # Hyperliquid Builder Code Bot
 
-This service claims canonical USDC rewards exceeding 1 USDC for configured
-builder accounts, sweeps each builder's full available spot USDC balance into
-an operator-controlled settlement account, sends one payout to a fixed
-recipient, and marks the corresponding MySQL records complete.
+At UTC 00:00 this service concurrently captures canonical-USDC claimable
+rewards for all configured builders and persists that reconciliation boundary
+before any claim is submitted. It then claims in parallel, sweeps each
+builder's available spot USDC into an operator-controlled settlement account,
+and records the execution result. At UTC 01:00 it sends one payout for the
+pending MySQL records to a fixed recipient and marks those records complete.
 
 The design treats builder-to-settlement transfers as repeatable internal fund
 movement. Only the final settlement-to-recipient payout has a durable recovery
@@ -73,12 +75,15 @@ Always use the same working directory because state is stored in `./data`.
 `--help` prints all available flags and exits successfully without loading the
 configuration or starting any runtime component.
 
-`--consolidate-only` runs one builder-fund consolidation and exits. It queries
-and claims eligible canonical-USDC rewards, waits for claimed balances to become
-visible, and sends each builder's latest positive available spot balance to the
-settlement account. It does not connect to MySQL, read or update funding records
-or durable `current` state, send a recipient payout, or start the scheduler. It
-decrypts only builder keys, but still acquires `data/LOCK`, so it cannot run
+`--run-on-start` immediately runs the database/payout phase. It does not claim
+or sweep builders and does not backfill a missed UTC 00:00 consolidation.
+
+`--consolidate-only` runs one builder-fund consolidation and exits. It uses the
+same parallel claimable capture, parallel claim attempts, bounded retries and
+sweep behavior as the UTC 00:00 task. It does not connect to MySQL, read or
+update funding records or durable `current` state, read or write the UTC 00:00
+daily consolidation record, send a recipient payout, or start the scheduler.
+It decrypts only builder keys, but still acquires `data/LOCK`, so it cannot run
 alongside the service in the same working directory.
 
 To verify EC2 credentials, network access, and SES delivery without starting
@@ -97,18 +102,19 @@ status subject ordering, HTML rendering, and inbox preheader used by runtime
 reports.
 
 Startup always recovers `data/current.json` before starting a new run. The data
-directory retains `LOCK`, date-keyed claimable-reward snapshots, checksummed
-current and backup snapshots, and history archives. At UTC 00:00
-(Asia/Shanghai 08:00), the scheduler records a read-only claimable-USDC
-snapshot for settlement reconciliation. At UTC 01:00 (Asia/Shanghai 09:00), it
-runs the funding workflow using live values and includes both views in the SES
-report. Snapshot metadata and per-builder reads each make at most three
-attempts, two seconds apart; exhausted snapshot failures never block funding.
-When a complete snapshot total covers or equals the database payout, the
-reconciliation is normal and the report shows the non-negative difference
-without adding a warning. When it is below the payout, the report is upgraded
-to warning with the shortfall, but a sufficiently funded settlement still pays
-normally. Confirmed payouts enter unlimited MySQL retry and are never sent
-again during database recovery.
+directory retains `LOCK`, date-keyed daily consolidation records, checksummed
+current and backup payout states, and history archives. At UTC 00:00
+(Asia/Shanghai 08:00), the scheduler captures all builder claimable values in
+parallel, retrying only failed `/info` reads up to five times at 200 ms
+intervals. It writes a `claimables_captured` record before any claim, then runs
+parallel claims with at most three attempts for uncertain responses and updates
+the record to `completed` after sweeping.
+At UTC 01:00 (Asia/Shanghai 09:00), it freezes pending records and performs the
+single settlement-to-recipient payout; it never claims or sweeps builders in
+this phase. The SES report compares the captured zero-hour claimable total with
+the database payout. Missing or incomplete claimable data prevents a numeric
+conclusion; a lower complete total produces a warning. Neither condition blocks
+a payout that the settlement balance can fund. Confirmed payouts enter
+unlimited MySQL retry and are never sent again during database recovery.
 Ordinary funding failures retry at most five times at one-minute intervals,
 while retry exhaustion and fatal payout outcomes exit immediately.
