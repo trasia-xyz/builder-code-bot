@@ -56,6 +56,8 @@ const (
 	claimableQueryRetryInterval     = 200 * time.Millisecond
 	claimSubmitAttempts             = 3
 	claimSubmitRetryInterval        = 250 * time.Millisecond
+	sweepSubmitAttempts             = 3
+	sweepSubmitRetryInterval        = 250 * time.Millisecond
 	claimBalanceObservationAttempts = 10
 	claimBalanceObservationInterval = time.Second
 	claimRewardThresholdUSDC        = int64(1)
@@ -533,12 +535,17 @@ func (o *Orchestrator) markClaimUncertain(
 	o.builderFailure(ctx, state, report, builder, "claimRewards", "unknown")
 }
 
+type sweepRetryState struct {
+	done       bool
+	hadUnknown bool
+	lastAmount string
+}
+
 func (o *Orchestrator) sweepBuilderBalances(
 	ctx context.Context,
 	state *RunState,
 	report *RunReport,
 	token info.Token,
-	attempt int,
 	initialBalances map[string]info.SpotBalanceAmounts,
 	claimBalanceTargets map[string]decimal.Decimal,
 	unconvergedClaims map[string]struct{},
@@ -546,55 +553,162 @@ func (o *Orchestrator) sweepBuilderBalances(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for _, builder := range o.builders {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		var balance info.SpotBalanceAmounts
-		observed := false
-		if attempt == 1 {
-			balance, observed = initialBalances[builder]
-		}
-		if !observed {
-			if _, alreadyPolled := claimBalanceTargets[builder]; attempt == 1 && alreadyPolled {
+	states := make([]sweepRetryState, len(o.builders))
+	for attempt := 1; attempt <= sweepSubmitAttempts; attempt++ {
+		pending := false
+		for index, builder := range o.builders {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			retry := &states[index]
+			if retry.done {
 				continue
 			}
-			var balanceErr error
-			balance, balanceErr = o.chain.SpotBalance(ctx, builder, token)
+			balance, balanceErr, skip := o.loadSweepBalance(
+				ctx, state, report, token, builder, attempt, initialBalances, claimBalanceTargets,
+			)
+			if skip {
+				retry.done = true
+				continue
+			}
 			if balanceErr != nil {
-				o.builderFailure(ctx, state, report, builder, "spotBalance", "query")
+				if attempt == sweepSubmitAttempts {
+					retry.done = true
+					o.builderFailure(ctx, state, report, builder, "spotBalance", "query")
+				} else {
+					pending = true
+					o.warn(ctx, "builder sweep balance query failed; retrying",
+						slog.String("event", "funding_builder_sweep_retry_planned"),
+						slog.String("run_id", state.RunID),
+						slog.String("builder", builder),
+						slog.String("reason", "spot_balance_query"),
+						slog.Int("attempt", attempt),
+						slog.Int("max_attempts", sweepSubmitAttempts))
+				}
 				continue
 			}
-			o.recordBuilderBalance(ctx, state, report, builder, attempt, balance, nil)
-		}
-		if !balance.Available.IsPositive() {
-			continue
-		}
-		prepared, prepareErr := o.chain.PrepareSpotSend(
-			builder, state.Manifest.Settlement, token, balance.Available, o.nonce.Next(),
-		)
-		if prepareErr != nil {
-			o.builderFailure(ctx, state, report, builder, "spotSend", "prepare")
-			continue
-		}
-		result, _ := o.chain.Submit(ctx, prepared)
-		o.logBuilderSubmitResult(ctx, state, builder, "spotSend", balance.Available.String(), result)
-		if result.Accepted {
-			if builderReport := report.builder(builder); builderReport != nil {
-				report.addSweepAmount(builderReport, balance.Available.String())
-				if _, unconverged := unconvergedClaims[builder]; unconverged {
-					builderReport.SweepStatus = ReportStepWarning
-					builderReport.SweepSummary = "已按最新可用余额归集，Reward 余额未确认刷新"
-				} else {
-					builderReport.SweepStatus = ReportStepSuccess
-					builderReport.SweepSummary = "资金已归集"
+			if !balance.Available.IsPositive() {
+				if retry.hadUnknown {
+					o.markSweepSucceeded(
+						report, builder, retry.lastAmount, unconvergedClaims,
+						"资金已归集（余额已清空；此前提交结果不确定）",
+					)
 				}
+				retry.done = true
+				continue
 			}
-		} else {
-			o.builderFailure(ctx, state, report, builder, "spotSend", submitResultName(result))
+			prepared, prepareErr := o.chain.PrepareSpotSend(
+				builder, state.Manifest.Settlement, token, balance.Available, o.nonce.Next(),
+			)
+			if prepareErr != nil {
+				if retry.hadUnknown {
+					if attempt == sweepSubmitAttempts {
+						retry.done = true
+						o.builderFailure(ctx, state, report, builder, "spotSend", "unknown")
+					} else {
+						pending = true
+						o.logSweepRetry(ctx, state, builder, attempt)
+					}
+				} else {
+					retry.done = true
+					o.builderFailure(ctx, state, report, builder, "spotSend", "prepare")
+				}
+				continue
+			}
+			amount := balance.Available.String()
+			result, _ := o.chain.Submit(ctx, prepared)
+			o.logBuilderSubmitResult(ctx, state, builder, "spotSend", amount, result)
+			switch {
+			case result.Accepted:
+				retry.done = true
+				summary := "资金已归集"
+				if attempt > 1 {
+					summary = fmt.Sprintf("资金已归集（第 %d 次尝试）", attempt)
+				}
+				o.markSweepSucceeded(report, builder, amount, unconvergedClaims, summary)
+			case result.Rejected && !retry.hadUnknown:
+				retry.done = true
+				o.builderFailure(ctx, state, report, builder, "spotSend", "rejected")
+			default:
+				retry.hadUnknown = true
+				retry.lastAmount = amount
+				if attempt == sweepSubmitAttempts {
+					retry.done = true
+					o.builderFailure(ctx, state, report, builder, "spotSend", "unknown")
+					continue
+				}
+				pending = true
+				o.logSweepRetry(ctx, state, builder, attempt)
+			}
+		}
+		if !pending {
+			break
+		}
+		if err := o.sleeper.Sleep(ctx, sweepSubmitRetryInterval); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func (o *Orchestrator) loadSweepBalance(
+	ctx context.Context,
+	state *RunState,
+	report *RunReport,
+	token info.Token,
+	builder string,
+	attempt int,
+	initialBalances map[string]info.SpotBalanceAmounts,
+	claimBalanceTargets map[string]decimal.Decimal,
+) (info.SpotBalanceAmounts, error, bool) {
+	if attempt == 1 {
+		if balance, observed := initialBalances[builder]; observed {
+			return balance, nil, false
+		}
+		if _, alreadyPolled := claimBalanceTargets[builder]; alreadyPolled {
+			return info.SpotBalanceAmounts{}, nil, true
+		}
+	}
+	balance, err := o.chain.SpotBalance(ctx, builder, token)
+	if err != nil {
+		return info.SpotBalanceAmounts{}, err, false
+	}
+	o.recordBuilderBalance(ctx, state, report, builder, attempt, balance, nil)
+	return balance, nil, false
+}
+
+func (o *Orchestrator) markSweepSucceeded(
+	report *RunReport,
+	builder, amount string,
+	unconvergedClaims map[string]struct{},
+	summary string,
+) {
+	builderReport := report.builder(builder)
+	if builderReport == nil {
+		return
+	}
+	report.addSweepAmount(builderReport, amount)
+	if _, unconverged := unconvergedClaims[builder]; unconverged {
+		builderReport.SweepStatus = ReportStepWarning
+		builderReport.SweepSummary = "已按最新可用余额归集，Reward 余额未确认刷新"
+		return
+	}
+	builderReport.SweepStatus = ReportStepSuccess
+	builderReport.SweepSummary = summary
+}
+
+func (o *Orchestrator) logSweepRetry(
+	ctx context.Context,
+	state *RunState,
+	builder string,
+	attempt int,
+) {
+	o.warn(ctx, "builder sweep remains uncertain; retrying",
+		slog.String("event", "funding_builder_sweep_retry_planned"),
+		slog.String("run_id", state.RunID),
+		slog.String("builder", builder),
+		slog.Int("attempt", attempt),
+		slog.Int("max_attempts", sweepSubmitAttempts))
 }
 
 func (o *Orchestrator) observeClaimBalances(

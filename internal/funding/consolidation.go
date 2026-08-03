@@ -148,7 +148,7 @@ func (o *Orchestrator) runConsolidation(
 		return report, err
 	}
 	if err := o.sweepBuilderBalances(
-		ctx, &state, &report, token, 1,
+		ctx, &state, &report, token,
 		initialBalances, claimBalanceTargets, unconvergedClaims,
 	); err != nil {
 		return report, err

@@ -250,6 +250,79 @@ func TestUncertainClaimRetriesUntilAccepted(t *testing.T) {
 	}
 }
 
+func TestUncertainSweepRetriesUntilAccepted(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		results  []exchange.SubmitResult
+		attempts int
+		summary  string
+	}{
+		{
+			name:     "accepted after unknown",
+			results:  []exchange.SubmitResult{{}, {Accepted: true}},
+			attempts: 2,
+			summary:  "资金已归集（第 2 次尝试）",
+		},
+		{
+			name:     "rejection does not resolve earlier unknown",
+			results:  []exchange.SubmitResult{{}, {Rejected: true}, {Accepted: true}},
+			attempts: 3,
+			summary:  "资金已归集（第 3 次尝试）",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.chain.sweepResults = map[string][]exchange.SubmitResult{"0xbuilder": test.results}
+			if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			builder := fx.store.consolidations["2026-07-12"].Builders[0]
+			if builder.SweepAmount != "1.5" || builder.SweepStatus != ReportStepSuccess ||
+				builder.SweepSummary != test.summary ||
+				countString(fx.chain.events, "submit:spotSend:0xbuilder") != test.attempts ||
+				countDelay(fx.sleeper.delays, sweepSubmitRetryInterval) != test.attempts-1 {
+				t.Fatalf("retried sweep builder = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
+			}
+			if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
+				t.Fatal("sweep retry path must not submit settlement payout")
+			}
+		})
+	}
+}
+
+func TestUncertainSweepConfirmsWhenAvailableClears(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.sweepResults = map[string][]exchange.SubmitResult{"0xbuilder": {{}}}
+	fx.chain.applyUnknownSweep = true
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepAmount != "1.5" || builder.SweepStatus != ReportStepSuccess ||
+		builder.SweepSummary != "资金已归集（余额已清空；此前提交结果不确定）" ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 ||
+		countDelay(fx.sleeper.delays, sweepSubmitRetryInterval) != 1 {
+		t.Fatalf("balance-cleared sweep = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
+	}
+	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
+		t.Fatal("sweep confirmation path must not submit settlement payout")
+	}
+}
+
+func TestRejectedSweepDoesNotRetry(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.sweepResult = exchange.SubmitResult{Rejected: true}
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepStatus != ReportStepWarning ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 ||
+		countDelay(fx.sleeper.delays, sweepSubmitRetryInterval) != 0 {
+		t.Fatalf("rejected sweep = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
+	}
+}
+
 func TestScheduledFundingNeverClaimsOrSweepsWithoutDailyRecord(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
@@ -889,6 +962,8 @@ type fakeChain struct {
 	claimStarted           chan string
 	claimRelease           chan struct{}
 	sweepResult            exchange.SubmitResult
+	sweepResults           map[string][]exchange.SubmitResult
+	applyUnknownSweep      bool
 	payoutResult           exchange.SubmitResult
 	applyUnknownPayout     bool
 	events                 []string
@@ -1036,11 +1111,16 @@ func (c *fakeChain) Submit(
 		}
 		return c.payoutResult, nil
 	}
-	if c.sweepResult.Accepted {
+	result := c.sweepResult
+	if sequence := c.sweepResults[action.Signer]; len(sequence) > 0 {
+		result = sequence[0]
+		c.sweepResults[action.Signer] = sequence[1:]
+	}
+	if result.Accepted || (c.applyUnknownSweep && !result.Accepted && !result.Rejected) {
 		c.balances[action.Signer] = c.balances[action.Signer].Sub(amount)
 		c.balances[action.Destination] = c.balances[action.Destination].Add(amount)
 	}
-	return c.sweepResult, nil
+	return result, nil
 }
 
 type fakeSleeper struct{ delays []time.Duration }
