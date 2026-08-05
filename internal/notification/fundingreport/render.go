@@ -368,6 +368,8 @@ func buildSettlementView(balance funding.SettlementBalanceReport) settlementView
 		Status:    "未观察", Color: "#64748b", Tint: "#f8fafc",
 	}
 	switch {
+	case balance.PostPayoutUnconfirmed:
+		data.Status, data.Color, data.Tint = "Payout 后余额未确认", "#b45309", "#fffbeb"
 	case balance.QueryFailed:
 		data.Status, data.Color, data.Tint = "查询失败", "#b91c1c", "#fef2f2"
 	case balance.Observed:
@@ -382,6 +384,9 @@ func settlementBalanceSummary(balance funding.SettlementBalanceReport) string {
 	}
 	if balance.QueryFailed {
 		return "Settlement 结束余额查询失败"
+	}
+	if balance.PostPayoutUnconfirmed {
+		return "Settlement Payout 后余额未确认"
 	}
 	return ""
 }
@@ -728,7 +733,7 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
             <tr><td style="padding:18px;">
               <div style="font-size:13px;font-weight:700;color:#991b1b;">{{.FailureStage}}</div>
               <div style="margin-top:6px;font-size:15px;font-weight:700;color:#7f1d1d;">{{.FailureSummary}}</div>
-              {{if .NextAction}}<div style="margin-top:10px;font-size:13px;line-height:1.55;color:#991b1b;"><strong>下一步：</strong>{{.NextAction}}</div>{{end}}
+              {{if .NextAction}}<div style="margin-top:10px;font-size:13px;line-height:1.55;color:#991b1b;"><strong>下一步: </strong>{{.NextAction}}</div>{{end}}
             </td></tr>
           </table>
         </td></tr>

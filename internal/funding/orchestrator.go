@@ -836,7 +836,7 @@ func (o *Orchestrator) claimBalanceObservationExhausted(
 	if builderReport := report.builder(builder); builderReport != nil {
 		builderReport.SweepStatus = ReportStepWarning
 		builderReport.SweepSummary = summary
-		report.addWarning(builderReport.Name + "：" + summary)
+		report.addWarning(builderReport.Name + ": " + summary)
 	}
 	o.alertOnce(
 		ctx, state.RunID, "builder_claim_balance_not_visible:"+strings.ToLower(builder),
@@ -846,13 +846,6 @@ func (o *Orchestrator) claimBalanceObservationExhausted(
 			builder, claimable, claimBalanceObservationAttempts,
 		),
 	)
-}
-
-func submitResultName(result exchange.SubmitResult) string {
-	if result.Rejected {
-		return "rejected"
-	}
-	return "unknown"
 }
 
 func (o *Orchestrator) logBuilderSubmitResult(
@@ -896,7 +889,7 @@ func (o *Orchestrator) builderFailure(
 			builderReport.SweepStatus = ReportStepWarning
 			builderReport.SweepSummary = builderActionSummary(action, outcome)
 		}
-		report.addWarning(builderReport.Name + "：" + builderActionSummary(action, outcome))
+		report.addWarning(builderReport.Name + ": " + builderActionSummary(action, outcome))
 	}
 	o.alertOnce(
 		ctx, state.RunID, "builder_"+action+"_failed",

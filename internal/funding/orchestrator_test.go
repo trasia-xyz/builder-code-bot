@@ -71,6 +71,82 @@ func TestDailyConsolidationAndFundingAreSeparatePhases(t *testing.T) {
 	}
 }
 
+func TestFinalReportWaitsForAcceptedPayoutBalanceVisibility(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(1)
+	fx.chain.holds["0xsettlement"] = decimal.RequireFromString("0.25")
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("2.5"), Available: decimal.RequireFromString("2.25"),
+	}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
+		stale, // UTC 01:00 payout sufficiency check.
+		stale, // First final observation before the accepted payout is visible.
+	}
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
+	balanceCallsBefore := fx.chain.balanceCalls["0xsettlement"]
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+
+	report := onlyReport(t, fx.notifier)
+	balance := report.SettlementBalance
+	if report.Payout.Status != ReportStepSuccess || !balance.Observed ||
+		balance.QueryFailed || balance.PostPayoutUnconfirmed ||
+		balance.Total != "1" || balance.Hold != "0.25" || balance.Available != "0.75" {
+		t.Fatalf("final report payout=%#v settlement balance=%#v", report.Payout, balance)
+	}
+	if calls := fx.chain.balanceCalls["0xsettlement"] - balanceCallsBefore; calls != 3 {
+		t.Fatalf("UTC 01:00 settlement balance calls = %d, want payout check, stale final, refreshed final", calls)
+	}
+}
+
+func TestFinalReportDoesNotLabelStalePostPayoutBalanceAsEndingBalance(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(1)
+	fx.chain.holds["0xsettlement"] = decimal.RequireFromString("0.25")
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("2.5"), Available: decimal.RequireFromString("2.25"),
+	}
+	fx.chain.balanceSequence["0xsettlement"] = make(
+		[]info.SpotBalanceAmounts, settlementFinalBalanceObservationAttempts+1,
+	)
+	for index := range fx.chain.balanceSequence["0xsettlement"] {
+		fx.chain.balanceSequence["0xsettlement"][index] = stale
+	}
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
+	balanceCallsBefore := fx.chain.balanceCalls["0xsettlement"]
+	delaysBefore := countDelay(fx.sleeper.delays, settlementFinalBalanceObservationInterval)
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+
+	report := onlyReport(t, fx.notifier)
+	balance := report.SettlementBalance
+	warning := "Settlement: Payout 后余额未在有限观察内更新，任务结束余额无法确认"
+	if report.Status != ReportStatusWarning || report.Payout.Status != ReportStepSuccess ||
+		balance.Observed || balance.QueryFailed || !balance.PostPayoutUnconfirmed ||
+		balance.Total != "" || balance.Hold != "" || balance.Available != "" ||
+		!containsString(report.Warnings, warning) {
+		t.Fatalf("final report = %#v", report)
+	}
+	if calls := fx.chain.balanceCalls["0xsettlement"] - balanceCallsBefore; calls != settlementFinalBalanceObservationAttempts+1 {
+		t.Fatalf("UTC 01:00 settlement balance calls = %d, want 1 payout check + %d final observations",
+			calls, settlementFinalBalanceObservationAttempts)
+	}
+	if delays := countDelay(fx.sleeper.delays, settlementFinalBalanceObservationInterval) - delaysBefore; delays != settlementFinalBalanceObservationAttempts-1 {
+		t.Fatalf("post-payout balance observation delays = %d, want %d",
+			delays, settlementFinalBalanceObservationAttempts-1)
+	}
+}
+
 func TestDailyConsolidationRunsOnlyOncePerUTCDate(t *testing.T) {
 	fx := newFixture(t)
 	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {

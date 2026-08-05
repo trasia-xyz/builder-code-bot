@@ -45,7 +45,7 @@ func TestRenderBuildsRichSuccessEmailAndEscapesValues(t *testing.T) {
 			Address: "0xsettlement", Total: "0.25", Hold: "0.1", Available: "0.15", Observed: true,
 		},
 		Warnings: []string{
-			"builder-1：Reward 领取结果不确定",
+			"builder-1: Reward 领取结果不确定",
 			"UTC 00:00 Claimable 合计 1.2 USDC，低于数据库 Payout 1.5 USDC，短缺 0.3 USDC，请人工核查结算口径",
 		},
 	}
@@ -59,7 +59,7 @@ func TestRenderBuildsRichSuccessEmailAndEscapesValues(t *testing.T) {
 	}
 	for _, want := range []string{
 		"成功但有告警", "Payout 1.5 USDC", "Builder 明细", "Exchange 明确确认",
-		"0x123456…345678", "builder-1：Reward 领取结果不确定",
+		"0x123456…345678", "builder-1: Reward 领取结果不确定",
 		"Settlement 结束余额", "0.15 USDC",
 		"UTC 00:00 Claim 与资金归集", "零点 Claimable 合计", "1.2 USDC",
 		"00:00 Reward", "Claimable 作为对账基准", "对账差额", "-0.3 USDC",
@@ -74,6 +74,31 @@ func TestRenderBuildsRichSuccessEmailAndEscapesValues(t *testing.T) {
 	}
 	if strings.Contains(message.HTMLBody, "ZgotmplZ") {
 		t.Fatalf("HTML template rejected a trusted style value: %s", message.HTMLBody)
+	}
+}
+
+func TestRenderShowsUnconfirmedPostPayoutBalanceWithoutAmounts(t *testing.T) {
+	t.Parallel()
+	report := funding.RunReport{
+		Status: funding.ReportStatusWarning,
+		Payout: funding.PayoutReport{Status: funding.ReportStepPending},
+		SettlementBalance: funding.SettlementBalanceReport{
+			Address: "0xsettlement", PostPayoutUnconfirmed: true,
+		},
+	}
+
+	settlement := buildSettlementView(report.SettlementBalance)
+	if settlement.Status != "Payout 后余额未确认" ||
+		settlement.Total != "—" || settlement.Available != "—" {
+		t.Fatalf("settlement view = %#v", settlement)
+	}
+
+	message := Render(report)
+	if !strings.Contains(message.HTMLBody, "Payout 后余额未确认") {
+		t.Fatalf("HTML body missing unconfirmed post-payout status")
+	}
+	if count := strings.Count(message.HTMLBody, ">— USDC</td>"); count != 3 {
+		t.Fatalf("settlement placeholder count = %d, want 3", count)
 	}
 }
 

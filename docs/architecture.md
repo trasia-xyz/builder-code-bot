@@ -143,7 +143,9 @@ data/
 
 最终 funding report 只在 UTC 01:00 funding 结束时发送，内容包括：各 builder 的零点
 claimable 与 claim/sweep 结果、完整 claimable 合计与数据库 payout 的差额、payout 确认依据、
-settlement 结束余额、rate limit、告警与处置建议。
+settlement 结束余额、rate limit、告警与处置建议。正数 payout 确认后，结束余额必须等到
+settlement total 相比付款前下降才可标记为已观察；有限观察内仍不可见时只报告未确认，不得把
+付款前余额展示为结束余额。
 
 全部 builder 的零点 claimable 都成功捕获时才做数值对账；合计低于 payout 时报告为 warning，
 但 settlement 余额充足时仍正常付款。Claim 不确定单独告警，不改变已冻结的 claimable 口径。

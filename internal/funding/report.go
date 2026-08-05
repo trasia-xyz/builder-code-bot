@@ -95,12 +95,13 @@ type PayoutReport struct {
 }
 
 type SettlementBalanceReport struct {
-	Address     string
-	Total       string
-	Hold        string
-	Available   string
-	Observed    bool
-	QueryFailed bool
+	Address               string
+	Total                 string
+	Hold                  string
+	Available             string
+	Observed              bool
+	QueryFailed           bool
+	PostPayoutUnconfirmed bool
 }
 
 type RunReport struct {

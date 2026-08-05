@@ -43,7 +43,7 @@ func (o *Orchestrator) observeUserRateLimits(ctx context.Context, report *RunRep
 			} else if report != nil && account.kind == "settlement" {
 				report.SettlementRateLimitQueryFailed = true
 			}
-			report.addWarning(accountLabel(account, report) + "：Rate Limit 查询失败")
+			report.addWarning(accountLabel(account, report) + ": Rate Limit 查询失败")
 			o.warn(ctx, "Hyperliquid user rate limit query failed",
 				slog.String("event", "funding_user_rate_limit_query_failed"),
 				slog.String("account_kind", account.kind),
@@ -68,7 +68,7 @@ func (o *Orchestrator) observeUserRateLimits(ctx context.Context, report *RunRep
 		}
 		if low {
 			o.warn(ctx, "Hyperliquid user rate limit is low", attrs...)
-			report.addWarning(fmt.Sprintf("%s：Rate Limit 仅剩 %d", accountLabel(account, report), remaining))
+			report.addWarning(fmt.Sprintf("%s: Rate Limit 仅剩 %d", accountLabel(account, report), remaining))
 		} else {
 			o.info(ctx, "Hyperliquid user rate limit observed", attrs...)
 		}

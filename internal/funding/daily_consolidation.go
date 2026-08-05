@@ -296,16 +296,16 @@ func (o *Orchestrator) attachDailyConsolidation(
 				total = total.Add(claimable)
 			}
 		} else {
-			report.addWarning(builder.Name + "：零点 Claimable 查询失败")
+			report.addWarning(builder.Name + ": 零点 Claimable 查询失败")
 		}
 		if entry.ClaimUncertain {
 			summary.UncertainClaims++
 		}
 		if builder.ClaimStatus == ReportStepWarning {
-			report.addWarning(builder.Name + "：" + fallbackSummary(builder.ClaimSummary, "Reward 领取存在告警"))
+			report.addWarning(builder.Name + ": " + fallbackSummary(builder.ClaimSummary, "Reward 领取存在告警"))
 		}
 		if builder.SweepStatus == ReportStepWarning {
-			report.addWarning(builder.Name + "：" + fallbackSummary(builder.SweepSummary, "资金归集存在告警"))
+			report.addWarning(builder.Name + ": " + fallbackSummary(builder.SweepSummary, "资金归集存在告警"))
 		}
 	}
 	summary.TotalClaimableUSDC = total.String()
