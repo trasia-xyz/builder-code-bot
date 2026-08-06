@@ -102,6 +102,28 @@ func TestRenderShowsUnconfirmedPostPayoutBalanceWithoutAmounts(t *testing.T) {
 	}
 }
 
+func TestRenderDoesNotPresentUnconfirmedRateLimitAsHealthy(t *testing.T) {
+	t.Parallel()
+	report := funding.RunReport{
+		Builders: []funding.BuilderReport{{
+			Name: "builder-1", RateLimitObserved: true, RateLimitRemaining: 201,
+			RateLimitVisibilityUnconfirmed: true,
+		}},
+		Payout:                      funding.PayoutReport{Status: funding.ReportStepSuccess, Amount: "1"},
+		SettlementRateLimitObserved: true, SettlementRateLimitRemaining: 200,
+		SettlementRateLimitVisibilityUnconfirmed: true,
+	}
+
+	message := Render(report)
+	for _, want := range []string{
+		"最低观测 201 · 刷新未确认", "最低观测 200 · 刷新未确认",
+	} {
+		if !strings.Contains(message.HTMLBody, want) {
+			t.Fatalf("HTML body missing %q", want)
+		}
+	}
+}
+
 func TestBuildDailyConsolidationViewShowsCoveredPayoutAsNormal(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {

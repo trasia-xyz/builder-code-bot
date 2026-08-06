@@ -64,19 +64,28 @@ type Server struct {
 	balances     map[balanceKey]spotBalance
 	claimRewards map[balanceKey]decimal.Decimal
 	rateLimits   map[string]info.UserRateLimit
-	requests     []RecordedRequest
-	nextFailure  FailureMode
-	outcomes     map[string]exchangeOutcome
+	// Queued /info snapshots model API visibility lag independently from the
+	// authoritative state mutated by /exchange. Once a queue is exhausted,
+	// reads fall through to the latest authoritative value.
+	balanceSnapshots          map[balanceKey][]spotBalance
+	rateLimitSnapshots        map[string][]info.UserRateLimit
+	authoritativeBalanceReads map[balanceKey]int
+	requests                  []RecordedRequest
+	nextFailure               FailureMode
+	outcomes                  map[string]exchangeOutcome
 }
 
 // New starts a mock server and registers its cleanup with t.
 func New(t testing.TB) *Server {
 	t.Helper()
 	s := &Server{
-		balances:     make(map[balanceKey]spotBalance),
-		claimRewards: make(map[balanceKey]decimal.Decimal),
-		rateLimits:   make(map[string]info.UserRateLimit),
-		outcomes:     make(map[string]exchangeOutcome),
+		balances:                  make(map[balanceKey]spotBalance),
+		claimRewards:              make(map[balanceKey]decimal.Decimal),
+		rateLimits:                make(map[string]info.UserRateLimit),
+		balanceSnapshots:          make(map[balanceKey][]spotBalance),
+		rateLimitSnapshots:        make(map[string][]info.UserRateLimit),
+		authoritativeBalanceReads: make(map[balanceKey]int),
+		outcomes:                  make(map[string]exchangeOutcome),
 	}
 	s.server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
 	s.URL = s.server.URL
@@ -91,17 +100,42 @@ func (s *Server) SetSpotBalance(address, token, amount string) {
 
 // SetSpotBalanceWithHold sets exact total and held spot balances.
 func (s *Server) SetSpotBalanceWithHold(address, token, total, hold string) {
-	totalValue, err := decimal.NewFromString(total)
-	if err != nil {
-		panic(fmt.Sprintf("invalid mock total spot balance %q: %v", total, err))
-	}
-	holdValue, err := decimal.NewFromString(hold)
-	if err != nil {
-		panic(fmt.Sprintf("invalid mock held spot balance %q: %v", hold, err))
-	}
+	value := parseSpotBalance(total, hold)
 	s.mu.Lock()
-	s.balances[balanceKey{address: normalizeAddress(address), token: token}] = spotBalance{total: totalValue, hold: holdValue}
+	s.balances[balanceKey{address: normalizeAddress(address), token: token}] = value
 	s.mu.Unlock()
+}
+
+// QueueSpotBalanceSnapshot queues one spotClearinghouseState snapshot for an
+// account. Snapshots are returned FIFO before /info falls through to the latest
+// authoritative balance. Queue the pre-action balance before Submit to model a
+// stale read after an accepted or applied action.
+func (s *Server) QueueSpotBalanceSnapshot(address, token, total, hold string) {
+	value := parseSpotBalance(total, hold)
+	key := balanceKey{address: normalizeAddress(address), token: token}
+	s.mu.Lock()
+	s.balanceSnapshots[key] = append(s.balanceSnapshots[key], value)
+	s.authoritativeBalanceReads[key] = 0
+	s.mu.Unlock()
+}
+
+// PendingSpotBalanceSnapshots reports how many queued /info snapshots remain
+// for an account. Tests use this to prove that an observer crossed the stale
+// visibility window instead of merely asserting the eventual mutation.
+func (s *Server) PendingSpotBalanceSnapshots(address, token string) int {
+	key := balanceKey{address: normalizeAddress(address), token: token}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.balanceSnapshots[key])
+}
+
+// AuthoritativeSpotBalanceReadsAfterSnapshots reports reads made after the
+// most recently queued stale sequence was exhausted.
+func (s *Server) AuthoritativeSpotBalanceReadsAfterSnapshots(address, token string) int {
+	key := balanceKey{address: normalizeAddress(address), token: token}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.authoritativeBalanceReads[key]
 }
 
 // SetClaimReward sets the balance credited by the next successful claim for an account.
@@ -122,6 +156,19 @@ func (s *Server) SetUserRateLimit(address string, used, cap uint64) {
 		NRequestsUsed: used,
 		NRequestsCap:  cap,
 	}
+	s.mu.Unlock()
+}
+
+// QueueUserRateLimitSnapshot queues one userRateLimit snapshot for an account.
+// Snapshots are returned FIFO before /info falls through to the latest
+// authoritative counters.
+func (s *Server) QueueUserRateLimitSnapshot(address string, used, cap uint64) {
+	key := normalizeAddress(address)
+	s.mu.Lock()
+	s.rateLimitSnapshots[key] = append(s.rateLimitSnapshots[key], info.UserRateLimit{
+		NRequestsUsed: used,
+		NRequestsCap:  cap,
+	})
 	s.mu.Unlock()
 }
 
@@ -183,7 +230,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, body []byte) {
 		token := canonicalToken()
 		wireToken := token.Name + ":" + token.TokenID
 		key := balanceKey{address: normalizeAddress(request.User), token: wireToken}
-		value := s.balances[key]
+		value := s.visibleSpotBalanceLocked(key)
 		response := struct {
 			Balances []info.SpotBalance `json:"balances"`
 		}{Balances: []info.SpotBalance{{Coin: token.Name, Token: token.Index, Total: value.total.String(), Hold: value.hold.String()}}}
@@ -210,10 +257,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, body []byte) {
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
 	case "userRateLimit":
-		response, exists := s.rateLimits[normalizeAddress(request.User)]
-		if !exists {
-			response.NRequestsCap = 10_000
-		}
+		response := s.visibleUserRateLimitLocked(normalizeAddress(request.User))
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
 	default:
@@ -324,6 +368,8 @@ func (s *Server) handleExchange(w http.ResponseWriter, body []byte) {
 		if err := apply(); err != nil {
 			response = []byte(`{"status":"err","response":"mutation rejected"}`)
 			statusCode = http.StatusOK
+		} else {
+			s.incrementUserRateLimitLocked(signerAddress)
 		}
 	}
 	s.outcomes[idempotencyKey] = exchangeOutcome{hash: bodyHash, statusCode: statusCode, body: append([]byte(nil), response...)}
@@ -348,6 +394,63 @@ func (s *Server) applySpotSend(signerAddress string, action signing.SpotSendActi
 	destinationBalance.total = destinationBalance.total.Add(amount)
 	s.balances[destination] = destinationBalance
 	return nil
+}
+
+func (s *Server) visibleSpotBalanceLocked(key balanceKey) spotBalance {
+	queue := s.balanceSnapshots[key]
+	if len(queue) == 0 {
+		if _, tracked := s.authoritativeBalanceReads[key]; tracked {
+			s.authoritativeBalanceReads[key]++
+		}
+		return s.balances[key]
+	}
+	value := queue[0]
+	if len(queue) == 1 {
+		delete(s.balanceSnapshots, key)
+	} else {
+		s.balanceSnapshots[key] = queue[1:]
+	}
+	return value
+}
+
+func (s *Server) visibleUserRateLimitLocked(address string) info.UserRateLimit {
+	queue := s.rateLimitSnapshots[address]
+	if len(queue) > 0 {
+		value := queue[0]
+		if len(queue) == 1 {
+			delete(s.rateLimitSnapshots, address)
+		} else {
+			s.rateLimitSnapshots[address] = queue[1:]
+		}
+		return value
+	}
+	value, exists := s.rateLimits[address]
+	if !exists {
+		value.NRequestsCap = 10_000
+	}
+	return value
+}
+
+func (s *Server) incrementUserRateLimitLocked(address string) {
+	key := normalizeAddress(address)
+	value, exists := s.rateLimits[key]
+	if !exists {
+		value.NRequestsCap = 10_000
+	}
+	value.NRequestsUsed++
+	s.rateLimits[key] = value
+}
+
+func parseSpotBalance(total, hold string) spotBalance {
+	totalValue, err := decimal.NewFromString(total)
+	if err != nil {
+		panic(fmt.Sprintf("invalid mock total spot balance %q: %v", total, err))
+	}
+	holdValue, err := decimal.NewFromString(hold)
+	if err != nil {
+		panic(fmt.Sprintf("invalid mock held spot balance %q: %v", hold, err))
+	}
+	return spotBalance{total: totalValue, hold: holdValue}
 }
 
 func hashBytes(value []byte) string {

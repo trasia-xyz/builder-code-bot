@@ -192,6 +192,9 @@ func buildView(report funding.RunReport) view {
 		switch {
 		case builder.RateLimitQueryFailed:
 			rateText, rateColor = "查询失败", "#dc2626"
+		case builder.RateLimitVisibilityUnconfirmed:
+			rateText = fmt.Sprintf("最低观测 %d · 刷新未确认", builder.RateLimitRemaining)
+			rateColor = "#d97706"
 		case builder.RateLimitObserved:
 			rateText = fmt.Sprintf("剩余 %d", builder.RateLimitRemaining)
 			if builder.RateLimitRemaining < 200 {
@@ -231,6 +234,11 @@ func buildView(report funding.RunReport) view {
 		switch {
 		case report.SettlementRateLimitQueryFailed:
 			data.Payout.RateLimit, data.Payout.RateColor = "查询失败", "#dc2626"
+		case report.SettlementRateLimitVisibilityUnconfirmed:
+			data.Payout.RateLimit = fmt.Sprintf(
+				"最低观测 %d · 刷新未确认", report.SettlementRateLimitRemaining,
+			)
+			data.Payout.RateColor = "#d97706"
 		case report.SettlementRateLimitObserved:
 			data.Payout.RateLimit = fmt.Sprintf("剩余 %d", report.SettlementRateLimitRemaining)
 			if report.SettlementRateLimitRemaining < 200 {
@@ -511,7 +519,9 @@ func evidenceLabel(evidence string) string {
 	case "exchange_response":
 		return "Exchange 明确确认"
 	case "settlement_balance_decreased":
-		return "Settlement total 下降确认"
+		return "Settlement 达到预期付款后余额"
+	case "paired_balance_boundary":
+		return "Settlement 与 Recipient 达到预期付款后余额"
 	default:
 		return fallback(evidence, "—")
 	}

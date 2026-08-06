@@ -83,8 +83,8 @@ func TestFinalReportWaitsForAcceptedPayoutBalanceVisibility(t *testing.T) {
 		Total: decimal.RequireFromString("2.5"), Available: decimal.RequireFromString("2.25"),
 	}
 	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
-		stale, // UTC 01:00 payout sufficiency check.
-		stale, // First final observation before the accepted payout is visible.
+		stale, // Stable UTC 01:00 payout sufficiency boundary.
+		stale,
 	}
 	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
 	balanceCallsBefore := fx.chain.balanceCalls["0xsettlement"]
@@ -99,8 +99,8 @@ func TestFinalReportWaitsForAcceptedPayoutBalanceVisibility(t *testing.T) {
 		balance.Total != "1" || balance.Hold != "0.25" || balance.Available != "0.75" {
 		t.Fatalf("final report payout=%#v settlement balance=%#v", report.Payout, balance)
 	}
-	if calls := fx.chain.balanceCalls["0xsettlement"] - balanceCallsBefore; calls != 3 {
-		t.Fatalf("UTC 01:00 settlement balance calls = %d, want payout check, stale final, refreshed final", calls)
+	if calls := fx.chain.balanceCalls["0xsettlement"] - balanceCallsBefore; calls != 4 {
+		t.Fatalf("UTC 01:00 settlement balance calls = %d, want two payout checks plus two final observations", calls)
 	}
 }
 
@@ -116,7 +116,8 @@ func TestFinalReportDoesNotLabelStalePostPayoutBalanceAsEndingBalance(t *testing
 		Total: decimal.RequireFromString("2.5"), Available: decimal.RequireFromString("2.25"),
 	}
 	fx.chain.balanceSequence["0xsettlement"] = make(
-		[]info.SpotBalanceAmounts, settlementFinalBalanceObservationAttempts+1,
+		[]info.SpotBalanceAmounts,
+		settlementBalanceRequiredConfirmations+settlementFinalBalanceObservationAttempts,
 	)
 	for index := range fx.chain.balanceSequence["0xsettlement"] {
 		fx.chain.balanceSequence["0xsettlement"][index] = stale
@@ -137,13 +138,148 @@ func TestFinalReportDoesNotLabelStalePostPayoutBalanceAsEndingBalance(t *testing
 		!containsString(report.Warnings, warning) {
 		t.Fatalf("final report = %#v", report)
 	}
-	if calls := fx.chain.balanceCalls["0xsettlement"] - balanceCallsBefore; calls != settlementFinalBalanceObservationAttempts+1 {
-		t.Fatalf("UTC 01:00 settlement balance calls = %d, want 1 payout check + %d final observations",
-			calls, settlementFinalBalanceObservationAttempts)
+	if calls := fx.chain.balanceCalls["0xsettlement"] - balanceCallsBefore; calls !=
+		settlementBalanceRequiredConfirmations+settlementFinalBalanceObservationAttempts {
+		t.Fatalf("UTC 01:00 settlement balance calls = %d, want %d payout checks + %d final observations",
+			calls, settlementBalanceRequiredConfirmations, settlementFinalBalanceObservationAttempts)
 	}
-	if delays := countDelay(fx.sleeper.delays, settlementFinalBalanceObservationInterval) - delaysBefore; delays != settlementFinalBalanceObservationAttempts-1 {
-		t.Fatalf("post-payout balance observation delays = %d, want %d",
-			delays, settlementFinalBalanceObservationAttempts-1)
+	wantDelays := 1 + 1 + settlementFinalBalanceObservationAttempts
+	if delays := countDelay(fx.sleeper.delays, settlementFinalBalanceObservationInterval) - delaysBefore; delays != wantDelays {
+		t.Fatalf("payout boundary and post-payout observation delays = %d, want %d",
+			delays, wantDelays)
+	}
+}
+
+func TestFinalReportRejectsHistoricalLowerBalanceUntilExpectedTotalIsStable(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(1)
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	prePayout := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("2.5"), Available: decimal.RequireFromString("2.5"),
+	}
+	historicalLower := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	expected := info.SpotBalanceAmounts{Total: decimal.NewFromInt(1), Available: decimal.NewFromInt(1)}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
+		prePayout, prePayout,
+		historicalLower,
+		historicalLower,
+		expected,
+		expected,
+	}
+	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
+	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
+		t.Fatal(err)
+	}
+
+	balance := onlyReport(t, fx.notifier).SettlementBalance
+	if !balance.Observed || balance.PostPayoutUnconfirmed || balance.Total != "1" {
+		t.Fatalf("final settlement balance = %#v", balance)
+	}
+}
+
+func TestFinalReportRequiresStableAvailableAtExpectedTotal(t *testing.T) {
+	fx := newFixture(t)
+	report := newRunReport(
+		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
+		fx.orchestrator.builders, fx.orchestrator.builderNames,
+		"0xsettlement", "0xrecipient",
+	)
+	report.token = cloneToken(&fx.chain.token)
+	report.Payout = PayoutReport{
+		Status: ReportStepSuccess, Amount: "1.5", SettlementTotalBefore: "2.5",
+	}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
+		{Total: decimal.NewFromInt(1), Available: decimal.RequireFromString("0.9")},
+		{Total: decimal.NewFromInt(1), Available: decimal.RequireFromString("0.8")},
+		{Total: decimal.NewFromInt(1), Available: decimal.RequireFromString("0.8")},
+	}
+
+	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
+
+	if !report.SettlementBalance.Observed || report.SettlementBalance.Available != "0.8" ||
+		fx.chain.balanceCalls["0xsettlement"] != 3 {
+		t.Fatalf("settlement balance = %#v, calls=%d",
+			report.SettlementBalance, fx.chain.balanceCalls["0xsettlement"])
+	}
+}
+
+func TestFinalReportQueryErrorsDoNotConsumeVisibilitySamples(t *testing.T) {
+	fx := newFixture(t)
+	report := newRunReport(
+		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
+		fx.orchestrator.builders, fx.orchestrator.builderNames,
+		"0xsettlement", "0xrecipient",
+	)
+	report.token = cloneToken(&fx.chain.token)
+	report.Payout = PayoutReport{
+		Status: ReportStepSuccess, Amount: "1.5", SettlementTotalBefore: "2.5",
+	}
+	fx.chain.balanceErrorSequence["0xsettlement"] = []error{
+		errors.New("temporary info failure"), errors.New("temporary info failure"),
+	}
+	expected := info.SpotBalanceAmounts{
+		Total: decimal.NewFromInt(1), Available: decimal.NewFromInt(1),
+	}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{expected, expected}
+
+	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
+
+	if !report.SettlementBalance.Observed || fx.chain.balanceCalls["0xsettlement"] != 4 {
+		t.Fatalf("settlement balance = %#v, calls=%d",
+			report.SettlementBalance, fx.chain.balanceCalls["0xsettlement"])
+	}
+}
+
+func TestFinalReportAllowsConfirmationAfterOrdinaryVisibilityWindow(t *testing.T) {
+	fx := newFixture(t)
+	report := newRunReport(
+		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
+		fx.orchestrator.builders, fx.orchestrator.builderNames,
+		"0xsettlement", "0xrecipient",
+	)
+	report.token = cloneToken(&fx.chain.token)
+	report.Payout = PayoutReport{
+		Status: ReportStepSuccess, Amount: "1.5", SettlementTotalBefore: "2.5",
+	}
+	stale := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("2.5"), Available: decimal.RequireFromString("2.5"),
+	}
+	expected := info.SpotBalanceAmounts{
+		Total: decimal.NewFromInt(1), Available: decimal.NewFromInt(1),
+	}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
+		stale, stale, stale, stale, expected, expected,
+	}
+
+	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
+
+	if !report.SettlementBalance.Observed || fx.chain.balanceCalls["0xsettlement"] != 6 {
+		t.Fatalf("settlement balance = %#v, calls=%d",
+			report.SettlementBalance, fx.chain.balanceCalls["0xsettlement"])
+	}
+}
+
+func TestFinalReportFailsClosedWhenSuccessfulPayoutBoundaryIsInvalid(t *testing.T) {
+	fx := newFixture(t)
+	report := newRunReport(
+		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
+		fx.orchestrator.builders, fx.orchestrator.builderNames,
+		"0xsettlement", "0xrecipient",
+	)
+	report.token = cloneToken(&fx.chain.token)
+	report.Payout = PayoutReport{Status: ReportStepSuccess, Amount: "1.5"}
+
+	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
+
+	if !report.SettlementBalance.PostPayoutUnconfirmed ||
+		report.SettlementBalance.Observed || fx.chain.balanceCalls["0xsettlement"] != 0 ||
+		!containsString(
+			report.Warnings,
+			"Settlement: Payout 已成功但付款后余额边界无效，任务结束余额无法确认",
+		) {
+		t.Fatalf("report = %#v, calls=%d", report, fx.chain.balanceCalls["0xsettlement"])
 	}
 }
 
@@ -230,6 +366,9 @@ func TestDailyClaimableQueriesAndClaimsRunInParallel(t *testing.T) {
 	if !sameStrings(queryBuilders, []string{"0xbuilder", "0xbuilder-2"}) {
 		t.Fatalf("parallel claimable builders = %v", queryBuilders)
 	}
+	fx.chain.mu.Lock()
+	fx.chain.claimableStarted = nil
+	fx.chain.mu.Unlock()
 	close(fx.chain.claimableRelease)
 	claimBuilders := []string{
 		receiveWithin(t, fx.chain.claimStarted),
@@ -295,93 +434,235 @@ func TestExhaustedClaimableQueryMarksDailyReconciliationIncomplete(t *testing.T)
 	}
 }
 
-func TestUncertainClaimRetriesUntilAccepted(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		results  []exchange.SubmitResult
-		attempts int
-	}{
-		{name: "accepted after unknown", results: []exchange.SubmitResult{{}, {Accepted: true}}, attempts: 2},
-		{
-			name:     "rejection does not resolve earlier unknown",
-			results:  []exchange.SubmitResult{{}, {Rejected: true}, {Accepted: true}},
-			attempts: 3,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			fx := newFixture(t)
-			fx.chain.claimResults = map[string][]exchange.SubmitResult{"0xbuilder": test.results}
-			if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			builder := fx.store.consolidations["2026-07-12"].Builders[0]
-			wantSummary := fmt.Sprintf("Reward 已领取（第 %d 次尝试）", test.attempts)
-			if builder.ClaimAttempts != test.attempts || builder.ClaimUncertain ||
-				builder.ClaimStatus != ReportStepSuccess || builder.ClaimSummary != wantSummary ||
-				countString(fx.chain.events, "submit:claimRewards:0xbuilder") != test.attempts ||
-				countDelay(fx.sleeper.delays, claimSubmitRetryInterval) != test.attempts-1 {
-				t.Fatalf("retried claim builder = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
-			}
-		})
-	}
-}
-
-func TestUncertainSweepRetriesUntilAccepted(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		results  []exchange.SubmitResult
-		attempts int
-		summary  string
-	}{
-		{
-			name:     "accepted after unknown",
-			results:  []exchange.SubmitResult{{}, {Accepted: true}},
-			attempts: 2,
-			summary:  "资金已归集（第 2 次尝试）",
-		},
-		{
-			name:     "rejection does not resolve earlier unknown",
-			results:  []exchange.SubmitResult{{}, {Rejected: true}, {Accepted: true}},
-			attempts: 3,
-			summary:  "资金已归集（第 3 次尝试）",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			fx := newFixture(t)
-			fx.chain.sweepResults = map[string][]exchange.SubmitResult{"0xbuilder": test.results}
-			if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			builder := fx.store.consolidations["2026-07-12"].Builders[0]
-			if builder.SweepAmount != "1.5" || builder.SweepStatus != ReportStepSuccess ||
-				builder.SweepSummary != test.summary ||
-				countString(fx.chain.events, "submit:spotSend:0xbuilder") != test.attempts ||
-				countDelay(fx.sleeper.delays, sweepSubmitRetryInterval) != test.attempts-1 {
-				t.Fatalf("retried sweep builder = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
-			}
-			if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
-				t.Fatal("sweep retry path must not submit settlement payout")
-			}
-		})
-	}
-}
-
-func TestUncertainSweepConfirmsWhenAvailableClears(t *testing.T) {
+func TestUncertainClaimUsesRelativeBalanceEvidenceWithoutResubmission(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.sweepResults = map[string][]exchange.SubmitResult{"0xbuilder": {{}}}
-	fx.chain.applyUnknownSweep = true
+	fx.chain.claimResult = exchange.SubmitResult{}
+	fx.chain.applyUnknownClaim = true
+	preClaim := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	postClaim := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5"),
+	}
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{
+		preClaim, // Stable pre-claim baseline.
+		preClaim,
+		preClaim, // Stale post-action observation.
+		postClaim,
+	}
 	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	builder := fx.store.consolidations["2026-07-12"].Builders[0]
-	if builder.SweepAmount != "1.5" || builder.SweepStatus != ReportStepSuccess ||
-		builder.SweepSummary != "资金已归集（余额已清空；此前提交结果不确定）" ||
-		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 ||
-		countDelay(fx.sleeper.delays, sweepSubmitRetryInterval) != 1 {
-		t.Fatalf("balance-cleared sweep = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
+	if builder.ClaimAttempts != 1 || builder.ClaimUncertain ||
+		builder.ClaimStatus != ReportStepSuccess ||
+		builder.ClaimSummary != "Reward 已领取（由余额增长确认；未重发）" ||
+		builder.SweepAmount != "1.5" ||
+		countString(fx.chain.events, "submit:claimRewards:0xbuilder") != 1 {
+		t.Fatalf("observed claim builder = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
 	}
-	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
-		t.Fatal("sweep confirmation path must not submit settlement payout")
+}
+
+func TestUncertainSweepRetriesLatestAvailableUntilAccepted(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.sweepResults = map[string][]exchange.SubmitResult{
+		"0xbuilder": {{}, {Accepted: true}},
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepStatus != ReportStepWarning || builder.SweepAmount != "1.5" ||
+		builder.SweepSummary != "第 2 次归集已接受；此前响应未知，累计归集金额无法确认" ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 2 ||
+		!fx.chain.balances["0xbuilder"].IsZero() ||
+		!fx.chain.balances["0xsettlement"].Equal(decimal.RequireFromString("1.5")) {
+		t.Fatalf("retried sweep = %#v, balances=%v events=%v",
+			builder, fx.chain.balances, fx.chain.events)
+	}
+	assertDistinctSweepNonces(t, fx.chain.submittedActions, "0xbuilder", 2)
+}
+
+func TestUncertainSweepRetriesLastAmountWhenStableQueryReturnsHistoricalZero(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.sweepResults = map[string][]exchange.SubmitResult{
+		"0xbuilder": {{}, {Accepted: true}},
+	}
+	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	postClaim := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5"),
+	}
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{
+		zero, zero, // Claim baseline.
+		postClaim, postClaim, // Claim visibility.
+		postClaim, postClaim, // Initial sweep amount.
+		zero, zero, // Historical zero returned before retry.
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepStatus != ReportStepWarning || builder.SweepAmount != "1.5" ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 2 ||
+		!fx.chain.balances["0xbuilder"].IsZero() ||
+		!fx.chain.balances["0xsettlement"].Equal(decimal.RequireFromString("1.5")) {
+		t.Fatalf("stale-zero sweep = %#v, balances=%v events=%v",
+			builder, fx.chain.balances, fx.chain.events)
+	}
+}
+
+func TestUncertainSweepDoesNotTrustLowerHistoricalPositiveBalance(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.sweepResults = map[string][]exchange.SubmitResult{
+		"0xbuilder": {{}, {Accepted: true}},
+	}
+	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	postClaim := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5"),
+	}
+	historicalPartial := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("0.5"), Available: decimal.RequireFromString("0.5"),
+	}
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{
+		zero, zero,
+		postClaim, postClaim,
+		postClaim, postClaim,
+		historicalPartial, historicalPartial,
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	actions := sweepActionsFor(fx.chain.submittedActions, "0xbuilder")
+	if builder.SweepStatus != ReportStepWarning || builder.SweepAmount != "1.5" ||
+		len(actions) != 2 || actions[1].Amount != "1.5" ||
+		!fx.chain.balances["0xbuilder"].IsZero() ||
+		!fx.chain.balances["0xsettlement"].Equal(decimal.RequireFromString("1.5")) {
+		t.Fatalf("lower historical balance retry = %#v, actions=%#v balances=%v",
+			builder, actions, fx.chain.balances)
+	}
+}
+
+func TestAppliedUncertainSweepRetriesSafelyAndRemainsWarning(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.sweepResult = exchange.SubmitResult{}
+	fx.chain.applyUnknownSweep = true
+	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	postClaim := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5"),
+	}
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{
+		zero, zero,
+		postClaim, postClaim,
+		postClaim, postClaim,
+		postClaim, postClaim, // Stale positive snapshots before the first retry.
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepStatus != ReportStepWarning || builder.SweepAmount != "" ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != sweepSubmitAttempts ||
+		!fx.chain.balances["0xbuilder"].IsZero() ||
+		!fx.chain.balances["0xsettlement"].Equal(decimal.RequireFromString("1.5")) {
+		t.Fatalf("applied uncertain sweep = %#v, balances=%v events=%v",
+			builder, fx.chain.balances, fx.chain.events)
+	}
+	assertDistinctSweepNonces(t, fx.chain.submittedActions, "0xbuilder", sweepSubmitAttempts)
+}
+
+func TestUncertainThenRejectedSweepStillRetriesUntilAccepted(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.sweepResults = map[string][]exchange.SubmitResult{
+		"0xbuilder": {{}, {Rejected: true}, {Accepted: true}},
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepStatus != ReportStepWarning || builder.SweepAmount != "1.5" ||
+		builder.SweepSummary != "第 3 次归集已接受；此前响应未知，累计归集金额无法确认" ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 3 ||
+		!fx.chain.balances["0xsettlement"].Equal(decimal.RequireFromString("1.5")) {
+		t.Fatalf("unknown/rejected/accepted sweep = %#v, balances=%v events=%v",
+			builder, fx.chain.balances, fx.chain.events)
+	}
+}
+
+func TestUncertainSweepExhaustionDoesNotBlockLaterBuilders(t *testing.T) {
+	fx := newFixture(t)
+	orchestrator := newTwoBuilderOrchestrator(t, fx)
+	fx.chain.sweepResults = map[string][]exchange.SubmitResult{
+		"0xbuilder": {{}, {}, {}},
+	}
+
+	if err := orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record := fx.store.consolidations["2026-07-12"]
+	if len(record.Builders) != 2 ||
+		record.Builders[0].SweepStatus != ReportStepWarning ||
+		record.Builders[0].SweepAmount != "" ||
+		record.Builders[1].SweepStatus != ReportStepSuccess ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != sweepSubmitAttempts ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder-2") != 1 ||
+		!fx.chain.balances["0xsettlement"].Equal(decimal.RequireFromString("1.25")) {
+		t.Fatalf("builders=%#v balances=%v events=%v",
+			record.Builders, fx.chain.balances, fx.chain.events)
+	}
+}
+
+func TestAcceptedSweepContinuesToNextBuilder(t *testing.T) {
+	fx := newFixture(t)
+	orchestrator := newTwoBuilderOrchestrator(t, fx)
+
+	if err := orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record := fx.store.consolidations["2026-07-12"]
+	if len(record.Builders) != 2 ||
+		record.Builders[0].SweepStatus != ReportStepSuccess ||
+		record.Builders[1].SweepStatus != ReportStepSuccess ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder-2") != 1 ||
+		!fx.chain.balances["0xsettlement"].Equal(decimal.RequireFromString("2.75")) {
+		t.Fatalf("builders=%#v balances=%v events=%v",
+			record.Builders, fx.chain.balances, fx.chain.events)
+	}
+}
+
+func TestAcceptedSweepDoesNotExposePreSubmitBalanceAsFinal(t *testing.T) {
+	fx := newFixture(t)
+	report, err := fx.orchestrator.runConsolidation(
+		context.Background(), TriggerConsolidateOnly, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Builders) != 1 || report.Builders[0].SweepStatus != ReportStepSuccess ||
+		report.Builders[0].FinalTotal != "" || report.Builders[0].FinalAvailable != "" {
+		t.Fatalf("builder report = %#v", report.Builders)
+	}
+}
+
+func TestUncertainClaimRejectsStaleLowBaselineAndUnchangedClaimable(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimResult = exchange.SubmitResult{}
+	fx.chain.balances["0xbuilder"] = decimal.NewFromInt(2)
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{
+		{Total: decimal.Zero, Available: decimal.Zero}, // Historical pre-claim baseline.
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if !builder.ClaimUncertain || builder.ClaimStatus != ReportStepWarning ||
+		countString(fx.chain.events, "submit:claimRewards:0xbuilder") != 1 {
+		t.Fatalf("stale-baseline claim = %#v, events=%v", builder, fx.chain.events)
 	}
 }
 
@@ -393,8 +674,7 @@ func TestRejectedSweepDoesNotRetry(t *testing.T) {
 	}
 	builder := fx.store.consolidations["2026-07-12"].Builders[0]
 	if builder.SweepStatus != ReportStepWarning ||
-		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 ||
-		countDelay(fx.sleeper.delays, sweepSubmitRetryInterval) != 0 {
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 {
 		t.Fatalf("rejected sweep = %#v, events=%v delays=%v", builder, fx.chain.events, fx.sleeper.delays)
 	}
 }
@@ -444,6 +724,82 @@ func TestUnderfundedFundingRetryDoesNotFallBackToBuilderActions(t *testing.T) {
 	}
 }
 
+func TestPayoutPreflightRetriesStaleUnderfundedBalance(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	funded := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5"),
+	}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{zero, zero, funded}
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if countString(fx.chain.events, "submit:spotSend:0xsettlement") != 1 ||
+		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
+		t.Fatalf("events=%v completed=%v", fx.chain.events, fx.repo.completedIDs)
+	}
+	if report := onlyReport(t, fx.notifier); report.Payout.SettlementTotalBefore != "1.5" {
+		t.Fatalf("payout total before = %q, want final funded sample", report.Payout.SettlementTotalBefore)
+	}
+}
+
+func TestPayoutPreflightRetriesQueryErrorBeforeFundedBalance(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.chain.balanceErrorSequence["0xsettlement"] = []error{
+		errors.New("temporary info failure"), nil,
+	}
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if countString(fx.chain.events, "submit:spotSend:0xsettlement") != 1 ||
+		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
+		t.Fatalf("events=%v completed=%v", fx.chain.events, fx.repo.completedIDs)
+	}
+	if report := onlyReport(t, fx.notifier); report.Payout.SettlementTotalBefore != "1.5" {
+		t.Fatalf("payout total before = %q, want final funded sample", report.Payout.SettlementTotalBefore)
+	}
+}
+
+func TestPayoutIsNotSubmittedWithoutRecipientBalanceBaseline(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.chain.balanceErrors["0xrecipient"] = errors.New("recipient info unavailable")
+
+	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
+	if err == nil || containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
+		t.Fatalf("Run() error=%v events=%v", err, fx.chain.events)
+	}
+	if fx.store.current == nil || fx.store.current.Phase != PhasePrepared ||
+		fx.store.current.Payout != nil {
+		t.Fatalf("current = %#v", fx.store.current)
+	}
+}
+
+func TestPayoutRecipientBaselineMustStabilizeBeforeSubmit(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.chain.balances["0xrecipient"] = decimal.NewFromInt(5)
+	fx.chain.balanceSequence["0xrecipient"] = []info.SpotBalanceAmounts{
+		{Total: decimal.Zero, Available: decimal.Zero},
+		{Total: decimal.NewFromInt(5), Available: decimal.NewFromInt(5)},
+		{Total: decimal.NewFromInt(5), Available: decimal.NewFromInt(5)},
+	}
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if fx.chain.balanceCalls["0xrecipient"] < 3 ||
+		fx.store.archived.Payout == nil ||
+		fx.store.archived.Payout.RecipientTotalBefore != "5" {
+		t.Fatalf("recipient calls=%d archived payout=%#v",
+			fx.chain.balanceCalls["0xrecipient"], fx.store.archived.Payout)
+	}
+}
+
 func TestClaimableBelowPayoutWarnsWithoutBlockingFundedPayout(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString("1.4")
@@ -465,7 +821,7 @@ func TestClaimableBelowPayoutWarnsWithoutBlockingFundedPayout(t *testing.T) {
 	}
 }
 
-func TestUncertainClaimRetriesWithoutChangingClaimableReconciliation(t *testing.T) {
+func TestUncertainClaimIsObservedWithoutResubmission(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.claimResult = exchange.SubmitResult{}
 	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
@@ -474,9 +830,11 @@ func TestUncertainClaimRetriesWithoutChangingClaimableReconciliation(t *testing.
 	record := fx.store.consolidations["2026-07-12"]
 	if len(record.Builders) != 1 || !record.Builders[0].ClaimUncertain ||
 		record.Builders[0].ClaimableUSDC != "1.5" ||
-		record.Builders[0].ClaimAttempts != claimSubmitAttempts {
+		record.Builders[0].ClaimAttempts != 1 ||
+		countString(fx.chain.events, "submit:claimRewards:0xbuilder") != 1 {
 		t.Fatalf("uncertain daily consolidation = %#v", record)
 	}
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
 	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
 	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
 		t.Fatal(err)
@@ -484,7 +842,7 @@ func TestUncertainClaimRetriesWithoutChangingClaimableReconciliation(t *testing.
 	report := onlyReport(t, fx.notifier)
 	if report.DailyConsolidation.UncertainClaims != 1 ||
 		!report.DailyConsolidation.CoversPayout || report.DailyConsolidation.BelowPayout ||
-		!containsString(report.Warnings, "UTC 00:00 有 1 个 Builder 的 claim 在有限重试后结果仍不确定，请人工核查") {
+		!containsString(report.Warnings, "UTC 00:00 有 1 个 Builder 的 claim 在有限观察后结果仍不确定，请人工核查") {
 		t.Fatalf("uncertain claim report = %#v", report)
 	}
 }
@@ -557,7 +915,7 @@ func TestConsolidateOnlyDoesNotReadOrWriteDailyRecord(t *testing.T) {
 func TestDailyConsolidationUsesOneSharedClaimVisibilityWait(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
-	fx.chain.balances["0xbuilder-2"] = decimal.RequireFromString("1.25")
+	fx.chain.balances["0xbuilder-2"] = decimal.Zero
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
 		Repository: fx.repo, Store: fx.store, DailyConsolidations: fx.store, Chain: fx.chain,
 		Notifier: fx.notifier, Logger: fx.logger,
@@ -573,7 +931,10 @@ func TestDailyConsolidationUsesOneSharedClaimVisibilityWait(t *testing.T) {
 	if err := orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if countDelay(fx.sleeper.delays, claimBalanceObservationInterval) != 1 {
+	// One shared claim-baseline wait, two shared claim-visibility waits and one
+	// stable pre-sweep wait per Builder. Accepted internal sweeps do not perform
+	// a post-submit balance observation.
+	if countDelay(fx.sleeper.delays, claimBalanceObservationInterval) != 5 {
 		t.Fatalf("claim visibility waits = %v", fx.sleeper.delays)
 	}
 	if len(fx.chain.events) != 4 ||
@@ -587,12 +948,132 @@ func TestDailyConsolidationUsesOneSharedClaimVisibilityWait(t *testing.T) {
 	}
 }
 
+func TestClaimVisibilityRequiresIncreaseFromPreClaimTotal(t *testing.T) {
+	fx := newFixture(t)
+	preClaim := info.SpotBalanceAmounts{
+		Total: decimal.NewFromInt(2), Available: decimal.NewFromInt(2),
+	}
+	postClaim := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("3.5"), Available: decimal.RequireFromString("3.5"),
+	}
+	fx.chain.balances["0xbuilder"] = preClaim.Total
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{
+		preClaim, // Pre-claim baseline.
+		preClaim, // Stale values that already exceed the 1.5 claimable amount.
+		preClaim,
+		postClaim,
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.ClaimStatus != ReportStepSuccess || builder.ClaimUncertain ||
+		builder.SweepStatus != ReportStepSuccess || builder.SweepAmount != "3.5" ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 {
+		t.Fatalf("relative claim visibility builder=%#v events=%v", builder, fx.chain.events)
+	}
+}
+
+func TestSweepReloadsStableSourceAfterClaimObservation(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.balances["0xbuilder"] = decimal.RequireFromString("0.5")
+	preClaim := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	claimVisible := info.SpotBalanceAmounts{
+		Total:     decimal.RequireFromString("1.5"),
+		Available: decimal.RequireFromString("1.5"),
+	}
+	freshSource := info.SpotBalanceAmounts{
+		Total: decimal.NewFromInt(2), Available: decimal.NewFromInt(2),
+	}
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{
+		preClaim, preClaim,
+		claimVisible, claimVisible,
+		freshSource, freshSource,
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepAmount != "2" || builder.SweepStatus != ReportStepSuccess ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 {
+		t.Fatalf("fresh source sweep=%#v events=%v", builder, fx.chain.events)
+	}
+}
+
+func TestSweepSourceCannotRegressBelowConfirmedClaimBalance(t *testing.T) {
+	fx := newFixture(t)
+	preClaim := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	postClaim := info.SpotBalanceAmounts{
+		Total:     decimal.RequireFromString("1.5"),
+		Available: decimal.RequireFromString("1.5"),
+	}
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{
+		preClaim, preClaim,
+		postClaim, postClaim,
+		preClaim, preClaim, // A stable historical regression before sweep.
+		postClaim, postClaim,
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepAmount != "1.5" || builder.SweepStatus != ReportStepSuccess ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 {
+		t.Fatalf("regressed source sweep=%#v events=%v", builder, fx.chain.events)
+	}
+}
+
+func TestClaimVisibilityAcceptsCreditAboveCapturedMinimum(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString("1.5000009")
+	fx.chain.holds["0xbuilder"] = decimal.RequireFromString("0.0000009")
+	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	fx.chain.balanceSequence["0xbuilder"] = []info.SpotBalanceAmounts{zero, zero}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.ClaimStatus != ReportStepSuccess || builder.ClaimUncertain ||
+		builder.SweepAmount != "1.5" {
+		t.Fatalf("high-precision claim builder=%#v", builder)
+	}
+}
+
+func TestAcceptedClaimCanRemainVisibleWhenRewardsRefillImmediately(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableAfterClaim = map[string]decimal.Decimal{
+		"0xbuilder": decimal.RequireFromString("1.5"),
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.ClaimStatus != ReportStepSuccess || builder.ClaimUncertain ||
+		builder.SweepStatus != ReportStepSuccess || builder.SweepAmount != "1.5" ||
+		fx.chain.claimableCalls["0xbuilder"] != 1 {
+		t.Fatalf("refilled claim builder=%#v calls=%d",
+			builder, fx.chain.claimableCalls["0xbuilder"])
+	}
+}
+
 func TestClaimVisibilityExhaustionStillRecordsBestEffortSweep(t *testing.T) {
 	fx := newFixture(t)
+	// After the accepted claim the authoritative balance is the same latest
+	// value returned throughout the exhausted visibility window.
+	fx.chain.balances["0xbuilder"] = decimal.RequireFromString("0.5")
+	fx.chain.holds["0xbuilder"] = decimal.RequireFromString("1.5")
 	latest := info.SpotBalanceAmounts{
 		Total: decimal.RequireFromString("2"), Available: decimal.RequireFromString("0.5"),
 	}
-	fx.chain.balanceSequence["0xbuilder"] = make([]info.SpotBalanceAmounts, claimBalanceObservationAttempts)
+	fx.chain.balanceSequence["0xbuilder"] = make(
+		[]info.SpotBalanceAmounts,
+		claimBaselineRequiredConfirmations+claimBalanceObservationAttempts,
+	)
 	for index := range fx.chain.balanceSequence["0xbuilder"] {
 		fx.chain.balanceSequence["0xbuilder"][index] = latest
 	}
@@ -600,11 +1081,82 @@ func TestClaimVisibilityExhaustionStillRecordsBestEffortSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	builder := fx.store.consolidations["2026-07-12"].Builders[0]
-	if builder.SweepAmount != "0.5" || builder.SweepStatus != ReportStepWarning {
+	if builder.ClaimStatus != ReportStepWarning ||
+		builder.ClaimSummary != "Reward 请求已接受，但余额未确认刷新" ||
+		builder.SweepAmount != "0.5" || builder.SweepStatus != ReportStepWarning {
 		t.Fatalf("daily builder = %#v", builder)
 	}
-	if fx.chain.balanceCalls["0xbuilder"] != claimBalanceObservationAttempts {
+	if fx.chain.balanceCalls["0xbuilder"] !=
+		claimBaselineRequiredConfirmations+claimBalanceObservationAttempts+
+			sweepBalanceRequiredConfirmations {
 		t.Fatalf("balance calls = %d", fx.chain.balanceCalls["0xbuilder"])
+	}
+}
+
+func TestClaimVisibilityWarningSurvivesLaterSweepFailure(t *testing.T) {
+	fx := newFixture(t)
+	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	fx.chain.balanceSequence["0xbuilder"] = make(
+		[]info.SpotBalanceAmounts,
+		claimBaselineRequiredConfirmations+claimBalanceObservationAttempts,
+	)
+	for index := range fx.chain.balanceSequence["0xbuilder"] {
+		fx.chain.balanceSequence["0xbuilder"][index] = zero
+	}
+	fx.chain.balanceErrorSequence["0xbuilder"] = make(
+		[]error, claimBaselineRequiredConfirmations+claimBalanceObservationAttempts,
+	)
+	for range sweepBalanceQueryAttempts {
+		fx.chain.balanceErrorSequence["0xbuilder"] = append(
+			fx.chain.balanceErrorSequence["0xbuilder"], errors.New("builder info unavailable"),
+		)
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	entry := fx.store.consolidations["2026-07-12"].Builders[0]
+	if entry.ClaimStatus != ReportStepWarning ||
+		entry.ClaimSummary != "Reward 请求已接受，但余额未确认刷新" ||
+		entry.SweepStatus != ReportStepWarning ||
+		entry.SweepSummary != "余额查询失败" {
+		t.Fatalf("persisted builder = %#v", entry)
+	}
+	report := newRunReport(
+		fx.clock.now.Add(time.Hour), TriggerUTC, ReportExecution{}, "mainnet",
+		fx.orchestrator.builders, fx.orchestrator.builderNames,
+		"0xsettlement", "0xrecipient",
+	)
+	fx.orchestrator.attachDailyConsolidation(
+		context.Background(), &report, "2026-07-12",
+	)
+	if report.Builders[0].ClaimStatus != ReportStepWarning ||
+		!containsString(report.Warnings, "builder-1: Reward 请求已接受，但余额未确认刷新") ||
+		!containsString(report.Warnings, "builder-1: 余额查询失败") {
+		t.Fatalf("attached report = %#v", report)
+	}
+}
+
+func TestClaimVisibilityExhaustionWithZeroSourceKeepsWarning(t *testing.T) {
+	fx := newFixture(t)
+	zero := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	fx.chain.balanceSequence["0xbuilder"] = make(
+		[]info.SpotBalanceAmounts,
+		claimBaselineRequiredConfirmations+claimBalanceObservationAttempts+
+			sweepBalanceRequiredConfirmations,
+	)
+	for index := range fx.chain.balanceSequence["0xbuilder"] {
+		fx.chain.balanceSequence["0xbuilder"][index] = zero
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.SweepStatus != ReportStepWarning ||
+		builder.SweepSummary != "Reward 余额未确认刷新，当前无可归集余额" ||
+		builder.SweepAmount != "" {
+		t.Fatalf("zero-source unconverged claim = %#v", builder)
 	}
 }
 
@@ -622,6 +1174,8 @@ func TestPayoutUsesAvailableButUncertainConfirmationUsesTotal(t *testing.T) {
 	fx.chain.payoutResult = exchange.SubmitResult{}
 	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
 		{Total: decimal.NewFromInt(2), Available: decimal.NewFromInt(2)},
+		{Total: decimal.NewFromInt(2), Available: decimal.NewFromInt(2)},
+		{Total: decimal.NewFromInt(2), Available: decimal.NewFromInt(2)},
 		{Total: decimal.NewFromInt(2), Available: decimal.RequireFromString("0.4")},
 		{Total: decimal.NewFromInt(2), Available: decimal.RequireFromString("0.3")},
 		{Total: decimal.NewFromInt(2), Available: decimal.RequireFromString("0.2")},
@@ -632,6 +1186,12 @@ func TestPayoutUsesAvailableButUncertainConfirmationUsesTotal(t *testing.T) {
 	if err == nil || !IsFatal(err) || fx.store.current == nil || fx.store.current.Phase != PhaseBlocked {
 		t.Fatalf("available-only decrease error=%v current=%#v", err, fx.store.current)
 	}
+	report := onlyReport(t, fx.notifier)
+	if !report.SettlementBalance.PostPayoutUnconfirmed ||
+		report.SettlementBalance.Observed || report.SettlementBalance.Total != "" ||
+		report.SettlementBalance.Available != "" {
+		t.Fatalf("ambiguous payout ending balance = %#v", report.SettlementBalance)
+	}
 }
 
 func TestUnknownPayoutConfirmsOnlyAfterSettlementTotalDecreases(t *testing.T) {
@@ -639,6 +1199,15 @@ func TestUnknownPayoutConfirmsOnlyAfterSettlementTotalDecreases(t *testing.T) {
 	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
 	fx.chain.payoutResult = exchange.SubmitResult{}
 	fx.chain.applyUnknownPayout = true
+	before := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("1.5"), Available: decimal.RequireFromString("1.5"),
+	}
+	after := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
+		before, before, // Stable payout preflight.
+		before, // Stale pre-payout state observed after the ambiguous response.
+		after, after,
+	}
 	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +1216,7 @@ func TestUnknownPayoutConfirmsOnlyAfterSettlementTotalDecreases(t *testing.T) {
 		t.Fatalf("unknown applied payout current=%#v archive=%q", fx.store.current, fx.store.archiveResult)
 	}
 	report := onlyReport(t, fx.notifier)
-	if report.Payout.ConfirmationEvidence != "settlement_balance_decreased" {
+	if report.Payout.ConfirmationEvidence != "paired_balance_boundary" {
 		t.Fatalf("payout report = %#v", report.Payout)
 	}
 }
@@ -685,9 +1254,16 @@ func TestPayoutRecoveryNeverResubmitsUncertainState(t *testing.T) {
 	t.Run("submitting observes total decrease", func(t *testing.T) {
 		fx := newFixture(t)
 		state := fx.positiveState(t, PhasePayoutSubmitting)
-		state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 900), TotalBefore: "2"}
+		state.Payout = &PayoutJournal{
+			Prepared: validPayout(t, state, 900), TotalBefore: "2", RecipientTotalBefore: "0",
+		}
 		fx.store.current = &state
-		fx.chain.balances["0xsettlement"] = decimal.RequireFromString("0.5")
+		before := info.SpotBalanceAmounts{Total: decimal.NewFromInt(2), Available: decimal.NewFromInt(2)}
+		after := info.SpotBalanceAmounts{
+			Total: decimal.RequireFromString("0.5"), Available: decimal.RequireFromString("0.5"),
+		}
+		fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{before, after, after}
+		fx.chain.balances["0xrecipient"] = decimal.RequireFromString("1.5")
 		if err := fx.orchestrator.Recover(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -721,6 +1297,10 @@ func TestPayoutRecoveryNeverResubmitsUncertainState(t *testing.T) {
 		if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
 			t.Fatalf("events = %v", fx.chain.events)
 		}
+		if fx.store.archived.Payout == nil ||
+			fx.store.archived.Payout.RecipientTotalBefore != "0" {
+			t.Fatalf("legacy recipient boundary was not persisted: %#v", fx.store.archived.Payout)
+		}
 	})
 }
 
@@ -737,10 +1317,38 @@ func TestConfirmedPayoutRecoveryOnlyCompletesDatabase(t *testing.T) {
 	}
 }
 
+func TestConfirmedPayoutRecoveryFailsClosedWithoutValidJournal(t *testing.T) {
+	tests := []struct {
+		name    string
+		journal func(t *testing.T, state RunState) *PayoutJournal
+	}{
+		{name: "missing", journal: func(*testing.T, RunState) *PayoutJournal { return nil }},
+		{name: "invalid settlement boundary", journal: func(t *testing.T, state RunState) *PayoutJournal {
+			return &PayoutJournal{Prepared: validPayout(t, state, 905), TotalBefore: "bad"}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fx := newFixture(t)
+			state := fx.positiveState(t, PhasePayoutConfirmed)
+			state.Payout = test.journal(t, state)
+			fx.store.current = &state
+
+			err := fx.orchestrator.Recover(context.Background())
+			if err == nil || !IsFatal(err) || len(fx.repo.completedIDs) != 0 ||
+				fx.store.current == nil {
+				t.Fatalf("recovery error=%v completed=%v current=%#v",
+					err, fx.repo.completedIDs, fx.store.current)
+			}
+		})
+	}
+}
+
 func TestRecoveryUsesDailyConsolidationForPersistedUTCDate(t *testing.T) {
 	fx := newFixture(t)
 	state := fx.positiveState(t, PhasePayoutConfirmed)
 	state.UTCDate = "2026-07-11"
+	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 904), TotalBefore: "2"}
 	fx.store.current = &state
 	fx.store.consolidations = map[string]DailyConsolidation{
 		"2026-07-11": {
@@ -841,7 +1449,7 @@ type fixture struct {
 func newTwoBuilderOrchestrator(t *testing.T, fx *fixture) *Orchestrator {
 	t.Helper()
 	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
-	fx.chain.balances["0xbuilder-2"] = decimal.RequireFromString("1.25")
+	fx.chain.balances["0xbuilder-2"] = decimal.Zero
 	fx.chain.rateLimits["0xbuilder-2"] = info.UserRateLimit{NRequestsCap: 10_000}
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
 		Repository: fx.repo, Store: fx.store, DailyConsolidations: fx.store, Chain: fx.chain,
@@ -873,12 +1481,13 @@ func newFixture(t *testing.T) *fixture {
 		claimableErrors:        map[string]error{},
 		claimableErrorSequence: map[string][]error{},
 		balances: map[string]decimal.Decimal{
-			"0xbuilder": decimal.RequireFromString("1.5"), "0xsettlement": decimal.Zero,
+			"0xbuilder": decimal.Zero, "0xsettlement": decimal.Zero,
 		},
-		holds:           map[string]decimal.Decimal{},
-		balanceErrors:   map[string]error{},
-		balanceSequence: map[string][]info.SpotBalanceAmounts{},
-		balanceCalls:    map[string]int{},
+		holds:                map[string]decimal.Decimal{},
+		balanceErrors:        map[string]error{},
+		balanceErrorSequence: map[string][]error{},
+		balanceSequence:      map[string][]info.SpotBalanceAmounts{},
+		balanceCalls:         map[string]int{},
 		rateLimits: map[string]info.UserRateLimit{
 			"0xbuilder": {NRequestsCap: 10_000}, "0xsettlement": {NRequestsCap: 10_000},
 		},
@@ -1019,6 +1628,7 @@ type fakeChain struct {
 	tokenError             error
 	tokenCalls             int
 	claimableRewards       map[string]decimal.Decimal
+	claimableAfterClaim    map[string]decimal.Decimal
 	claimableErrors        map[string]error
 	claimableErrorSequence map[string][]error
 	claimableCalls         map[string]int
@@ -1027,6 +1637,7 @@ type fakeChain struct {
 	balances               map[string]decimal.Decimal
 	holds                  map[string]decimal.Decimal
 	balanceErrors          map[string]error
+	balanceErrorSequence   map[string][]error
 	balanceSequence        map[string][]info.SpotBalanceAmounts
 	balanceCalls           map[string]int
 	rateLimits             map[string]info.UserRateLimit
@@ -1040,9 +1651,11 @@ type fakeChain struct {
 	sweepResult            exchange.SubmitResult
 	sweepResults           map[string][]exchange.SubmitResult
 	applyUnknownSweep      bool
+	applyUnknownClaim      bool
 	payoutResult           exchange.SubmitResult
 	applyUnknownPayout     bool
 	events                 []string
+	submittedActions       []exchange.PreparedAction
 }
 
 func (c *fakeChain) CanonicalUSDC(context.Context) (info.Token, error) {
@@ -1100,6 +1713,13 @@ func (c *fakeChain) SpotBalance(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.balanceCalls[address]++
+	if sequence := c.balanceErrorSequence[address]; len(sequence) > 0 {
+		err := sequence[0]
+		c.balanceErrorSequence[address] = sequence[1:]
+		if err != nil {
+			return info.SpotBalanceAmounts{}, err
+		}
+	}
 	if err := c.balanceErrors[address]; err != nil {
 		return info.SpotBalanceAmounts{}, err
 	}
@@ -1167,25 +1787,36 @@ func (c *fakeChain) Submit(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = append(c.events, "submit:"+action.Kind+":"+action.Signer)
-	if c.trackRateLimitUsage {
-		limit := c.rateLimits[action.Signer]
-		limit.NRequestsUsed++
-		c.rateLimits[action.Signer] = limit
-	}
+	c.submittedActions = append(c.submittedActions, clonePrepared(action))
 	if action.Kind == "claimRewards" {
+		result := c.claimResult
 		if sequence := c.claimResults[action.Signer]; len(sequence) > 0 {
-			result := sequence[0]
+			result = sequence[0]
 			c.claimResults[action.Signer] = sequence[1:]
-			return result, nil
 		}
-		return c.claimResult, nil
+		if result.Accepted || (c.applyUnknownClaim && !result.Accepted && !result.Rejected) {
+			reward := c.claimableRewards[action.Signer]
+			c.balances[action.Signer] = c.balances[action.Signer].Add(reward)
+			c.claimableRewards[action.Signer] = decimal.Zero
+			if refill, exists := c.claimableAfterClaim[action.Signer]; exists {
+				c.claimableRewards[action.Signer] = refill
+			}
+			c.incrementRateLimitUsageLocked(action.Signer)
+		}
+		return result, nil
 	}
 	amount := decimal.RequireFromString(action.Amount)
 	if action.Signer == "0xsettlement" {
 		if c.payoutResult.Accepted || c.applyUnknownPayout {
 			c.balances[action.Signer] = c.balances[action.Signer].Sub(amount)
+			c.balances[action.Destination] = c.balances[action.Destination].Add(amount)
+			c.incrementRateLimitUsageLocked(action.Signer)
 		}
 		return c.payoutResult, nil
+	}
+	available := c.balances[action.Signer].Sub(c.holds[action.Signer])
+	if amount.GreaterThan(available) {
+		return exchange.SubmitResult{Rejected: true}, nil
 	}
 	result := c.sweepResult
 	if sequence := c.sweepResults[action.Signer]; len(sequence) > 0 {
@@ -1195,8 +1826,18 @@ func (c *fakeChain) Submit(
 	if result.Accepted || (c.applyUnknownSweep && !result.Accepted && !result.Rejected) {
 		c.balances[action.Signer] = c.balances[action.Signer].Sub(amount)
 		c.balances[action.Destination] = c.balances[action.Destination].Add(amount)
+		c.incrementRateLimitUsageLocked(action.Signer)
 	}
 	return result, nil
+}
+
+func (c *fakeChain) incrementRateLimitUsageLocked(address string) {
+	if !c.trackRateLimitUsage {
+		return
+	}
+	limit := c.rateLimits[address]
+	limit.NRequestsUsed++
+	c.rateLimits[address] = limit
 }
 
 type fakeSleeper struct{ delays []time.Duration }
@@ -1381,6 +2022,39 @@ func countString(values []string, want string) int {
 		}
 	}
 	return count
+}
+
+func assertDistinctSweepNonces(
+	t *testing.T,
+	actions []exchange.PreparedAction,
+	builder string,
+	want int,
+) {
+	t.Helper()
+	filtered := sweepActionsFor(actions, builder)
+	seen := make(map[uint64]struct{}, want)
+	for _, action := range filtered {
+		if _, duplicate := seen[action.Nonce]; duplicate {
+			t.Fatalf("sweep nonce %d was reused for %s", action.Nonce, builder)
+		}
+		seen[action.Nonce] = struct{}{}
+	}
+	if len(filtered) != want {
+		t.Fatalf("sweep actions for %s = %d, want %d", builder, len(filtered), want)
+	}
+}
+
+func sweepActionsFor(
+	actions []exchange.PreparedAction,
+	builder string,
+) []exchange.PreparedAction {
+	filtered := make([]exchange.PreparedAction, 0, len(actions))
+	for _, action := range actions {
+		if action.Kind == "spotSend" && strings.EqualFold(action.Signer, builder) {
+			filtered = append(filtered, action)
+		}
+	}
+	return filtered
 }
 
 func receiveWithin[T any](t *testing.T, values <-chan T) T {

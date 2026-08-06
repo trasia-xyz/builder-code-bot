@@ -103,6 +103,7 @@ func (o *Orchestrator) recoverState(
 	metadata StateLoadMetadata,
 	report *RunReport,
 ) (err error) {
+	markRecoveredPayoutSubmission(report, state, metadata)
 	o.info(ctx, "funding recovery started",
 		slog.String("event", "recovery_started"), slog.String("run_id", state.RunID),
 		slog.String("phase", string(state.Phase)),
@@ -130,14 +131,38 @@ func (o *Orchestrator) recoverState(
 		if metadata.RecoveredFromBackup {
 			return o.observeUncertainPayout(ctx, state, report)
 		}
+		if err := o.ensurePreparedPayoutRecipientBoundary(ctx, state, report); err != nil {
+			return err
+		}
 		return o.submitPreparedPayout(ctx, state, report)
 	case PhasePayoutSubmitting:
 		return o.observeUncertainPayout(ctx, state, report)
 	case PhasePayoutConfirmed:
+		if err := validateConfirmedPayoutState(state); err != nil {
+			markSettlementPayoutUnconfirmed(report)
+			report.Payout.Status = ReportStepFailed
+			report.Outcome = "blocked"
+			report.fail(
+				"payout",
+				"已确认 Payout 状态不完整，未更新数据库。",
+				"请保留 current 状态并核查 journal、request hash 与付款前余额边界。",
+			)
+			return &FatalError{Err: fmt.Errorf("validate confirmed payout state: %w", err)}
+		}
 		report.Payout.Status = ReportStepSuccess
 		report.setStage("payout", ReportStepSuccess, "已在此前执行中确认")
 		return o.completeDatabase(ctx, state, report)
 	case PhaseBlocked:
+		// An ambiguous payout remains safe to inspect again because recovery only
+		// reads settlement state and never resubmits the persisted request. This
+		// lets a balance index that lagged the original observation window heal on
+		// a later recovery while retaining the exactly-once boundary.
+		if isUncertainPayoutBlock(state) {
+			report.Outcome = "completed"
+			report.Payout.Status = ReportStepPending
+			report.setStage("payout", ReportStepPending, "重新只读核查不确定 Payout")
+			return o.observeUncertainPayout(ctx, state, report)
+		}
 		if state.BlockedReason == "" {
 			state.BlockedReason = "funding run is blocked"
 		}
@@ -151,6 +176,28 @@ func (o *Orchestrator) recoverState(
 		return &FatalError{Err: fmt.Errorf("%s", state.BlockedReason)}
 	default:
 		return fmt.Errorf("unsupported persisted funding phase %q", state.Phase)
+	}
+}
+
+func markRecoveredPayoutSubmission(
+	report *RunReport,
+	state *RunState,
+	metadata StateLoadMetadata,
+) {
+	if report == nil || state == nil || state.Payout == nil {
+		return
+	}
+	possiblySubmitted := false
+	switch state.Phase {
+	case PhasePayoutSubmitting, PhasePayoutConfirmed, PhaseBlocked:
+		possiblySubmitted = true
+	case PhasePayoutPrepared:
+		// A backup can be one durable boundary behind a primary from which
+		// Submit already started. A primary prepared state itself is safe.
+		possiblySubmitted = metadata.RecoveredFromBackup
+	}
+	if possiblySubmitted {
+		report.markSubmitted(state.Manifest.Settlement)
 	}
 }
 

@@ -49,3 +49,42 @@ func validatePreparedPayout(state *RunState, action exchange.PreparedAction) err
 	}
 	return nil
 }
+
+func validatePayoutJournal(state *RunState, requireRecipientBoundary bool) error {
+	if state == nil || state.Payout == nil {
+		return fmt.Errorf("payout journal is missing")
+	}
+	if err := validatePreparedPayout(state, state.Payout.Prepared); err != nil {
+		return err
+	}
+	before, err := decimal.NewFromString(state.Payout.TotalBefore)
+	if err != nil || before.IsNegative() {
+		return fmt.Errorf("payout settlement total-before boundary is invalid")
+	}
+	amount, err := decimal.NewFromString(state.Manifest.PayoutTotal)
+	if err != nil || !amount.IsPositive() {
+		return fmt.Errorf("payout amount is invalid")
+	}
+	if before.LessThan(amount) {
+		return fmt.Errorf("payout settlement total-before boundary is below payout amount")
+	}
+	recipientBefore := strings.TrimSpace(state.Payout.RecipientTotalBefore)
+	if recipientBefore == "" {
+		if requireRecipientBoundary {
+			return fmt.Errorf("payout recipient total-before boundary is missing")
+		}
+		return nil
+	}
+	recipient, err := decimal.NewFromString(recipientBefore)
+	if err != nil || recipient.IsNegative() {
+		return fmt.Errorf("payout recipient total-before boundary is invalid")
+	}
+	return nil
+}
+
+func validateConfirmedPayoutState(state *RunState) error {
+	// RecipientTotalBefore was introduced after the original journal format.
+	// Confirmed legacy states may omit it, but the request and settlement
+	// boundary must still be semantically complete before records are closed.
+	return validatePayoutJournal(state, false)
+}

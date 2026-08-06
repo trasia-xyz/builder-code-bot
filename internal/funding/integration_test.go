@@ -32,18 +32,33 @@ func TestIntegrationFundingFlow(t *testing.T) {
 	for _, test := range []struct {
 		name            string
 		ambiguousPayout bool
+		ambiguousSweep  bool
+		wantSweeps      int
 	}{
-		{name: "accepted payout"},
-		{name: "ambiguous applied payout confirmed by balance", ambiguousPayout: true},
+		{name: "accepted payout", wantSweeps: 2},
+		{name: "ambiguous unapplied internal sweep is retried", ambiguousSweep: true, wantSweeps: 3},
+		{name: "ambiguous applied payout confirmed by balance", ambiguousPayout: true, wantSweeps: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			env := newIntegrationEnvironment(t, test.ambiguousPayout)
+			env := newIntegrationEnvironment(t, test.ambiguousPayout, test.ambiguousSweep)
 			if err := env.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			consolidation, err := env.store.LoadDailyConsolidation(context.Background(), "2026-07-12")
 			if err != nil || consolidation == nil || len(consolidation.Builders) != 2 {
 				t.Fatalf("daily consolidation = %#v, error = %v", consolidation, err)
+			}
+			for index, builder := range consolidation.Builders {
+				wantStatus := funding.ReportStepSuccess
+				wantSummary := "资金已归集"
+				if test.ambiguousSweep && index == 0 {
+					wantStatus = funding.ReportStepWarning
+					wantSummary = "此前响应未知"
+				}
+				if builder.SweepStatus != wantStatus ||
+					!strings.Contains(builder.SweepSummary, wantSummary) {
+					t.Fatalf("builder sweep result = %#v", builder)
+				}
 			}
 			if err := env.orchestrator.Run(context.Background(), funding.TriggerRunOnStart); err != nil {
 				t.Fatal(err)
@@ -62,6 +77,15 @@ func TestIntegrationFundingFlow(t *testing.T) {
 			if got := env.balance(t, integrationRecipient); !got.Equal(env.payoutAmount) {
 				t.Fatalf("recipient balance = %s, want %s", got, env.payoutAmount)
 			}
+			if len(env.notifier.reports) != 1 {
+				t.Fatalf("final reports = %d, want 1", len(env.notifier.reports))
+			}
+			finalBalance := env.notifier.reports[0].SettlementBalance
+			wantFinal := decimal.NewFromInt(4).Sub(env.payoutAmount).String()
+			if !finalBalance.Observed || finalBalance.PostPayoutUnconfirmed ||
+				finalBalance.Total != wantFinal || finalBalance.Available != wantFinal {
+				t.Fatalf("final settlement balance = %#v, want %s", finalBalance, wantFinal)
+			}
 
 			var claims, sweeps, payouts int
 			for _, request := range env.server.Requests() {
@@ -74,8 +98,18 @@ func TestIntegrationFundingFlow(t *testing.T) {
 					payouts++
 				}
 			}
-			if claims != 2 || sweeps != 2 || payouts != 1 {
+			if claims != 2 || sweeps != test.wantSweeps || payouts != 1 {
 				t.Fatalf("claims=%d sweeps=%d payouts=%d", claims, sweeps, payouts)
+			}
+			for _, account := range append(append([]string(nil), env.builders...), env.settlement) {
+				if pending := env.server.PendingSpotBalanceSnapshots(account, "USDC:0"); pending != 0 {
+					t.Fatalf("pending stale balance snapshots for %s = %d", account, pending)
+				}
+				if reads := env.server.AuthoritativeSpotBalanceReadsAfterSnapshots(
+					account, "USDC:0",
+				); reads < 2 {
+					t.Fatalf("authoritative balance reads for %s = %d, want at least 2", account, reads)
+				}
 			}
 		})
 	}
@@ -86,13 +120,18 @@ type integrationEnvironment struct {
 	repository   *integrationRepository
 	store        *state.Store
 	orchestrator *funding.Orchestrator
+	notifier     *integrationNotifier
 	info         *info.Client
 	settlement   string
+	builders     []string
 	dataDir      string
 	payoutAmount decimal.Decimal
 }
 
-func newIntegrationEnvironment(t *testing.T, ambiguousPayout bool) *integrationEnvironment {
+func newIntegrationEnvironment(
+	t *testing.T,
+	ambiguousPayout, ambiguousSweep bool,
+) *integrationEnvironment {
 	t.Helper()
 	server := hyperliquidmock.New(t)
 	signers := make(map[string]signing.PrivateKey)
@@ -133,20 +172,28 @@ func newIntegrationEnvironment(t *testing.T, ambiguousPayout bool) *integrationE
 	chain := &integrationChain{
 		info: info.New(transport), exchange: exchangeClient, server: server,
 		settlement: addresses[2], ambiguousPayout: ambiguousPayout,
+		ambiguousSweep:    ambiguousSweep,
+		delayedVisibility: true,
+		token: info.Token{
+			Name: "USDC", TokenID: "0", Index: 0, WeiDecimals: 6, WireToken: "USDC:0",
+		},
 	}
 	clock := fixedIntegrationClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
+	notifier := &integrationNotifier{}
 	orchestrator, err := funding.NewOrchestrator(funding.OrchestratorConfig{
 		Repository: repository, Store: store, DailyConsolidations: store, Chain: chain,
 		Builders:   []string{addresses[0], addresses[1]},
 		Settlement: addresses[2], Recipient: integrationRecipient,
-		Clock: clock, Nonce: signing.NewNonceGenerator(), Sleeper: noWaitSleeper{},
+		Notifier: notifier, Clock: clock, Nonce: signing.NewNonceGenerator(), Sleeper: noWaitSleeper{},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &integrationEnvironment{
 		server: server, repository: repository, store: store, orchestrator: orchestrator,
-		info: info.New(transport), settlement: addresses[2], dataDir: dataDir,
+		notifier: notifier,
+		info:     info.New(transport), settlement: addresses[2], dataDir: dataDir,
+		builders:     append([]string(nil), addresses[:2]...),
 		payoutAmount: decimal.RequireFromString("3.123457"),
 	}
 }
@@ -162,11 +209,14 @@ func (e *integrationEnvironment) balance(t *testing.T, address string) decimal.D
 }
 
 type integrationChain struct {
-	info            *info.Client
-	exchange        *exchange.Client
-	server          *hyperliquidmock.Server
-	settlement      string
-	ambiguousPayout bool
+	info              *info.Client
+	exchange          *exchange.Client
+	server            *hyperliquidmock.Server
+	settlement        string
+	ambiguousPayout   bool
+	ambiguousSweep    bool
+	delayedVisibility bool
+	token             info.Token
 }
 
 func (c *integrationChain) CanonicalUSDC(ctx context.Context) (info.Token, error) {
@@ -188,11 +238,47 @@ func (c *integrationChain) PrepareSpotSend(address, destination string, token in
 	return c.exchange.PrepareSpotSend(address, destination, token, amount, nonce)
 }
 func (c *integrationChain) Submit(ctx context.Context, action exchange.PreparedAction) (exchange.SubmitResult, error) {
+	var before info.SpotBalanceAmounts
+	if c.delayedVisibility {
+		var err error
+		before, err = c.info.SpotBalance(ctx, action.Signer, c.token)
+		if err != nil {
+			return exchange.SubmitResult{}, err
+		}
+	}
+	ambiguousApplied := false
+	if c.ambiguousSweep && action.Kind == "spotSend" &&
+		!strings.EqualFold(action.Signer, c.settlement) {
+		c.server.FailNextExchange(hyperliquidmock.FailureAmbiguous)
+		c.ambiguousSweep = false
+	}
 	if c.ambiguousPayout && strings.EqualFold(action.Signer, c.settlement) {
 		c.server.FailNextExchange(hyperliquidmock.FailureAmbiguousApplied)
 		c.ambiguousPayout = false
+		ambiguousApplied = true
 	}
-	return c.exchange.Submit(ctx, action)
+	result, err := c.exchange.Submit(ctx, action)
+	observeAfterSubmit := action.Kind == "claimRewards" ||
+		strings.EqualFold(action.Signer, c.settlement)
+	if c.delayedVisibility && observeAfterSubmit && (result.Accepted || ambiguousApplied) {
+		hold := before.Total.Sub(before.Available).String()
+		for range 2 {
+			c.server.QueueSpotBalanceSnapshot(
+				action.Signer, c.token.WireToken, before.Total.String(), hold,
+			)
+		}
+	}
+	return result, err
+}
+
+type integrationNotifier struct {
+	reports []funding.RunReport
+}
+
+func (*integrationNotifier) Alert(context.Context, string, funding.AlertSeverity, string) {}
+
+func (n *integrationNotifier) Report(_ context.Context, report funding.RunReport) {
+	n.reports = append(n.reports, report)
 }
 
 type integrationRepository struct {

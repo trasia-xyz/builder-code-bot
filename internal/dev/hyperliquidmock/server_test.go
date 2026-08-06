@@ -65,6 +65,7 @@ func TestServerAppliesSpotSendOnceForSameSignedRequest(t *testing.T) {
 	server := New(t)
 	client, signer := newExchangeClient(t, server.URL)
 	server.SetSpotBalance(signer, "USDC:0", "5")
+	server.SetUserRateLimit(signer, 0, 10_000)
 	action, err := client.PrepareSpotSend(signer, "0x00000000000000000000000000000000000000aa", testToken(), decimal.RequireFromString("2.25"), 1001)
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +80,9 @@ func TestServerAppliesSpotSendOnceForSameSignedRequest(t *testing.T) {
 
 	assertBalance(t, server, signer, "2.75")
 	assertBalance(t, server, "0x00000000000000000000000000000000000000aa", "2.25")
+	if limit := queryRateLimit(t, server, signer); limit.NRequestsUsed != 1 {
+		t.Fatalf("rate limit after idempotent replay = %+v, want one applied action", limit)
+	}
 	requests := server.Requests()
 	exchangeRequests := 0
 	for _, request := range requests {
@@ -88,6 +92,129 @@ func TestServerAppliesSpotSendOnceForSameSignedRequest(t *testing.T) {
 	}
 	if exchangeRequests != 2 {
 		t.Fatalf("requests = %#v", requests)
+	}
+}
+
+func TestServerQueuesStaleSpotBalanceSnapshotsBeforeCommittedState(t *testing.T) {
+	server := New(t)
+	client, signer := newExchangeClient(t, server.URL)
+	server.SetSpotBalance(signer, "USDC:0", "5")
+	server.QueueSpotBalanceSnapshot(signer, "USDC:0", "5", "0")
+	server.QueueSpotBalanceSnapshot(signer, "USDC:0", "5", "0")
+	if pending := server.PendingSpotBalanceSnapshots(signer, "USDC:0"); pending != 2 {
+		t.Fatalf("pending snapshots = %d, want 2", pending)
+	}
+
+	action, err := client.PrepareSpotSend(
+		signer,
+		"0x00000000000000000000000000000000000000aa",
+		testToken(),
+		decimal.NewFromInt(2),
+		1008,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := client.Submit(context.Background(), action); err != nil || !result.Accepted {
+		t.Fatalf("Submit() = %#v, %v", result, err)
+	}
+
+	assertBalance(t, server, signer, "5")
+	if pending := server.PendingSpotBalanceSnapshots(signer, "USDC:0"); pending != 1 {
+		t.Fatalf("pending snapshots after first read = %d, want 1", pending)
+	}
+	assertBalance(t, server, signer, "5")
+	assertBalance(t, server, signer, "3")
+	if pending := server.PendingSpotBalanceSnapshots(signer, "USDC:0"); pending != 0 {
+		t.Fatalf("pending snapshots after observer = %d, want 0", pending)
+	}
+	if reads := server.AuthoritativeSpotBalanceReadsAfterSnapshots(signer, "USDC:0"); reads != 1 {
+		t.Fatalf("authoritative reads after snapshots = %d, want 1", reads)
+	}
+}
+
+func TestServerAppliedExchangeActionsAdvanceRateLimitAfterQueuedStaleSnapshot(t *testing.T) {
+	tests := []struct {
+		name string
+		mode FailureMode
+	}{
+		{name: "accepted", mode: failureNone},
+		{name: "ambiguous applied", mode: FailureAmbiguousApplied},
+		{name: "HTTP error applied", mode: FailureHTTPErrorApplied},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := New(t)
+			client, signer := newExchangeClient(t, server.URL)
+			server.SetSpotBalance(signer, "USDC:0", "5")
+			server.SetUserRateLimit(signer, 800, 1000)
+			server.QueueUserRateLimitSnapshot(signer, 800, 1000)
+			if tt.mode != failureNone {
+				server.FailNextExchange(tt.mode)
+			}
+
+			action, err := client.PrepareSpotSend(
+				signer,
+				"0x00000000000000000000000000000000000000aa",
+				testToken(),
+				decimal.NewFromInt(1),
+				1009,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, submitErr := client.Submit(context.Background(), action)
+			if tt.mode == failureNone {
+				if submitErr != nil || !result.Accepted {
+					t.Fatalf("Submit() = %#v, %v", result, submitErr)
+				}
+			} else if submitErr == nil || result.Accepted || result.Rejected {
+				t.Fatalf("Submit() = %#v, %v, want uncertain", result, submitErr)
+			}
+
+			stale := queryRateLimit(t, server, signer)
+			if stale.NRequestsUsed != 800 || stale.RemainingRequests() != 200 {
+				t.Fatalf("stale rate limit = %+v", stale)
+			}
+			visible := queryRateLimit(t, server, signer)
+			if visible.NRequestsUsed != 801 || visible.RemainingRequests() != 199 {
+				t.Fatalf("authoritative rate limit = %+v", visible)
+			}
+		})
+	}
+}
+
+func TestServerUnappliedExchangeActionsDoNotAdvanceRateLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		mode FailureMode
+	}{
+		{name: "rejected", mode: FailureRejected},
+		{name: "ambiguous unapplied", mode: FailureAmbiguous},
+		{name: "HTTP error unapplied", mode: FailureHTTPError},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := New(t)
+			client, signer := newExchangeClient(t, server.URL)
+			server.SetSpotBalance(signer, "USDC:0", "5")
+			server.SetUserRateLimit(signer, 800, 1000)
+			server.FailNextExchange(tt.mode)
+
+			action, err := client.PrepareSpotSend(
+				signer,
+				"0x00000000000000000000000000000000000000aa",
+				testToken(),
+				decimal.NewFromInt(1),
+				1010,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = client.Submit(context.Background(), action)
+			if limit := queryRateLimit(t, server, signer); limit.NRequestsUsed != 800 {
+				t.Fatalf("rate limit after unapplied request = %+v", limit)
+			}
+		})
 	}
 }
 
@@ -250,4 +377,20 @@ func assertBalance(t *testing.T, server *Server, address, want string) {
 	if !got.Available.Equal(decimal.RequireFromString(want)) {
 		t.Fatalf("balance for %s = %s, want %s", address, got.Available, want)
 	}
+}
+
+func queryRateLimit(t *testing.T, server *Server, address string) info.UserRateLimit {
+	t.Helper()
+	transport, err := httpclient.New(httpclient.Config{
+		Network: hyperliquid.NetworkTestnet,
+		BaseURL: server.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := info.New(transport).UserRateLimit(context.Background(), address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
 }

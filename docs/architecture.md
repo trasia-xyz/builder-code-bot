@@ -14,14 +14,21 @@
 1. 查询 canonical USDC。
 2. 并行查询所有 builder 的 canonical-USDC claimable reward；仅重试失败项。
 3. 将零点 claimable 以 `claimables_captured` 原子写入当日文件；落盘成功后才继续。
-4. 对符合条件的 builder 并行提交 `claimRewards`；结果不确定时换新 nonce 有限次重试。
-5. 等待已提交 claim 的 spot 余额可见，再把每个 builder 正 available 余额全部 sweep 到
-   settlement。
-6. 将 claim/sweep 结果写回当日文件，状态更新为 `completed`。
+4. 连续两次查询符合条件的 builder 的 claim 前 `Total/Available` 稳定基线；基线无法取得时不提交
+   claim。
+5. 并行提交一次 `claimRewards`。结果不确定时不换 nonce 重发，只观察动作关联状态。
+6. Claimable 已捕获时，将其按 token 精度截断为最低增量，要求 claim 后 `Total` 不低于基线加
+   该增量；同一完整余额连续两次满足才视为已刷新。明确接受的响应作为动作证据；不确定提交还
+   必须先在提交后看到完整的 claim 前余额并看到 `ClaimableUSDC` 明确下降。Claimable 缺失时，
+   Total-only 不能解除不确定状态。
+7. 每笔 sweep 前重新连续读取稳定的 builder `Total/Available`，按最新 available 提交。明确接受
+   后直接完成该 builder，不立即查询余额。结果不确定时等待后重读稳定的当前 Available，并用新
+   nonce 最多提交三次；该 builder 最终失败也不阻断其他 builder。
+8. 将 claim/sweep 结果写回当日文件，状态更新为 `completed`。
 
 零点 claimable 是与数据库 payout 对账的唯一数值基准；claim 接受状态是独立的执行结果。
-某个 builder 的 claimable 查询全部失败时标记为数据缺失，仍会尝试 claim，但当日不能得出完整
-数值对账结论。Claim 在有限重试后仍不确定时保留 warning，不会改写已落盘的零点 claimable，
+某个 builder 的 claimable 查询全部失败时标记为数据缺失，在取得余额基线后仍会尝试一次 claim，
+但当日不能得出完整数值对账结论。Claim 在有限观察后仍不确定时保留 warning，不会改写已落盘的零点 claimable，
 也不阻止其他已捕获数据参与合计。
 
 ### UTC 01:00：数据库 Payout
@@ -30,7 +37,8 @@
 
 1. 从 MySQL 冻结全部 `status = 0` records。
 2. 计算精确 raw total 和六位向上取整的 payout total。
-3. 查询 settlement available；余额充足时向固定 recipient 发送唯一一笔 payout。
+3. 连续读取稳定的 settlement `Total/Available` 与 recipient `Total` 基线；余额充足时向固定 recipient
+   发送唯一一笔 payout。
 4. payout 确认后将冻结 records 标记完成。
 5. 读取同一 UTC 日期的零点归集记录，生成最终报告。
 
@@ -44,15 +52,25 @@ Claimable 只取 referral info 中 canonical USDC 对应项的 `unclaimedRewards
 查询最终失败，因无法判断阈值，为避免漏领会执行一次受相同上限保护的 claim，同时将对账数据
 标记为不完整。
 
-同一轮 builder claim 并行提交，各 builder 重试状态独立。一次不确定提交之后，后续明确拒绝
-仍不能证明首次未执行，整体保持不确定；任一次明确接受则确认完成。若存在已接受或仍不确定的
-claim，等待余额可见后再按最新 available 归集到 settlement。Sweep 对每个 builder 有限次重试：
-明确接受即停止；无更早不确定结果时明确拒绝不重试；结果不确定时换新 nonce 重试，并在重试前
-重新读取 available——若余额已清空则视为上次不确定提交已生效。Sweep 仍只移动运营方控制账户间
-资金，不使用 payout journal，也不触及 settlement→recipient 付款。
+同一轮 builder claim 并行且每个 builder 只提交一次。明确接受证明 claim 动作成功，程序再等待
+相对 `Total` 下界连续成立；后续新 Reward 立即回补不会把已接受动作误报为失败。不确定结果还要求
+先看到提交后的 claim 前完整余额与 Claimable 下降，不再换 nonce。观察耗尽时将 Claim 本身持久化
+为 warning，并按最后可见余额做 best-effort 归集，不能冒充 Reward 已完整可见。
 
-零点任务与 `--consolidate-only` 共用同一套 claim、可见性等待和有限次 sweep。单账户 claim/sweep
-失败会告警，但不阻止其他 builder。
+Sweep 金额使用提交前重新稳定读取的 `Available`。明确接受的响应直接确认本次内部归集，不再执行
+容易读到旧快照的提交后余额查询。Builder 与 settlement 都是运营方账户，因此不确定 sweep 可以
+有限重试：每次先等待，再重读连续稳定的 Builder 余额，按最新正 Available 和新 nonce 提交。若重读
+得到低于上一笔不确定 amount 的余额，为避免历史低值快照造成部分归集或漏归集，会至少使用上一笔
+不确定请求的 amount 再试一次；若此前已成功，该请求只会因余额不足被拒绝，不会产生对外资金风险。
+
+首次明确拒绝不重试；出现过不确定响应后，后续拒绝不能反证此前请求未执行，因此在剩余次数内继续。
+三次后仍无明确接受则保留 warning，且不虚构 SweepAmount。若后续重试明确接受，也保留 warning：
+SweepAmount 只记录该次 accepted 金额，此前不确定请求是否入账及累计归集金额仍无法确认。任一 builder
+的失败都不阻断其他 builder。Claim 已确认的 builder `Total` 仅作为首次 sweep 查询的下界；进入
+不确定重试后允许余额下降。
+
+零点任务与 `--consolidate-only` 共用同一套 claim 可见性边界和内部 sweep 有限重试。Payout 不使用
+这套重试规则，仍严格禁止对不确定请求重发。
 
 ## 3. `--consolidate-only` 隔离
 
@@ -67,10 +85,16 @@ Spot 查询返回：
 - `Total`：链上 spot 总余额；
 - `Available = Total - Hold`：当前可发送余额。
 
-Builder sweep 金额和 payout 资金充足性使用 `Available`。Payout journal 保存提交前 settlement
-`Total`；结果不确定时只比较 `TotalAfter < TotalBefore`。Hold 变化不视为付款成功。
+Builder sweep 金额和 payout 资金充足性使用 `Available`。Payout 提交前必须连续取得稳定的
+settlement `Total/Available` 与 recipient `Total` 基线；journal 同时保存 settlement
+与 recipient 的提交前 total。结果不确定时，先要求
+提交后看见 settlement 前态，再连续两次同时满足：settlement `Total == TotalBefore - Amount`，
+recipient `Total == RecipientTotalBefore + Amount`。Hold 变化、任意单边或较低历史快照都不视为
+付款成功。
 
 该确认规则要求 settlement 为本服务专用出账账户，人工或其他程序不得从该账户发送 spot USDC。
+观察窗口内若 settlement 或 recipient 出现并发入账，精确边界可能无法成立，系统会保守保持
+blocked 而不会把数据库 records 标记完成；此时按运维流程人工核查。
 
 ## 5. Records 与金额
 
@@ -88,18 +112,22 @@ Settlement → recipient 是唯一对外资金边界，也是唯一需要 exactl
 
 发送前验证完整可重放请求与 manifest 一致，然后依次：
 
-1. 保存 `payout_prepared`（完整请求与付款前 settlement total）。
+1. 保存 `payout_prepared`（完整请求、付款前 settlement total 与 recipient total）。
 2. 保存 `payout_submitting`。
 3. 第二次保存成功后才调用 submit。
+
+不确定结果观察到提交后的 settlement 前态时立即连续保存 `payout_submitting`，使 primary 与 backup
+都携带该证据，后续崩溃恢复不会丢失确认门槛。旧版 primary `payout_prepared` 若缺 recipient 基线，可在尚未 Submit 的安全
+边界补查并持久化；backup/submitting/blocked 状态只能只读观察，不能事后补造基线。
 
 | 结果 | 行为 |
 | --- | --- |
 | 明确成功 | 保存 `payout_confirmed`，随后无限重试 MySQL Complete |
 | 明确拒绝 | 归档 `rejected`、清理 current、fatal 退出，不自动重发 |
-| 不确定 | 有限次观察 settlement total；任一下降即确认成功 |
+| 不确定 | 先等待并双边观察；看到提交后前态且 settlement/recipient 连续两次精确达到各自预期才确认 |
 
 观察耗尽仍无法判断时保存 `blocked`、归档现场、保留 current 并 fatal 退出。系统绝不自动重发
-可能已经发送的 payout。
+可能已经发送的 payout。后续恢复可以再次执行相同的只读观察，从而让延迟的余额索引自愈。
 
 ## 7. Phase 与恢复
 
@@ -107,10 +135,11 @@ Settlement → recipient 是唯一对外资金边界，也是唯一需要 exactl
 | --- | --- |
 | `prepared` | 重新检查 settlement 并继续 payout，不执行 builder 动作 |
 | primary `payout_prepared` | 提交尚未开始，发送已持久化请求 |
-| backup `payout_prepared` | primary 可能已提交，只观察 total |
-| `payout_submitting` | 只观察 total |
-| `payout_confirmed` | 只重试数据库 Complete |
-| `blocked` | 立即 fatal，等待人工判断 |
+| backup `payout_prepared` | primary 可能已提交，只读观察双边余额 |
+| `payout_submitting` | 只读观察双边余额 |
+| `payout_confirmed` | 校验 journal、请求和 settlement 边界后，只重试数据库 Complete |
+| ambiguous `blocked` | 再次只读观察；确认后完成 DB，否则继续 blocked，绝不重发 |
+| 其他 `blocked` | 立即 fatal，等待人工判断 |
 
 MySQL Complete 成功后归档 `completed` 并清理 current。Complete 与归档之间崩溃时，恢复
 `payout_confirmed` 后会幂等再次 Complete。
@@ -143,9 +172,12 @@ data/
 
 最终 funding report 只在 UTC 01:00 funding 结束时发送，内容包括：各 builder 的零点
 claimable 与 claim/sweep 结果、完整 claimable 合计与数据库 payout 的差额、payout 确认依据、
-settlement 结束余额、rate limit、告警与处置建议。正数 payout 确认后，结束余额必须等到
-settlement total 相比付款前下降才可标记为已观察；有限观察内仍不可见时只报告未确认，不得把
-付款前余额展示为结束余额。
+settlement 结束余额、rate limit、告警与处置建议。正数 payout 确认后，结束余额必须连续两次
+达到精确的付款后 total，且两次 available 也相同，才可标记为已观察；查询错误不消耗成功样本
+预算。有限观察内仍不可见时只报告未确认，不得把付款前余额展示为结束余额。
+Payout 结果本身仍不确定时同样不再追加一次普通余额查询，也不展示未经边界确认的 Total/Available。
+对本轮已提交或从持久化 phase 判断为可能已提交的账户，若首次 Rate Limit 落在告警阈值附近，
+同样延迟重查；仍无法证明动作后计数可见时按 warning 展示最低观测值，不标成健康终值。
 
 全部 builder 的零点 claimable 都成功捕获时才做数值对账；合计低于 payout 时报告为 warning，
 但 settlement 余额充足时仍正常付款。Claim 不确定单独告警，不改变已冻结的 claimable 口径。
@@ -161,4 +193,4 @@ settlement total 相比付款前下降才可标记为已观察；有限观察内
 6. `--consolidate-only` 不得读写零点每日归集记录。
 7. 每日归集记录只用于报告，不参与 payout exactly-once 协议。
 8. 零点 claimable 必须在任何 claim 提交前落盘；后续动作不得修改其数值。
-9. Payout 确认后只允许数据库完成和归档。
+9. Payout 确认状态必须通过 journal、请求与 settlement 边界校验，之后只允许数据库完成和归档。

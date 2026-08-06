@@ -46,23 +46,24 @@ type ReportStage struct {
 }
 
 type BuilderReport struct {
-	Name                   string
-	Address                string
-	ClaimableUSDC          string
-	ClaimableObserved      bool
-	ClaimableQueryAttempts int
-	ClaimAttempts          int
-	ClaimUncertain         bool
-	ClaimStatus            ReportStepStatus
-	ClaimSummary           string
-	SweepAmount            string
-	SweepStatus            ReportStepStatus
-	SweepSummary           string
-	FinalTotal             string
-	FinalAvailable         string
-	RateLimitRemaining     uint64
-	RateLimitObserved      bool
-	RateLimitQueryFailed   bool
+	Name                           string
+	Address                        string
+	ClaimableUSDC                  string
+	ClaimableObserved              bool
+	ClaimableQueryAttempts         int
+	ClaimAttempts                  int
+	ClaimUncertain                 bool
+	ClaimStatus                    ReportStepStatus
+	ClaimSummary                   string
+	SweepAmount                    string
+	SweepStatus                    ReportStepStatus
+	SweepSummary                   string
+	FinalTotal                     string
+	FinalAvailable                 string
+	RateLimitRemaining             uint64
+	RateLimitObserved              bool
+	RateLimitQueryFailed           bool
+	RateLimitVisibilityUnconfirmed bool
 }
 
 type DailyConsolidationReport struct {
@@ -105,37 +106,39 @@ type SettlementBalanceReport struct {
 }
 
 type RunReport struct {
-	Status                         ReportStatus
-	Compact                        bool
-	Trigger                        Trigger
-	Outcome                        string
-	Attempt                        int
-	MaxAttempts                    int
-	Recovery                       bool
-	Network                        string
-	RunID                          string
-	UTCDate                        string
-	Phase                          Phase
-	StartedAt                      time.Time
-	ClaimablesCapturedAt           time.Time
-	FinishedAt                     time.Time
-	RecordCount                    int
-	RecordsRead                    bool
-	RawTotal                       string
-	PayoutTotal                    string
-	Stages                         []ReportStage
-	Builders                       []BuilderReport
-	DailyConsolidation             DailyConsolidationReport
-	Payout                         PayoutReport
-	SettlementBalance              SettlementBalanceReport
-	SettlementRateLimitRemaining   uint64
-	SettlementRateLimitObserved    bool
-	SettlementRateLimitQueryFailed bool
-	Warnings                       []string
-	FailureStage                   string
-	FailureSummary                 string
-	NextAction                     string
-	token                          *info.Token
+	Status                                   ReportStatus
+	Compact                                  bool
+	Trigger                                  Trigger
+	Outcome                                  string
+	Attempt                                  int
+	MaxAttempts                              int
+	Recovery                                 bool
+	Network                                  string
+	RunID                                    string
+	UTCDate                                  string
+	Phase                                    Phase
+	StartedAt                                time.Time
+	ClaimablesCapturedAt                     time.Time
+	FinishedAt                               time.Time
+	RecordCount                              int
+	RecordsRead                              bool
+	RawTotal                                 string
+	PayoutTotal                              string
+	Stages                                   []ReportStage
+	Builders                                 []BuilderReport
+	DailyConsolidation                       DailyConsolidationReport
+	Payout                                   PayoutReport
+	SettlementBalance                        SettlementBalanceReport
+	SettlementRateLimitRemaining             uint64
+	SettlementRateLimitObserved              bool
+	SettlementRateLimitQueryFailed           bool
+	SettlementRateLimitVisibilityUnconfirmed bool
+	Warnings                                 []string
+	FailureStage                             string
+	FailureSummary                           string
+	NextAction                               string
+	token                                    *info.Token
+	submittedAccounts                        map[string]struct{}
 }
 
 func newRunReport(
@@ -166,6 +169,7 @@ func newRunReport(
 		},
 		SettlementBalance: SettlementBalanceReport{Address: settlement},
 	}
+	report.submittedAccounts = make(map[string]struct{})
 	report.Builders = make([]BuilderReport, 0, len(builders))
 	for _, address := range builders {
 		name := builderNames[strings.ToLower(strings.TrimSpace(address))]
@@ -201,6 +205,24 @@ func (r *RunReport) syncState(state *RunState) {
 		r.Payout.RequestHash = state.Payout.Prepared.RequestHash
 		r.Payout.Nonce = state.Payout.Prepared.Nonce
 	}
+}
+
+func (r *RunReport) markSubmitted(address string) {
+	if r == nil {
+		return
+	}
+	if r.submittedAccounts == nil {
+		r.submittedAccounts = make(map[string]struct{})
+	}
+	r.submittedAccounts[strings.ToLower(strings.TrimSpace(address))] = struct{}{}
+}
+
+func (r *RunReport) submitted(address string) bool {
+	if r == nil {
+		return false
+	}
+	_, exists := r.submittedAccounts[strings.ToLower(strings.TrimSpace(address))]
+	return exists
 }
 
 func (r *RunReport) stage(key string) *ReportStage {
@@ -421,7 +443,7 @@ func builderActionSummary(action, outcome string) string {
 	actionName := map[string]string{
 		"claimable":    "零点 Claimable",
 		"claimRewards": "Reward 领取",
-		"spotBalance":  "余额查询",
+		"spotBalance":  "余额",
 		"spotSend":     "资金归集",
 	}[action]
 	if actionName == "" {

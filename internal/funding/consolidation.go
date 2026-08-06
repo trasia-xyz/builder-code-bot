@@ -106,11 +106,6 @@ func (o *Orchestrator) runConsolidation(
 			o.observeUserRateLimits(rateLimitObservationContext(ctx), &report)
 		}
 	}()
-	defer func() {
-		if !errors.Is(err, context.Canceled) {
-			o.observeSettlementFinalBalance(rateLimitObservationContext(ctx), &report)
-		}
-	}()
 	o.info(ctx, "funding consolidation task started",
 		logging.ConsoleSeparator(),
 		logging.ConsolePrefix(fundingTaskConsolePrefix),
@@ -135,21 +130,27 @@ func (o *Orchestrator) runConsolidation(
 			return report, err
 		}
 	}
-	claimBalanceTargets, err := o.claimBuilderRewards(
-		ctx, &state, &report, claimables,
+	claimBaselines, err := o.captureClaimBalanceBaselines(
+		ctx, &state, &report, token, claimables,
 	)
 	if err != nil {
 		return report, err
 	}
-	initialBalances, unconvergedClaims, err := o.observeClaimBalances(
+	claimBalanceTargets, err := o.claimBuilderRewards(
+		ctx, &state, &report, token, claimables, claimBaselines,
+	)
+	if err != nil {
+		return report, err
+	}
+	claimEndingBalances, unconvergedClaims, err := o.observeClaimBalances(
 		ctx, &state, &report, token, claimBalanceTargets,
 	)
 	if err != nil {
 		return report, err
 	}
+	report.setStage("rewards", aggregateBuilderStep(report.Builders, true), builderStepSummary(report.Builders, true))
 	if err := o.sweepBuilderBalances(
-		ctx, &state, &report, token,
-		initialBalances, claimBalanceTargets, unconvergedClaims,
+		ctx, &state, &report, token, claimEndingBalances, unconvergedClaims,
 	); err != nil {
 		return report, err
 	}

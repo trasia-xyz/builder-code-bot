@@ -7,13 +7,30 @@ builder's available spot USDC into an operator-controlled settlement account,
 and records the execution result. At UTC 01:00 it sends one payout for the
 pending MySQL records to a fixed recipient and marks those records complete.
 
+Claim visibility is measured against a stable pre-claim balance tuple. The
+captured reward is normalized to token precision and used as a lower-bound
+increase; ambiguous claims additionally require a decrease in claimable rewards.
+Every sweep reloads a stable Builder balance immediately before Submit. An
+accepted response completes that Builder without an immediate balance query.
+Because Builder and settlement are both operator-controlled accounts, an
+ambiguous sweep waits, reloads the latest stable Available balance, and retries
+with a fresh nonce up to three times. A lower stale snapshot is guarded by
+retrying at least the last ambiguous amount. A later accepted retry is reported
+with a warning because the cumulative amount of earlier ambiguous requests is
+unknown; retries never apply to the final payout.
+
 The design treats builder-to-settlement transfers as repeatable internal fund
 movement. Only the final settlement-to-recipient payout has a durable recovery
 journal. An accepted response confirms the payout directly; an ambiguous
-response is confirmed only when the settlement total balance decreases during
-five finite observations. Available balance (`total - hold`) is used separately
-for sweep amounts and payout sufficiency. An explicit rejection or unresolved
-ambiguity alerts and terminates the process.
+response is confirmed only after the post-submit pre-balance has been observed
+and two consecutive paired observations show both the exact expected settlement
+total and the exact expected recipient total. The observer waits before its
+first query and keeps up to ten successful paired observations; a later recovery
+may repeat this read-only check but never resubmits the payout. Available balance
+(`total - hold`) is used separately for sweep amounts and payout sufficiency. An
+explicit rejection or unresolved ambiguity alerts and terminates the process.
+Settlement and recipient pre-payout boundaries also require consecutive stable
+reads, and post-submit pre-balance evidence is persisted as soon as it appears.
 
 This balance rule requires the settlement account to be exclusively controlled
 by this service. No person or other process may send spot USDC from settlement.
@@ -36,7 +53,8 @@ go build -o bin/keytool ./cmd/keytool
 ```
 
 The integration suite uses real signing and HTTP clients against a local
-Hyperliquid mock, including ambiguous-but-applied payout confirmation.
+Hyperliquid mock, including delayed `/info` visibility after claims and accepted
+or ambiguous-but-applied payout actions, plus bounded internal sweep retries.
 
 ## Configure
 
@@ -79,8 +97,9 @@ configuration or starting any runtime component.
 or sweep builders and does not backfill a missed UTC 00:00 consolidation.
 
 `--consolidate-only` runs one builder-fund consolidation and exits. It uses the
-same parallel claimable capture, parallel claim attempts, bounded retries and
-sweep behavior as the UTC 00:00 task. It does not connect to MySQL, read or
+same parallel claimable capture, pre-claim balance boundaries, parallel claim
+submissions and post-action observation as the UTC 00:00 task. It does not
+connect to MySQL, read or
 update funding records or durable `current` state, read or write the UTC 00:00
 daily consolidation record, send a recipient payout, or start the scheduler.
 It decrypts only builder keys, but still acquires `data/LOCK`, so it cannot run
@@ -106,9 +125,12 @@ directory retains `LOCK`, date-keyed daily consolidation records, checksummed
 current and backup payout states, and history archives. At UTC 00:00
 (Asia/Shanghai 08:00), the scheduler captures all builder claimable values in
 parallel, retrying only failed `/info` reads up to five times at 200 ms
-intervals. It writes a `claimables_captured` record before any claim, then runs
-parallel claims with at most three attempts for uncertain responses and updates
-the record to `completed` after sweeping.
+intervals. It writes a `claimables_captured` record before any claim, then
+captures eligible builders' stable balance baselines and submits claims in
+parallel. Ambiguous claims are observed without a second nonce; ambiguous
+Builder-to-settlement sweeps instead reload current Available and retry with a
+fresh nonce because both accounts are operator-controlled. The record is
+updated to `completed` after the bounded processing finishes.
 At UTC 01:00 (Asia/Shanghai 09:00), it freezes pending records and performs the
 single settlement-to-recipient payout; it never claims or sweeps builders in
 this phase. The SES report compares the captured zero-hour claimable total with

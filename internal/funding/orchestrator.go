@@ -52,16 +52,24 @@ type Orchestrator struct {
 }
 
 const (
-	claimableQueryAttempts          = 5
-	claimableQueryRetryInterval     = 200 * time.Millisecond
-	claimSubmitAttempts             = 3
-	claimSubmitRetryInterval        = 250 * time.Millisecond
-	sweepSubmitAttempts             = 3
-	sweepSubmitRetryInterval        = 250 * time.Millisecond
-	claimBalanceObservationAttempts = 10
-	claimBalanceObservationInterval = time.Second
-	claimRewardThresholdUSDC        = int64(1)
-	zeroEthereumAddress             = "0x0000000000000000000000000000000000000000"
+	claimableQueryAttempts                 = 5
+	claimableQueryRetryInterval            = 200 * time.Millisecond
+	claimBaselineQueryAttempts             = 5
+	claimBaselineQueryInterval             = time.Second
+	claimBaselineRequiredConfirmations     = 2
+	sweepSubmitAttempts                    = 3
+	sweepSubmitRetryInterval               = time.Second
+	sweepBalanceQueryAttempts              = 5
+	sweepBalanceQueryInterval              = time.Second
+	sweepBalanceRequiredConfirmations      = 2
+	settlementBalanceQueryAttempts         = 5
+	settlementBalanceQueryInterval         = time.Second
+	settlementBalanceRequiredConfirmations = 2
+	claimBalanceObservationAttempts        = 10
+	claimBalanceObservationInterval        = time.Second
+	claimBalanceRequiredConfirmations      = 2
+	claimRewardThresholdUSDC               = int64(1)
+	zeroEthereumAddress                    = "0x0000000000000000000000000000000000000000"
 )
 
 func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
@@ -195,25 +203,75 @@ func (o *Orchestrator) runPositive(ctx context.Context, state *RunState, report 
 		report.fail("snapshot", "持久化的 Payout 金额无法解析。", "请保留 current 状态并检查数据完整性。")
 		return err
 	}
-	settlement, err := o.chain.SpotBalance(ctx, state.Manifest.Settlement, token)
-	if err != nil {
+	var (
+		settlement             info.SpotBalanceAmounts
+		candidate              info.SpotBalanceAmounts
+		observed               bool
+		lastQueryErr           error
+		lastSufficient         bool
+		consecutiveStableReads int
+	)
+	for attempt := 1; attempt <= settlementBalanceQueryAttempts; attempt++ {
+		balance, queryErr := o.chain.SpotBalance(ctx, state.Manifest.Settlement, token)
+		if queryErr == nil {
+			settlement = balance
+			observed = true
+			sufficient := !balance.Available.LessThan(payout)
+			lastSufficient = sufficient
+			if consecutiveStableReads > 0 && sameSpotBalance(balance, candidate) {
+				consecutiveStableReads++
+			} else {
+				candidate = balance
+				consecutiveStableReads = 1
+			}
+			o.info(ctx, "settlement balance observed",
+				slog.String("event", "funding_settlement_balance_observed"),
+				slog.String("run_id", state.RunID),
+				slog.Int("attempt", attempt),
+				slog.Int("max_attempts", settlementBalanceQueryAttempts),
+				slog.String("total", balance.Total.String()),
+				slog.String("hold", balance.Total.Sub(balance.Available).String()),
+				slog.String("available", balance.Available.String()),
+				slog.String("payout_total", payout.String()),
+				slog.Bool("sufficient", sufficient),
+				slog.Int("consecutive_stable_reads", consecutiveStableReads))
+			if sufficient && consecutiveStableReads >= settlementBalanceRequiredConfirmations {
+				return o.executePayout(ctx, state, balance, payout, report)
+			}
+		} else {
+			lastQueryErr = queryErr
+			consecutiveStableReads = 0
+			o.warn(ctx, "settlement balance query failed; retrying before payout",
+				slog.String("event", "funding_settlement_balance_query_failed"),
+				slog.String("run_id", state.RunID),
+				slog.Int("attempt", attempt),
+				slog.Int("max_attempts", settlementBalanceQueryAttempts))
+		}
+		if attempt < settlementBalanceQueryAttempts {
+			if err := o.sleeper.Sleep(ctx, settlementBalanceQueryInterval); err != nil {
+				return err
+			}
+		}
+	}
+	if !observed {
 		report.fail("payout", "Settlement 余额查询失败，无法确认是否满足 Payout。", "")
 		o.alertOnce(
 			ctx, state.RunID, "settlement_balance_query_failed",
 			AlertSeverityWarning, "settlement spot balance query failed",
 		)
-		return fmt.Errorf("query settlement spot balance: %w", err)
+		return fmt.Errorf("query settlement spot balance: %w", lastQueryErr)
 	}
-	sufficient := !settlement.Available.LessThan(payout)
-	o.info(ctx, "settlement balance observed",
-		slog.String("event", "funding_settlement_balance_observed"),
-		slog.String("run_id", state.RunID),
-		slog.String("total", settlement.Total.String()),
-		slog.String("hold", settlement.Total.Sub(settlement.Available).String()),
-		slog.String("available", settlement.Available.String()),
-		slog.String("payout_total", payout.String()), slog.Bool("sufficient", sufficient))
-	if sufficient {
-		return o.executePayout(ctx, state, settlement.Total, payout, report)
+	if lastSufficient {
+		o.alertOnce(
+			ctx, state.RunID, "settlement_balance_unstable",
+			AlertSeverityWarning, "settlement spot balance did not stabilize before payout",
+		)
+		report.fail(
+			"payout",
+			"Settlement 余额未在有限查询内稳定，未提交 Payout。",
+			"请等待余额索引稳定后重试。",
+		)
+		return fmt.Errorf("settlement balance did not stabilize before payout")
 	}
 	o.alertOnce(
 		ctx, state.RunID, "settlement_underfunded",
@@ -363,37 +421,162 @@ type claimAttemptResult struct {
 	result     exchange.SubmitResult
 }
 
-type claimRetryState struct {
-	balanceTarget  decimal.Decimal
-	claimableKnown bool
-	hadUnknown     bool
+type claimBalanceTarget struct {
+	totalBefore             decimal.Decimal
+	availableBefore         decimal.Decimal
+	claimableBefore         decimal.Decimal
+	claimableKnown          bool
+	minimumIncrease         decimal.Decimal
+	strictIncrease          bool
+	submitUnknown           bool
+	preStateSeenAfterSubmit bool
+}
+
+func (t claimBalanceTarget) minimumTotal() decimal.Decimal {
+	return t.totalBefore.Add(t.minimumIncrease)
+}
+
+func (t claimBalanceTarget) visible(total decimal.Decimal) bool {
+	minimum := t.minimumTotal()
+	if t.strictIncrease {
+		return total.GreaterThan(minimum)
+	}
+	return !total.LessThan(minimum)
+}
+
+type balanceQueryResult struct {
+	index   int
+	balance info.SpotBalanceAmounts
+	err     error
+}
+
+func sameSpotBalance(left, right info.SpotBalanceAmounts) bool {
+	return left.Total.Equal(right.Total) && left.Available.Equal(right.Available)
+}
+
+func claimEligible(claimable decimal.Decimal, observed bool) bool {
+	return !observed || claimable.GreaterThan(decimal.NewFromInt(claimRewardThresholdUSDC))
+}
+
+func (o *Orchestrator) captureClaimBalanceBaselines(
+	ctx context.Context,
+	state *RunState,
+	report *RunReport,
+	token info.Token,
+	claimables map[string]decimal.Decimal,
+) (map[string]info.SpotBalanceAmounts, error) {
+	baselines := make(map[string]info.SpotBalanceAmounts, len(o.builders))
+	pending := make([]bool, len(o.builders))
+	candidates := make([]info.SpotBalanceAmounts, len(o.builders))
+	consecutive := make([]int, len(o.builders))
+	for index, builder := range o.builders {
+		claimable, observed := claimables[builder]
+		pending[index] = claimEligible(claimable, observed)
+	}
+
+	for attempt := 1; attempt <= claimBaselineQueryAttempts; attempt++ {
+		indexes := pendingBuilderIndexes(pending)
+		if len(indexes) == 0 {
+			break
+		}
+		results := make(chan balanceQueryResult, len(indexes))
+		for _, index := range indexes {
+			index := index
+			go func() {
+				balance, err := o.chain.SpotBalance(ctx, o.builders[index], token)
+				results <- balanceQueryResult{index: index, balance: balance, err: err}
+			}()
+		}
+		round := make([]balanceQueryResult, len(o.builders))
+		for range indexes {
+			result := <-results
+			round[result.index] = result
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for _, index := range indexes {
+			builder := o.builders[index]
+			result := round[index]
+			if result.err == nil {
+				if consecutive[index] > 0 &&
+					result.balance.Total.Equal(candidates[index].Total) &&
+					result.balance.Available.Equal(candidates[index].Available) {
+					consecutive[index]++
+				} else {
+					candidates[index] = result.balance
+					consecutive[index] = 1
+				}
+				o.info(ctx, "builder pre-claim balance captured",
+					slog.String("event", "funding_builder_claim_balance_baseline_captured"),
+					slog.String("run_id", state.RunID),
+					slog.String("builder", builder),
+					slog.Int("attempt", attempt),
+					slog.String("total", result.balance.Total.String()),
+					slog.String("available", result.balance.Available.String()),
+					slog.Int("consecutive_matches", consecutive[index]))
+				if consecutive[index] >= claimBaselineRequiredConfirmations {
+					pending[index] = false
+					baselines[builder] = result.balance
+				}
+				continue
+			}
+			consecutive[index] = 0
+			o.warn(ctx, "builder pre-claim balance query failed",
+				slog.String("event", "funding_builder_claim_balance_baseline_query_failed"),
+				slog.String("run_id", state.RunID),
+				slog.String("builder", builder),
+				slog.Int("attempt", attempt),
+				slog.Int("max_attempts", claimBaselineQueryAttempts))
+		}
+		if len(pendingBuilderIndexes(pending)) > 0 && attempt < claimBaselineQueryAttempts {
+			if err := o.sleeper.Sleep(ctx, claimBaselineQueryInterval); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	for index, waiting := range pending {
+		if !waiting {
+			continue
+		}
+		builder := o.builders[index]
+		summary := "Claim 前余额基线查询失败，未提交 Reward 领取"
+		if builderReport := report.builder(builder); builderReport != nil {
+			builderReport.ClaimStatus = ReportStepWarning
+			builderReport.ClaimSummary = summary
+			report.addWarning(builderReport.Name + ": " + summary)
+		}
+		o.alertOnce(
+			ctx, state.RunID, "builder_claim_baseline_failed:"+strings.ToLower(builder),
+			AlertSeverityWarning,
+			fmt.Sprintf("builder pre-claim balance baseline query failed\nbuilder: %s", builder),
+		)
+	}
+	return baselines, nil
 }
 
 func (o *Orchestrator) claimBuilderRewards(
 	ctx context.Context,
 	state *RunState,
 	report *RunReport,
+	token info.Token,
 	claimables map[string]decimal.Decimal,
-) (map[string]decimal.Decimal, error) {
-	claimBalanceTargets := make(map[string]decimal.Decimal, len(o.builders))
+	baselines map[string]info.SpotBalanceAmounts,
+) (map[string]claimBalanceTarget, error) {
+	claimBalanceTargets := make(map[string]claimBalanceTarget, len(o.builders))
 	threshold := decimal.NewFromInt(claimRewardThresholdUSDC)
-	pending := make([]bool, len(o.builders))
-	states := make([]claimRetryState, len(o.builders))
+	indexes := make([]int, 0, len(o.builders))
 	for index, builder := range o.builders {
 		claimable, observed := claimables[builder]
-		eligible := !observed || claimable.GreaterThan(threshold)
+		eligible := claimEligible(claimable, observed)
 		if !eligible {
 			if builderReport := report.builder(builder); builderReport != nil {
 				builderReport.ClaimStatus = ReportStepSkipped
 				builderReport.ClaimSummary = "未超过 1 USDC 阈值"
 			}
-		} else {
-			pending[index] = true
-			states[index].balanceTarget = claimable
-			states[index].claimableKnown = observed
-			if !observed {
-				states[index].balanceTarget = threshold
-			}
+		} else if _, baselineObserved := baselines[builder]; baselineObserved {
+			indexes = append(indexes, index)
 		}
 		o.info(ctx, "builder claim eligibility checked",
 			slog.String("event", "funding_builder_claim_eligibility_checked"),
@@ -404,123 +587,86 @@ func (o *Orchestrator) claimBuilderRewards(
 			slog.Bool("eligible", eligible))
 	}
 
-	for attempt := 1; attempt <= claimSubmitAttempts; attempt++ {
-		indexes := pendingBuilderIndexes(pending)
-		if len(indexes) == 0 {
-			break
-		}
-		nonces := make(map[int]uint64, len(indexes))
-		for _, index := range indexes {
-			nonces[index] = o.nonce.Next()
-		}
-		results := make(chan claimAttemptResult, len(indexes))
-		for _, index := range indexes {
-			index := index
-			go func() {
-				prepared, err := o.chain.PrepareClaim(o.builders[index], nonces[index])
-				if err != nil {
-					results <- claimAttemptResult{index: index, prepareErr: err}
-					return
-				}
-				result, _ := o.chain.Submit(ctx, prepared)
-				results <- claimAttemptResult{index: index, result: result}
-			}()
-		}
+	nonces := make(map[int]uint64, len(indexes))
+	for _, index := range indexes {
+		nonces[index] = o.nonce.Next()
+	}
+	results := make(chan claimAttemptResult, len(indexes))
+	for _, index := range indexes {
+		index := index
+		go func() {
+			prepared, err := o.chain.PrepareClaim(o.builders[index], nonces[index])
+			if err != nil {
+				results <- claimAttemptResult{index: index, prepareErr: err}
+				return
+			}
+			result, _ := o.chain.Submit(ctx, prepared)
+			results <- claimAttemptResult{index: index, result: result}
+		}()
+	}
 
-		round := make([]claimAttemptResult, len(o.builders))
-		for range indexes {
-			result := <-results
-			round[result.index] = result
+	round := make([]claimAttemptResult, len(o.builders))
+	for range indexes {
+		result := <-results
+		round[result.index] = result
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, index := range indexes {
+		builder := o.builders[index]
+		claimable, claimableKnown := claimables[builder]
+		minimumIncrease := claimable.Truncate(int32(token.WeiDecimals))
+		if !claimableKnown {
+			minimumIncrease = threshold
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
+		target := claimBalanceTarget{
+			totalBefore:     baselines[builder].Total,
+			availableBefore: baselines[builder].Available,
+			claimableBefore: claimable,
+			claimableKnown:  claimableKnown,
+			minimumIncrease: minimumIncrease,
+			strictIncrease:  !claimableKnown,
 		}
-		for _, index := range indexes {
-			builder := o.builders[index]
-			retry := &states[index]
-			result := round[index]
+		result := round[index]
+		if builderReport := report.builder(builder); builderReport != nil {
+			builderReport.ClaimAttempts = 1
+		}
+		if result.prepareErr != nil {
+			o.builderFailure(ctx, state, report, builder, "claimRewards", "prepare")
+			continue
+		}
+		report.markSubmitted(builder)
+		o.logBuilderSubmitResult(ctx, state, builder, "claimRewards", "", result.result)
+		switch {
+		case result.result.Accepted:
+			claimBalanceTargets[builder] = target
 			if builderReport := report.builder(builder); builderReport != nil {
-				builderReport.ClaimAttempts = attempt
-			}
-			if result.prepareErr != nil {
-				if retry.hadUnknown {
-					if attempt == claimSubmitAttempts {
-						pending[index] = false
-						claimBalanceTargets[builder] = retry.balanceTarget
-						o.markClaimUncertain(ctx, state, report, builder)
-					} else {
-						o.logClaimRetry(ctx, state, builder, attempt)
-					}
-				} else {
-					pending[index] = false
-					o.builderFailure(ctx, state, report, builder, "claimRewards", "prepare")
+				builderReport.ClaimStatus = ReportStepSuccess
+				builderReport.ClaimSummary = "Reward 已领取"
+				if !claimableKnown {
+					builderReport.ClaimSummary += "；零点 Claimable 数据缺失"
 				}
-				continue
 			}
-			o.logBuilderSubmitResult(ctx, state, builder, "claimRewards", "", result.result)
-			switch {
-			case result.result.Accepted:
-				pending[index] = false
-				claimBalanceTargets[builder] = retry.balanceTarget
-				if builderReport := report.builder(builder); builderReport != nil {
-					builderReport.ClaimStatus = ReportStepSuccess
-					builderReport.ClaimSummary = "Reward 已领取"
-					if !retry.claimableKnown {
-						builderReport.ClaimSummary = "Reward 已领取；零点 Claimable 数据缺失"
-					}
-					if attempt > 1 {
-						builderReport.ClaimSummary = fmt.Sprintf("Reward 已领取（第 %d 次尝试）", attempt)
-						if !retry.claimableKnown {
-							builderReport.ClaimSummary += "；零点 Claimable 数据缺失"
-						}
-					}
-				}
-			case result.result.Rejected:
-				if retry.hadUnknown {
-					if attempt == claimSubmitAttempts {
-						pending[index] = false
-						claimBalanceTargets[builder] = retry.balanceTarget
-						o.markClaimUncertain(ctx, state, report, builder)
-					} else {
-						o.logClaimRetry(ctx, state, builder, attempt)
-					}
-				} else {
-					pending[index] = false
-					o.builderFailure(ctx, state, report, builder, "claimRewards", "rejected")
-				}
-			default:
-				retry.hadUnknown = true
-				if attempt == claimSubmitAttempts {
-					pending[index] = false
-					claimBalanceTargets[builder] = retry.balanceTarget
-					o.markClaimUncertain(ctx, state, report, builder)
-					continue
-				}
-				o.logClaimRetry(ctx, state, builder, attempt)
+		case result.result.Rejected:
+			o.builderFailure(ctx, state, report, builder, "claimRewards", "rejected")
+		default:
+			target.submitUnknown = true
+			claimBalanceTargets[builder] = target
+			if builderReport := report.builder(builder); builderReport != nil {
+				builderReport.ClaimUncertain = true
+				builderReport.ClaimSummary = "Reward 提交结果不确定，等待余额变化确认"
 			}
-		}
-		if len(pendingBuilderIndexes(pending)) > 0 && attempt < claimSubmitAttempts {
-			if err := o.sleeper.Sleep(ctx, claimSubmitRetryInterval); err != nil {
-				return nil, err
-			}
+			o.warn(ctx, "builder claim result is uncertain; observing balance without resubmission",
+				slog.String("event", "funding_builder_claim_observation_planned"),
+				slog.String("run_id", state.RunID),
+				slog.String("builder", builder),
+				slog.String("total_before", target.totalBefore.String()),
+				slog.String("minimum_total", target.minimumTotal().String()))
 		}
 	}
 	report.setStage("rewards", aggregateBuilderStep(report.Builders, true), builderStepSummary(report.Builders, true))
 	return claimBalanceTargets, nil
-}
-
-func (o *Orchestrator) logClaimRetry(
-	ctx context.Context,
-	state *RunState,
-	builder string,
-	attempt int,
-) {
-	o.warn(ctx, "builder claim remains uncertain; retrying",
-		slog.String("event", "funding_builder_claim_retry_planned"),
-		slog.String("run_id", state.RunID),
-		slog.String("builder", builder),
-		slog.Int("attempt", attempt),
-		slog.Int("max_attempts", claimSubmitAttempts))
 }
 
 func (o *Orchestrator) markClaimUncertain(
@@ -535,120 +681,152 @@ func (o *Orchestrator) markClaimUncertain(
 	o.builderFailure(ctx, state, report, builder, "claimRewards", "unknown")
 }
 
-type sweepRetryState struct {
-	done       bool
-	hadUnknown bool
-	lastAmount string
-}
-
 func (o *Orchestrator) sweepBuilderBalances(
 	ctx context.Context,
 	state *RunState,
 	report *RunReport,
 	token info.Token,
-	initialBalances map[string]info.SpotBalanceAmounts,
-	claimBalanceTargets map[string]decimal.Decimal,
+	claimEndingBalances map[string]info.SpotBalanceAmounts,
 	unconvergedClaims map[string]struct{},
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	states := make([]sweepRetryState, len(o.builders))
-	for attempt := 1; attempt <= sweepSubmitAttempts; attempt++ {
-		pending := false
-		for index, builder := range o.builders {
-			if err := ctx.Err(); err != nil {
-				return err
+	for _, builder := range o.builders {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		claimFloor, claimFloorKnown := claimEndingBalances[builder]
+		if _, unconverged := unconvergedClaims[builder]; unconverged {
+			claimFloorKnown = false
+		}
+		hadUnknown := false
+		retryAmount := decimal.Zero
+		for attempt := 1; attempt <= sweepSubmitAttempts; attempt++ {
+			if attempt > 1 {
+				if err := o.sleeper.Sleep(ctx, sweepSubmitRetryInterval); err != nil {
+					return err
+				}
 			}
-			retry := &states[index]
-			if retry.done {
-				continue
-			}
-			balance, balanceErr, skip := o.loadSweepBalance(
-				ctx, state, report, token, builder, attempt, initialBalances, claimBalanceTargets,
+
+			// Once a prior request is ambiguous, a lower source balance is an
+			// expected outcome rather than a stale regression. Reload the current
+			// stable Available; the retry amount is selected below using the last
+			// ambiguous request as a floor against stale lower snapshots.
+			minimumKnown := claimFloorKnown && !hadUnknown
+			balance, balanceErr := o.loadSweepBalance(
+				ctx, state, report, token, builder, claimFloor.Total, minimumKnown,
 			)
-			if skip {
-				retry.done = true
-				continue
-			}
 			if balanceErr != nil {
-				if attempt == sweepSubmitAttempts {
-					retry.done = true
-					o.builderFailure(ctx, state, report, builder, "spotBalance", "query")
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if hadUnknown {
+					o.builderFailure(ctx, state, report, builder, "spotSend", "unknown")
 				} else {
-					pending = true
-					o.warn(ctx, "builder sweep balance query failed; retrying",
-						slog.String("event", "funding_builder_sweep_retry_planned"),
-						slog.String("run_id", state.RunID),
-						slog.String("builder", builder),
-						slog.String("reason", "spot_balance_query"),
-						slog.Int("attempt", attempt),
-						slog.Int("max_attempts", sweepSubmitAttempts))
+					o.builderFailure(ctx, state, report, builder, "spotBalance", "query")
 				}
-				continue
+				break
 			}
-			if !balance.Available.IsPositive() {
-				if retry.hadUnknown {
-					o.markSweepSucceeded(
-						report, builder, retry.lastAmount, unconvergedClaims,
-						"资金已归集（余额已清空；此前提交结果不确定）",
-					)
+			amount := balance.Available
+			if hadUnknown && retryAmount.GreaterThan(amount) {
+				// A lower balance can be a stale pre-claim or partial snapshot. Retrying
+				// at least the last ambiguous amount is safe for this internal transfer:
+				// if that request already applied, the exchange rejects the retry for
+				// insufficient balance.
+				amount = retryAmount
+				o.warn(ctx, "builder sweep retry is using last ambiguous amount after lower balance",
+					slog.String("event", "funding_builder_sweep_retry_stale_lower_guard"),
+					slog.String("run_id", state.RunID),
+					slog.String("builder", builder),
+					slog.String("observed_available", balance.Available.String()),
+					slog.String("amount", amount.String()),
+					slog.Int("attempt", attempt))
+			}
+			if !amount.IsPositive() {
+				if builderReport := report.builder(builder); builderReport != nil {
+					if _, unconverged := unconvergedClaims[builder]; unconverged {
+						builderReport.SweepStatus = ReportStepWarning
+						builderReport.SweepSummary = "Reward 余额未确认刷新，当前无可归集余额"
+						report.addWarning(builderReport.Name + ": " + builderReport.SweepSummary)
+					} else {
+						builderReport.SweepStatus = ReportStepSkipped
+						builderReport.SweepSummary = "无可归集余额"
+					}
 				}
-				retry.done = true
-				continue
+				break
 			}
+
 			prepared, prepareErr := o.chain.PrepareSpotSend(
-				builder, state.Manifest.Settlement, token, balance.Available, o.nonce.Next(),
+				builder, state.Manifest.Settlement, token, amount, o.nonce.Next(),
 			)
 			if prepareErr != nil {
-				if retry.hadUnknown {
-					if attempt == sweepSubmitAttempts {
-						retry.done = true
-						o.builderFailure(ctx, state, report, builder, "spotSend", "unknown")
-					} else {
-						pending = true
-						o.logSweepRetry(ctx, state, builder, attempt)
-					}
-				} else {
-					retry.done = true
-					o.builderFailure(ctx, state, report, builder, "spotSend", "prepare")
-				}
-				continue
-			}
-			amount := balance.Available.String()
-			result, _ := o.chain.Submit(ctx, prepared)
-			o.logBuilderSubmitResult(ctx, state, builder, "spotSend", amount, result)
-			switch {
-			case result.Accepted:
-				retry.done = true
-				summary := "资金已归集"
-				if attempt > 1 {
-					summary = fmt.Sprintf("资金已归集（第 %d 次尝试）", attempt)
-				}
-				o.markSweepSucceeded(report, builder, amount, unconvergedClaims, summary)
-			case result.Rejected && !retry.hadUnknown:
-				retry.done = true
-				o.builderFailure(ctx, state, report, builder, "spotSend", "rejected")
-			default:
-				retry.hadUnknown = true
-				retry.lastAmount = amount
-				if attempt == sweepSubmitAttempts {
-					retry.done = true
-					o.builderFailure(ctx, state, report, builder, "spotSend", "unknown")
+				if hadUnknown && attempt < sweepSubmitAttempts {
+					o.logSweepRetry(ctx, state, builder, attempt, "prepare")
 					continue
 				}
-				pending = true
-				o.logSweepRetry(ctx, state, builder, attempt)
+				outcome := "prepare"
+				if hadUnknown {
+					outcome = "unknown"
+				}
+				o.builderFailure(ctx, state, report, builder, "spotSend", outcome)
+				break
 			}
-		}
-		if !pending {
-			break
-		}
-		if err := o.sleeper.Sleep(ctx, sweepSubmitRetryInterval); err != nil {
-			return err
+
+			result, _ := o.chain.Submit(ctx, prepared)
+			report.markSubmitted(builder)
+			if builderReport := report.builder(builder); builderReport != nil {
+				// The latest recorded balance was captured before this request and
+				// must not be presented as the Builder's ending balance.
+				builderReport.FinalTotal = ""
+				builderReport.FinalAvailable = ""
+			}
+			o.logBuilderSubmitResult(ctx, state, builder, "spotSend", amount.String(), result)
+			if result.Accepted {
+				if hadUnknown {
+					markSweepRetryAccepted(
+						report, builder, amount.String(), attempt, unconvergedClaims,
+					)
+				} else {
+					o.markSweepSucceeded(
+						report, builder, amount.String(), unconvergedClaims, "资金已归集",
+					)
+				}
+				break
+			}
+			if result.Rejected && !hadUnknown {
+				o.builderFailure(ctx, state, report, builder, "spotSend", "rejected")
+				break
+			}
+
+			if !result.Rejected {
+				hadUnknown = true
+				retryAmount = amount
+			}
+			if attempt == sweepSubmitAttempts {
+				o.builderFailure(ctx, state, report, builder, "spotSend", "unknown")
+				break
+			}
+			o.logSweepRetry(ctx, state, builder, attempt, "submit_result")
 		}
 	}
 	return nil
+}
+
+func (o *Orchestrator) logSweepRetry(
+	ctx context.Context,
+	state *RunState,
+	builder string,
+	attempt int,
+	reason string,
+) {
+	o.warn(ctx, "builder sweep remains uncertain; retrying current available balance",
+		slog.String("event", "funding_builder_sweep_retry_planned"),
+		slog.String("run_id", state.RunID),
+		slog.String("builder", builder),
+		slog.String("reason", reason),
+		slog.Int("attempt", attempt),
+		slog.Int("max_attempts", sweepSubmitAttempts))
 }
 
 func (o *Orchestrator) loadSweepBalance(
@@ -657,24 +835,64 @@ func (o *Orchestrator) loadSweepBalance(
 	report *RunReport,
 	token info.Token,
 	builder string,
-	attempt int,
-	initialBalances map[string]info.SpotBalanceAmounts,
-	claimBalanceTargets map[string]decimal.Decimal,
-) (info.SpotBalanceAmounts, error, bool) {
-	if attempt == 1 {
-		if balance, observed := initialBalances[builder]; observed {
-			return balance, nil, false
+	minimumTotal decimal.Decimal,
+	minimumTotalKnown bool,
+) (info.SpotBalanceAmounts, error) {
+	var (
+		candidate   info.SpotBalanceAmounts
+		lastErr     error
+		consecutive int
+	)
+	for attempt := 1; attempt <= sweepBalanceQueryAttempts; attempt++ {
+		balance, err := o.chain.SpotBalance(ctx, builder, token)
+		if err == nil {
+			lastErr = nil
+			if minimumTotalKnown && balance.Total.LessThan(minimumTotal) {
+				consecutive = 0
+				o.warn(ctx, "builder sweep balance regressed below confirmed claim floor",
+					slog.String("event", "funding_builder_sweep_balance_below_claim_floor"),
+					slog.String("run_id", state.RunID),
+					slog.String("builder", builder),
+					slog.String("minimum_total", minimumTotal.String()),
+					slog.String("total", balance.Total.String()),
+					slog.Int("attempt", attempt))
+				if attempt < sweepBalanceQueryAttempts {
+					if sleepErr := o.sleeper.Sleep(ctx, sweepBalanceQueryInterval); sleepErr != nil {
+						return info.SpotBalanceAmounts{}, sleepErr
+					}
+				}
+				continue
+			}
+			o.recordBuilderBalance(ctx, state, report, builder, attempt, balance, nil)
+			if consecutive > 0 && sameSpotBalance(balance, candidate) {
+				consecutive++
+			} else {
+				candidate = balance
+				consecutive = 1
+			}
+			if consecutive >= sweepBalanceRequiredConfirmations {
+				return balance, nil
+			}
+		} else {
+			lastErr = err
+			consecutive = 0
+			o.warn(ctx, "builder sweep balance query failed",
+				slog.String("event", "funding_builder_sweep_balance_query_failed"),
+				slog.String("run_id", state.RunID),
+				slog.String("builder", builder),
+				slog.Int("attempt", attempt),
+				slog.Int("max_attempts", sweepBalanceQueryAttempts))
 		}
-		if _, alreadyPolled := claimBalanceTargets[builder]; alreadyPolled {
-			return info.SpotBalanceAmounts{}, nil, true
+		if attempt < sweepBalanceQueryAttempts {
+			if err := o.sleeper.Sleep(ctx, sweepBalanceQueryInterval); err != nil {
+				return info.SpotBalanceAmounts{}, err
+			}
 		}
 	}
-	balance, err := o.chain.SpotBalance(ctx, builder, token)
-	if err != nil {
-		return info.SpotBalanceAmounts{}, err, false
+	if lastErr == nil {
+		lastErr = fmt.Errorf("builder sweep balance did not stabilize")
 	}
-	o.recordBuilderBalance(ctx, state, report, builder, attempt, balance, nil)
-	return balance, nil, false
+	return info.SpotBalanceAmounts{}, lastErr
 }
 
 func (o *Orchestrator) markSweepSucceeded(
@@ -697,18 +915,25 @@ func (o *Orchestrator) markSweepSucceeded(
 	builderReport.SweepSummary = summary
 }
 
-func (o *Orchestrator) logSweepRetry(
-	ctx context.Context,
-	state *RunState,
-	builder string,
+func markSweepRetryAccepted(
+	report *RunReport,
+	builder, amount string,
 	attempt int,
+	unconvergedClaims map[string]struct{},
 ) {
-	o.warn(ctx, "builder sweep remains uncertain; retrying",
-		slog.String("event", "funding_builder_sweep_retry_planned"),
-		slog.String("run_id", state.RunID),
-		slog.String("builder", builder),
-		slog.Int("attempt", attempt),
-		slog.Int("max_attempts", sweepSubmitAttempts))
+	builderReport := report.builder(builder)
+	if builderReport == nil {
+		return
+	}
+	report.addSweepAmount(builderReport, amount)
+	builderReport.SweepStatus = ReportStepWarning
+	builderReport.SweepSummary = fmt.Sprintf(
+		"第 %d 次归集已接受；此前响应未知，累计归集金额无法确认", attempt,
+	)
+	if _, unconverged := unconvergedClaims[builder]; unconverged {
+		builderReport.SweepSummary += "；Reward 余额未确认刷新"
+	}
+	report.addWarning(builderReport.Name + ": " + builderReport.SweepSummary)
 }
 
 func (o *Orchestrator) observeClaimBalances(
@@ -716,16 +941,18 @@ func (o *Orchestrator) observeClaimBalances(
 	state *RunState,
 	report *RunReport,
 	token info.Token,
-	targets map[string]decimal.Decimal,
+	targets map[string]claimBalanceTarget,
 ) (map[string]info.SpotBalanceAmounts, map[string]struct{}, error) {
 	balances := make(map[string]info.SpotBalanceAmounts, len(targets))
 	if len(targets) == 0 {
 		return balances, nil, nil
 	}
-	pending := make(map[string]decimal.Decimal, len(targets))
-	for builder, claimable := range targets {
-		pending[builder] = claimable
+	pending := make(map[string]claimBalanceTarget, len(targets))
+	for builder, target := range targets {
+		pending[builder] = target
 	}
+	consecutive := make(map[string]int, len(targets))
+	candidates := make(map[string]info.SpotBalanceAmounts, len(targets))
 	o.info(ctx, "builder claim balance observation waiting",
 		slog.String("event", "funding_builder_claim_balance_wait_started"),
 		slog.String("run_id", state.RunID),
@@ -736,7 +963,7 @@ func (o *Orchestrator) observeClaimBalances(
 	}
 	for attempt := 1; attempt <= claimBalanceObservationAttempts; attempt++ {
 		for _, builder := range o.builders {
-			claimable, waiting := pending[builder]
+			target, waiting := pending[builder]
 			if !waiting {
 				continue
 			}
@@ -745,12 +972,71 @@ func (o *Orchestrator) observeClaimBalances(
 			}
 			balance, err := o.chain.SpotBalance(ctx, builder, token)
 			if err != nil {
-				o.builderFailure(ctx, state, report, builder, "spotBalance", "query")
+				consecutive[builder] = 0
+				o.warn(ctx, "builder claim balance observation failed",
+					slog.String("event", "funding_builder_claim_balance_query_failed"),
+					slog.String("run_id", state.RunID),
+					slog.String("builder", builder),
+					slog.Int("attempt", attempt),
+					slog.Int("max_attempts", claimBalanceObservationAttempts))
 				continue
 			}
 			balances[builder] = balance
-			o.recordBuilderBalance(ctx, state, report, builder, attempt, balance, &claimable)
-			if !balance.Available.LessThan(claimable) {
+			if target.submitUnknown &&
+				balance.Total.Equal(target.totalBefore) &&
+				balance.Available.Equal(target.availableBefore) {
+				target.preStateSeenAfterSubmit = true
+				pending[builder] = target
+			}
+			o.recordBuilderBalance(ctx, state, report, builder, attempt, balance, &target)
+			visible := target.visible(balance.Total)
+			claimableTransitioned := !target.submitUnknown || !target.claimableKnown
+			if visible && target.submitUnknown && target.claimableKnown {
+				claimableAfter, claimableErr := o.chain.ClaimableUSDC(ctx, builder, token)
+				if claimableErr != nil {
+					consecutive[builder] = 0
+					o.warn(ctx, "builder claimable transition query failed",
+						slog.String("event", "funding_builder_claimable_transition_query_failed"),
+						slog.String("run_id", state.RunID),
+						slog.String("builder", builder),
+						slog.Int("attempt", attempt))
+					continue
+				}
+				claimableTransitioned = claimableAfter.LessThan(target.claimableBefore)
+				o.info(ctx, "builder claimable transition observed",
+					slog.String("event", "funding_builder_claimable_transition_observed"),
+					slog.String("run_id", state.RunID),
+					slog.String("builder", builder),
+					slog.String("claimable_before", target.claimableBefore.String()),
+					slog.String("claimable_after", claimableAfter.String()),
+					slog.Bool("transitioned", claimableTransitioned),
+					slog.Int("attempt", attempt))
+			}
+			visible = visible && claimableTransitioned
+			if target.submitUnknown {
+				visible = visible && target.preStateSeenAfterSubmit
+				if !target.claimableKnown {
+					// Without a captured claimable value, a Total-only change cannot
+					// safely resolve an ambiguous claim. Keep observing so the latest
+					// balance can still be swept on a best-effort basis.
+					visible = false
+				}
+			}
+			if visible {
+				if consecutive[builder] > 0 && sameSpotBalance(balance, candidates[builder]) {
+					consecutive[builder]++
+				} else {
+					candidates[builder] = balance
+					consecutive[builder] = 1
+				}
+			} else {
+				consecutive[builder] = 0
+			}
+			visible = consecutive[builder] >= claimBalanceRequiredConfirmations
+			if visible {
+				if target.submitUnknown {
+					o.resolveUncertainClaim(report, builder)
+				}
 				delete(pending, builder)
 			}
 		}
@@ -765,13 +1051,13 @@ func (o *Orchestrator) observeClaimBalances(
 	}
 	unconverged := make(map[string]struct{}, len(pending))
 	for _, builder := range o.builders {
-		claimable, waiting := pending[builder]
+		target, waiting := pending[builder]
 		if !waiting {
 			continue
 		}
 		unconverged[builder] = struct{}{}
 		balance, observed := balances[builder]
-		o.claimBalanceObservationExhausted(ctx, state, report, builder, claimable, balance, observed)
+		o.claimBalanceObservationExhausted(ctx, state, report, builder, target, balance, observed)
 	}
 	return balances, unconverged, nil
 }
@@ -783,15 +1069,11 @@ func (o *Orchestrator) recordBuilderBalance(
 	builder string,
 	attempt int,
 	balance info.SpotBalanceAmounts,
-	claimable *decimal.Decimal,
+	claimTarget *claimBalanceTarget,
 ) {
 	if builderReport := report.builder(builder); builderReport != nil {
 		builderReport.FinalTotal = balance.Total.String()
 		builderReport.FinalAvailable = balance.Available.String()
-		if !balance.Available.IsPositive() && builderReport.SweepStatus == ReportStepPending {
-			builderReport.SweepStatus = ReportStepSkipped
-			builderReport.SweepSummary = "无可归集余额"
-		}
 	}
 	attrs := []slog.Attr{
 		slog.String("event", "funding_builder_balance_observed"),
@@ -800,10 +1082,13 @@ func (o *Orchestrator) recordBuilderBalance(
 		slog.String("hold", balance.Total.Sub(balance.Available).String()),
 		slog.String("available", balance.Available.String()),
 	}
-	if claimable != nil {
+	if claimTarget != nil {
 		attrs = append(attrs,
-			slog.String("claimable_usdc", claimable.String()),
-			slog.Bool("claim_balance_visible", !balance.Available.LessThan(*claimable)),
+			slog.String("total_before", claimTarget.totalBefore.String()),
+			slog.String("minimum_increase", claimTarget.minimumIncrease.String()),
+			slog.String("minimum_total", claimTarget.minimumTotal().String()),
+			slog.Bool("pre_state_seen_after_submit", claimTarget.preStateSeenAfterSubmit),
+			slog.Bool("claim_balance_visible", claimTarget.visible(balance.Total)),
 		)
 	}
 	o.info(ctx, "builder balance observed", attrs...)
@@ -814,7 +1099,7 @@ func (o *Orchestrator) claimBalanceObservationExhausted(
 	state *RunState,
 	report *RunReport,
 	builder string,
-	claimable decimal.Decimal,
+	target claimBalanceTarget,
 	balance info.SpotBalanceAmounts,
 	observed bool,
 ) {
@@ -822,7 +1107,9 @@ func (o *Orchestrator) claimBalanceObservationExhausted(
 		slog.String("event", "funding_builder_claim_balance_observation_exhausted"),
 		slog.String("run_id", state.RunID), slog.String("builder", builder),
 		slog.Int("attempt_count", claimBalanceObservationAttempts),
-		slog.String("claimable_usdc", claimable.String()),
+		slog.String("total_before", target.totalBefore.String()),
+		slog.String("minimum_increase", target.minimumIncrease.String()),
+		slog.String("minimum_total", target.minimumTotal().String()),
 		slog.Bool("balance_observed", observed),
 	}
 	if observed {
@@ -837,15 +1124,36 @@ func (o *Orchestrator) claimBalanceObservationExhausted(
 		builderReport.SweepStatus = ReportStepWarning
 		builderReport.SweepSummary = summary
 		report.addWarning(builderReport.Name + ": " + summary)
+		if !target.submitUnknown {
+			builderReport.ClaimStatus = ReportStepWarning
+			builderReport.ClaimSummary = "Reward 请求已接受，但余额未确认刷新"
+			report.addWarning(builderReport.Name + ": " + builderReport.ClaimSummary)
+		}
+	}
+	if target.submitUnknown {
+		o.markClaimUncertain(ctx, state, report, builder)
 	}
 	o.alertOnce(
 		ctx, state.RunID, "builder_claim_balance_not_visible:"+strings.ToLower(builder),
 		AlertSeverityWarning,
 		fmt.Sprintf(
-			"builder claim balance did not become visible\nbuilder: %s\nclaimable USDC: %s\nattempts: %d",
-			builder, claimable, claimBalanceObservationAttempts,
+			"builder claim balance did not become visible\nbuilder: %s\nminimum increase: %s\nattempts: %d",
+			builder, target.minimumIncrease, claimBalanceObservationAttempts,
 		),
 	)
+}
+
+func (o *Orchestrator) resolveUncertainClaim(report *RunReport, builder string) {
+	builderReport := report.builder(builder)
+	if builderReport == nil {
+		return
+	}
+	builderReport.ClaimUncertain = false
+	builderReport.ClaimStatus = ReportStepSuccess
+	builderReport.ClaimSummary = "Reward 已领取（由余额增长确认；未重发）"
+	if !builderReport.ClaimableObserved {
+		builderReport.ClaimSummary += "；零点 Claimable 数据缺失"
+	}
 }
 
 func (o *Orchestrator) logBuilderSubmitResult(
@@ -892,7 +1200,8 @@ func (o *Orchestrator) builderFailure(
 		report.addWarning(builderReport.Name + ": " + builderActionSummary(action, outcome))
 	}
 	o.alertOnce(
-		ctx, state.RunID, "builder_"+action+"_failed",
+		ctx, state.RunID,
+		"builder_"+action+"_failed:"+strings.ToLower(strings.TrimSpace(builder)),
 		AlertSeverityWarning, action+" action did not complete",
 	)
 }

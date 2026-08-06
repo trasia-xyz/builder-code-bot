@@ -332,7 +332,7 @@ func (o *Orchestrator) attachDailyConsolidation(
 	}
 	if summary.UncertainClaims > 0 {
 		report.addWarning(fmt.Sprintf(
-			"UTC 00:00 有 %d 个 Builder 的 claim 在有限重试后结果仍不确定，请人工核查",
+			"UTC 00:00 有 %d 个 Builder 的 claim 在有限观察后结果仍不确定，请人工核查",
 			summary.UncertainClaims,
 		))
 	}

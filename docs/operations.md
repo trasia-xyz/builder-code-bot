@@ -94,12 +94,15 @@ warning，不阻止 settlement 充足时的 payout。
 
 ### Settlement 不足
 
-保留 `prepared` current；一点会自动重试。重试耗尽后进程退出，current 仍在，修好余额后重启
-即可继续。
+单次一点任务会先有限重查并要求连续两个完整余额样本稳定，避免刚入账但 `/info` 尚未刷新的旧值
+直接判定不足或成为付款基线；recipient 基线同样必须稳定。仍不足时
+保留 `prepared` current 并由调度器自动重试。重试耗尽后进程退出，current 仍在，修好余额后
+重启即可继续。
 
 ### 明确成功 / MySQL 未完成
 
-状态为 `payout_confirmed`：只重试数据库 Complete，**不会**再发链上 payout。重启同样安全。
+状态为 `payout_confirmed`：先校验持久化 journal、请求和 settlement 付款前边界，再只重试数据库
+Complete，**不会**再发链上 payout。校验失败会保留 current 并停止，不会完成 records。
 
 ### 明确拒绝
 
@@ -108,8 +111,11 @@ warning，不阻止 settlement 充足时的 payout。
 
 ### 响应不确定 → blocked
 
-禁止删除 current 后直接重启。根据 current 中的 recipient、amount、nonce、request hash、
-total before 与时间人工核查：
+禁止删除 current。重启或恢复时，程序会先等待并再次只读观察 settlement 与 recipient。只有先
+看到提交后的 settlement 前态，随后两边连续两次分别达到 `settlement total before - amount`
+与 `recipient total before + amount`，才自动确认；这个过程绝不会重发 payout。旧版本留下且
+缺少 recipient 基线的 journal 会保持 blocked，必须人工核查。若仍然 blocked，再根据 current
+中的 recipient、amount、nonce、request hash、双边 total before 与时间人工核查：
 
 - **已付款**：停机状态下幂等完成 manifest 中 records，再归档并移走 current/backup；
 - **未付款**：保留现场归档后，停机状态下移走 current/backup，再允许重新运行；

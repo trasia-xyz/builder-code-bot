@@ -49,8 +49,10 @@ type ManifestInput struct {
 // claims and sweeps only move funds between operator-controlled accounts and
 // are therefore safe to repeat from current balances.
 type PayoutJournal struct {
-	Prepared    exchange.PreparedAction `json:"prepared"`
-	TotalBefore string                  `json:"total_before"`
+	Prepared                      exchange.PreparedAction `json:"prepared"`
+	TotalBefore                   string                  `json:"total_before"`
+	RecipientTotalBefore          string                  `json:"recipient_total_before,omitempty"`
+	PreBalanceObservedAfterSubmit bool                    `json:"pre_balance_observed_after_submit,omitempty"`
 }
 
 type RunState struct {
