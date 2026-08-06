@@ -18,12 +18,22 @@ cp config.example.toml config.toml
 chmod 0600 config.toml
 ```
 
+```toml
+[points_rebate_payout]
+recipient_address = "0x..."
+
+[referral_payout]
+recipient_address = "0x..."
+```
+
 - 生产环境将 `signing.decrypt_password` 留空，启动时从 TTY 读取。
 - 核对配置地址与 keytool 派生地址一致。
 - 不要把私钥、密码或生产配置写入日志、邮件或 shell history。
 - Builder、settlement 均为我方账户；settlement **必须由本服务独占出账**，禁止人工或其他程序
   从该账户发送 spot USDC。
-- Recipient 为非零地址，且不得与任一 builder 或 settlement 相同。
+- 使用 `[points_rebate_payout]` 与 `[referral_payout]` 分别配置两类 recipient；旧 `[payout]`
+  配置不兼容，strict TOML 会拒绝启动。
+- 两个 Recipient 都必须为非零地址，彼此不同，且不得与任一 builder 或 settlement 相同。
 
 ## 启动
 
@@ -51,7 +61,7 @@ chmod 0600 config.toml
 | 时间 | 任务 |
 | --- | --- |
 | UTC 00:00（北京 08:00） | Claim + 归集；失败不阻断一点 |
-| UTC 01:00（北京 09:00） | 冻结 pending records + recipient payout |
+| UTC 01:00（北京 09:00） | 冻结两类 pending records + 依次执行 PointsRebatePayout、ReferralPayout |
 
 一点普通错误约每分钟重试，最多 5 次；fatal 或重试耗尽则进程退出。一点重试只检查 settlement
 与 payout，不执行 builder 动作。
@@ -87,7 +97,9 @@ data/
 | 🟠 | 普通失败，仍有自动重试 |
 | 🔴 | fatal、重试耗尽，或需人工核查 payout |
 
-🟠 为精简重试通知；其余终态含完整明细。对账口径与付款门槛见架构说明：claimable 短缺只升
+🟠 为精简重试通知；其余终态含完整明细。报告分别显示 PointsRebate 与 Referral，并用两类实际
+payout total 的合计与零点 claimable 对账。每个 target 还显示首次提交、是否发生一次 exact replay，
+以及发送方精确减少 amount、精确减少 amount + 1 USDC 或最终 blocked 的结果。Claimable 短缺只升
 warning，不阻止 settlement 充足时的 payout。
 
 ## 故障处置
@@ -95,27 +107,39 @@ warning，不阻止 settlement 充足时的 payout。
 ### Settlement 不足
 
 单次一点任务会先有限重查并要求连续两个完整余额样本稳定，避免刚入账但 `/info` 尚未刷新的旧值
-直接判定不足或成为付款基线；recipient 基线同样必须稳定。仍不足时
-保留 `prepared` current 并由调度器自动重试。重试耗尽后进程退出，current 仍在，修好余额后
-重启即可继续。
+直接判定不足或成为付款基线。第一笔发送前按两个正金额 target 各自六位向上取整后的 payout total
+合计检查 Available；合计不足时一笔也不发送。可能出现的 1 USDC 新地址费用只用于提交后的精确余额
+判断，不加入数据库 payout total 或零点对账。每笔发送方 settlement 基线同样必须稳定。仍不足时保留
+`prepared` current 并由调度器自动重试。重试耗尽后进程退出，current 仍在，修好余额后重启即可
+继续。
 
 ### 明确成功 / MySQL 未完成
 
-状态为 `payout_confirmed`：先校验持久化 journal、请求和 settlement 付款前边界，再只重试数据库
-Complete，**不会**再发链上 payout。校验失败会保留 current 并停止，不会完成 records。
+某个 target 状态为 `payout_confirmed`：先校验其持久化 journal、请求和 settlement 付款前边界，
+再只重试对应数据库表的 Complete，**不会**再发该笔链上 payout。每笔确认后会立即完成对应表；
+PointsRebate 已 completed、Referral 失败时，前者保持完成且不会回滚或重发。校验失败会保留 current
+并停止，不会完成当前 target 的 records。
 
 ### 明确拒绝
 
-归档 `rejected`、清理 current、fatal 退出。修复原因后重启即可；records 仍 pending，且已知
-未付款。
+只有首次提交在尚未出现任何不确定结果时返回的明确拒绝，才能按本节处理。当前 target 归档
+`rejected`、清理 current、fatal 退出。当前 target records 仍 pending，且已知
+未付款；若拒绝发生在第二笔，第一笔 records 已完成且不得回滚或重发。修复原因后再按数据库状态
+重新运行。Exact replay 返回的 duplicate nonce 或其他 err 不能反证首次请求未执行，必须按下一节处理。
 
-### 响应不确定 → blocked
+### 响应不确定 → exact replay 一次 → blocked
 
-禁止删除 current。重启或恢复时，程序会先等待并再次只读观察 settlement 与 recipient。只有先
-看到提交后的 settlement 前态，随后两边连续两次分别达到 `settlement total before - amount`
-与 `recipient total before + amount`，才自动确认；这个过程绝不会重发 payout。旧版本留下且
-缺少 recipient 基线的 journal 会保持 blocked，必须人工核查。若仍然 blocked，再根据 current
-中的 recipient、amount、nonce、request hash、双边 total before 与时间人工核查：
+首次提交超时、网络错误或响应不明确时，程序先只读观察发送方 settlement。连续两次精确达到
+`total before - amount` 或 `total before - amount - 1 USDC` 即确认成功；后一边界用于兼容新地址
+可能产生的 1 USDC 额外扣减。程序不查询、不依赖 recipient 余额。
+
+只有第一轮完整观察窗内的全部成功样本都精确保持在 `total before`，程序才重放一次 journal 中逐字节
+相同的请求，保持相同 nonce 与签名，绝不重新 Prepare。查询样本不足或出现任何其他余额变化时直接
+blocked，不重放。重放返回 `Invalid nonce: duplicate nonce ...`、再次超时或响应仍不明确时，只再观察一次
+settlement；仍无法确认即进入最终 blocked，发送终态报告并结束本次任务。Blocked 后禁止第三次 Submit，
+也禁止生成新 nonce。根据 current 中该 target 的 `kind`、manifest、recipient、amount、nonce、request
+hash、settlement total before、首次提交与 exact replay 记录和时间人工核查；其他已 completed target
+必须保持不动：
 
 - **已付款**：停机状态下幂等完成 manifest 中 records，再归档并移走 current/backup；
 - **未付款**：保留现场归档后，停机状态下移走 current/backup，再允许重新运行；

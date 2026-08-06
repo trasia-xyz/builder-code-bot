@@ -29,8 +29,7 @@ type view struct {
 	Builders           []builderView
 	DailyConsolidation dailyConsolidationView
 	Settlement         settlementView
-	ShowPayout         bool
-	Payout             payoutView
+	Payouts            []payoutView
 	Warnings           []string
 	ShowFailure        bool
 	FailureStage       string
@@ -92,17 +91,22 @@ type dailyConsolidationBuilderView struct {
 }
 
 type payoutView struct {
-	Amount      string
-	Settlement  string
-	Recipient   string
-	TotalBefore string
-	Evidence    string
-	RequestHash string
-	Nonce       string
-	Status      string
-	StatusColor string
-	RateLimit   string
-	RateColor   string
+	Name          string
+	RecordCount   string
+	RawTotal      string
+	Amount        string
+	Settlement    string
+	Recipient     string
+	TotalBefore   string
+	FirstSubmit   string
+	ExactReplay   string
+	Evidence      string
+	RequestHash   string
+	Nonce         string
+	Status        string
+	StatusColor   string
+	Database      string
+	DatabaseColor string
 }
 
 type settlementView struct {
@@ -113,6 +117,8 @@ type settlementView struct {
 	Status    string
 	Color     string
 	Tint      string
+	RateLimit string
+	RateColor string
 }
 
 func Render(report funding.RunReport) notification.Message {
@@ -168,7 +174,7 @@ func buildView(report funding.RunReport) view {
 		Phase:              fallback(string(report.Phase), "—"),
 		StartedAt:          formatTime(report.StartedAt),
 		FinishedAt:         formatTime(report.FinishedAt),
-		Settlement:         buildSettlementView(report.SettlementBalance),
+		Settlement:         buildSettlementView(report),
 		DailyConsolidation: buildDailyConsolidationView(report),
 	}
 
@@ -216,42 +222,36 @@ func buildView(report funding.RunReport) view {
 		})
 	}
 
-	data.ShowPayout = report.Payout.Amount != "" || report.Payout.Status != funding.ReportStepPending
-	if data.ShowPayout {
-		payoutStatus, payoutColor := builderStep(report.Payout.Status, "")
-		data.Payout = payoutView{
-			Amount:      displayAmount(report.Payout.Amount),
-			Settlement:  fallback(report.Payout.Settlement, "—"),
-			Recipient:   fallback(report.Payout.Recipient, "—"),
-			TotalBefore: displayAmount(report.Payout.SettlementTotalBefore),
-			Evidence:    evidenceLabel(report.Payout.ConfirmationEvidence),
-			RequestHash: fallback(report.Payout.RequestHash, "—"),
-			Status:      payoutStatus,
-			StatusColor: payoutColor,
-			RateLimit:   "未观察",
-			RateColor:   "#64748b",
+	for _, target := range report.Payouts {
+		if !target.RecordsRead && target.Payout.Amount == "" &&
+			target.Payout.Status == funding.ReportStepPending {
+			continue
 		}
-		switch {
-		case report.SettlementRateLimitQueryFailed:
-			data.Payout.RateLimit, data.Payout.RateColor = "查询失败", "#dc2626"
-		case report.SettlementRateLimitVisibilityUnconfirmed:
-			data.Payout.RateLimit = fmt.Sprintf(
-				"最低观测 %d · 刷新未确认", report.SettlementRateLimitRemaining,
-			)
-			data.Payout.RateColor = "#d97706"
-		case report.SettlementRateLimitObserved:
-			data.Payout.RateLimit = fmt.Sprintf("剩余 %d", report.SettlementRateLimitRemaining)
-			if report.SettlementRateLimitRemaining < 200 {
-				data.Payout.RateColor = "#d97706"
-			} else {
-				data.Payout.RateColor = "#15803d"
-			}
+		payoutStatus, payoutColor := builderStep(target.Payout.Status, "")
+		databaseStatus, databaseColor := builderStep(target.DatabaseStatus, "")
+		item := payoutView{
+			Name:          payoutName(target.Kind),
+			RecordCount:   fmt.Sprintf("%d", target.RecordCount),
+			RawTotal:      displayAmount(target.RawTotal),
+			Amount:        displayAmount(target.Payout.Amount),
+			Settlement:    fallback(target.Payout.Settlement, "—"),
+			Recipient:     fallback(target.Payout.Recipient, "—"),
+			TotalBefore:   displayAmount(target.Payout.SettlementTotalBefore),
+			FirstSubmit:   firstSubmitLabel(target.Payout.SubmitAttempts),
+			ExactReplay:   exactReplayLabel(target.Payout.SubmitAttempts),
+			Evidence:      evidenceLabel(target.Payout.ConfirmationEvidence, target.Payout.Blocked),
+			RequestHash:   fallback(target.Payout.RequestHash, "—"),
+			Status:        payoutStatus,
+			StatusColor:   payoutColor,
+			Database:      databaseStatus,
+			DatabaseColor: databaseColor,
 		}
-		if report.Payout.Nonce != 0 {
-			data.Payout.Nonce = fmt.Sprintf("%d", report.Payout.Nonce)
+		if target.Payout.Nonce != 0 {
+			item.Nonce = fmt.Sprintf("%d", target.Payout.Nonce)
 		} else {
-			data.Payout.Nonce = "—"
+			item.Nonce = "—"
 		}
+		data.Payouts = append(data.Payouts, item)
 	}
 	return data
 }
@@ -368,12 +368,14 @@ func preheader(report funding.RunReport, duration time.Duration) string {
 	)
 }
 
-func buildSettlementView(balance funding.SettlementBalanceReport) settlementView {
+func buildSettlementView(report funding.RunReport) settlementView {
+	balance := report.SettlementBalance
 	data := settlementView{
 		Address: fallback(balance.Address, "—"),
 		Total:   displayAmount(balance.Total), Hold: displayAmount(balance.Hold),
 		Available: displayAmount(balance.Available),
 		Status:    "未观察", Color: "#64748b", Tint: "#f8fafc",
+		RateLimit: "未观察", RateColor: "#64748b",
 	}
 	switch {
 	case balance.PostPayoutUnconfirmed:
@@ -382,6 +384,22 @@ func buildSettlementView(balance funding.SettlementBalanceReport) settlementView
 		data.Status, data.Color, data.Tint = "查询失败", "#b91c1c", "#fef2f2"
 	case balance.Observed:
 		data.Status, data.Color, data.Tint = "已观察", "#15803d", "#ecfdf3"
+	}
+	switch {
+	case report.SettlementRateLimitQueryFailed:
+		data.RateLimit, data.RateColor = "查询失败", "#dc2626"
+	case report.SettlementRateLimitVisibilityUnconfirmed:
+		data.RateLimit = fmt.Sprintf(
+			"最低观测 %d · 刷新未确认", report.SettlementRateLimitRemaining,
+		)
+		data.RateColor = "#d97706"
+	case report.SettlementRateLimitObserved:
+		data.RateLimit = fmt.Sprintf("剩余 %d", report.SettlementRateLimitRemaining)
+		if report.SettlementRateLimitRemaining < 200 {
+			data.RateColor = "#d97706"
+		} else {
+			data.RateColor = "#15803d"
+		}
 	}
 	return data
 }
@@ -505,24 +523,58 @@ func stageLabel(key string) string {
 		return "Reward"
 	case "sweep":
 		return "资金归集"
-	case "payout":
-		return "Payout"
-	case "database":
-		return "数据库"
+	case "points_rebate_payout":
+		return "Points Rebate Payout"
+	case "points_rebate_database":
+		return "Points Rebate 数据库"
+	case "referral_payout":
+		return "Referral Payout"
+	case "referral_database":
+		return "Referral 数据库"
+	case "finalize":
+		return "状态归档"
 	default:
 		return fallback(key, "任务执行")
 	}
 }
 
-func evidenceLabel(evidence string) string {
+func payoutName(kind funding.PayoutKind) string {
+	switch kind {
+	case funding.PayoutKindPointsRebate:
+		return "Points Rebate Payout"
+	case funding.PayoutKindReferral:
+		return "Referral Payout"
+	default:
+		return fallback(string(kind), "Payout")
+	}
+}
+
+func firstSubmitLabel(attempts int) string {
+	if attempts > 0 {
+		return "已授权 / 可能已发送"
+	}
+	return "未授权"
+}
+
+func exactReplayLabel(attempts int) string {
+	if attempts > 1 {
+		return "已授权 / 可能已发送（原请求 / 相同 nonce）"
+	}
+	return "未授权"
+}
+
+func evidenceLabel(evidence string, blocked bool) string {
 	switch evidence {
 	case "exchange_response":
 		return "Exchange 明确确认"
 	case "settlement_balance_decreased":
-		return "Settlement 达到预期付款后余额"
-	case "paired_balance_boundary":
-		return "Settlement 与 Recipient 达到预期付款后余额"
+		return "Settlement 精确减少 amount"
+	case "settlement_balance_decreased_with_activation_fee":
+		return "Settlement 精确减少 amount + 1 USDC（新地址费用）"
 	default:
+		if blocked {
+			return "发送方余额未能确认（blocked）"
+		}
 		return fallback(evidence, "—")
 	}
 }
@@ -681,8 +733,9 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
             <tr><td style="padding:14px 16px;color:#64748b;">状态</td><td style="padding:14px 16px;color:{{.Settlement.Color}};font-weight:700;">{{.Settlement.Status}}</td></tr>
             <tr><td style="padding:0 16px 12px;color:#64748b;">地址</td><td style="padding:0 16px 12px;word-break:break-all;">{{.Settlement.Address}}</td></tr>
             <tr><td style="padding:0 16px 12px;color:#64748b;">Total</td><td style="padding:0 16px 12px;font-weight:700;">{{.Settlement.Total}} USDC</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">Hold</td><td style="padding:0 16px 12px;">{{.Settlement.Hold}} USDC</td></tr>
-            <tr><td style="padding:0 16px 14px;color:#64748b;">Available</td><td style="padding:0 16px 14px;font-weight:700;">{{.Settlement.Available}} USDC</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">Hold</td><td style="padding:0 16px 12px;">{{.Settlement.Hold}} USDC</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">Available</td><td style="padding:0 16px 12px;font-weight:700;">{{.Settlement.Available}} USDC</td></tr>
+	            <tr><td style="padding:0 16px 14px;color:#64748b;">Rate Limit</td><td style="padding:0 16px 14px;color:{{.Settlement.RateColor}};">{{.Settlement.RateLimit}}</td></tr>
           </table>
         </td></tr>
 
@@ -710,25 +763,31 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
         </td></tr>
         {{end}}
 
-        {{if .ShowPayout}}
-        <tr><td class="pad" style="padding:22px 30px 10px;border-top:1px solid #e5e9f0;">
-          <div style="font-size:16px;font-weight:750;color:#0f172a;">Payout</div>
-        </td></tr>
-        <tr><td class="pad" style="padding:4px 30px 24px;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13px;line-height:1.55;background:#f8fafc;border-radius:10px;">
-            <tr><td style="padding:14px 16px;color:#64748b;">状态</td><td style="padding:14px 16px;color:{{.Payout.StatusColor}};font-weight:700;">{{.Payout.Status}}</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">金额</td><td style="padding:0 16px 12px;font-weight:700;">{{.Payout.Amount}} USDC</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">Raw total</td><td style="padding:0 16px 12px;">{{.RawTotal}} USDC</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">付款前 total</td><td style="padding:0 16px 12px;">{{.Payout.TotalBefore}} USDC</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">确认依据</td><td style="padding:0 16px 12px;">{{.Payout.Evidence}}</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">Rate Limit</td><td style="padding:0 16px 12px;color:{{.Payout.RateColor}};">{{.Payout.RateLimit}}</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">Settlement</td><td style="padding:0 16px 12px;word-break:break-all;">{{.Payout.Settlement}}</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">Recipient</td><td style="padding:0 16px 12px;word-break:break-all;">{{.Payout.Recipient}}</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">Request hash</td><td style="padding:0 16px 12px;word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;">{{.Payout.RequestHash}}</td></tr>
-            <tr><td style="padding:0 16px 14px;color:#64748b;">Nonce</td><td style="padding:0 16px 14px;">{{.Payout.Nonce}}</td></tr>
-          </table>
-        </td></tr>
-        {{end}}
+	        {{if .Payouts}}
+	        <tr><td class="pad" style="padding:22px 30px 10px;border-top:1px solid #e5e9f0;">
+	          <div style="font-size:16px;font-weight:750;color:#0f172a;">Payout 明细</div>
+	        </td></tr>
+	        {{range .Payouts}}
+	        <tr><td class="pad" style="padding:4px 30px 24px;">
+	          <div style="margin-bottom:8px;font-size:14px;font-weight:750;color:#334155;">{{.Name}}</div>
+	          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13px;line-height:1.55;background:#f8fafc;border-radius:10px;">
+	            <tr><td style="padding:14px 16px;color:#64748b;">付款状态</td><td style="padding:14px 16px;color:{{.StatusColor}};font-weight:700;">{{.Status}}</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">数据库状态</td><td style="padding:0 16px 12px;color:{{.DatabaseColor}};font-weight:700;">{{.Database}}</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">Records</td><td style="padding:0 16px 12px;">{{.RecordCount}}</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">金额</td><td style="padding:0 16px 12px;font-weight:700;">{{.Amount}} USDC</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">Raw total</td><td style="padding:0 16px 12px;">{{.RawTotal}} USDC</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">付款前 total</td><td style="padding:0 16px 12px;">{{.TotalBefore}} USDC</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">首次 Submit</td><td style="padding:0 16px 12px;">{{.FirstSubmit}}</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">Exact replay</td><td style="padding:0 16px 12px;">{{.ExactReplay}}</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">确认依据</td><td style="padding:0 16px 12px;">{{.Evidence}}</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">Settlement</td><td style="padding:0 16px 12px;word-break:break-all;">{{.Settlement}}</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">Recipient</td><td style="padding:0 16px 12px;word-break:break-all;">{{.Recipient}}</td></tr>
+	            <tr><td style="padding:0 16px 12px;color:#64748b;">Request hash</td><td style="padding:0 16px 12px;word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;">{{.RequestHash}}</td></tr>
+	            <tr><td style="padding:0 16px 14px;color:#64748b;">Nonce</td><td style="padding:0 16px 14px;">{{.Nonce}}</td></tr>
+	          </table>
+	        </td></tr>
+	        {{end}}
+	        {{end}}
 
         {{if .Warnings}}
         <tr><td class="pad" style="padding:22px 30px;border-top:1px solid #e5e9f0;">
@@ -778,8 +837,8 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
     <tr><td style="padding:0 16px 11px;color:#64748b;">完成时间</td><td style="padding:0 16px 11px;">{{.CompletedAt}}</td></tr>
     <tr><td style="padding:0 16px 11px;color:#64748b;">{{.TotalLabel}}</td><td style="padding:0 16px 11px;font-weight:700;">{{.Total}} USDC</td></tr>
     <tr><td style="padding:0 16px 11px;color:#64748b;">Builder 覆盖</td><td style="padding:0 16px 11px;">{{.Coverage}}</td></tr>
-    <tr><td style="padding:0 16px 11px;color:#64748b;">本轮数据库 Payout</td><td style="padding:0 16px 11px;font-weight:700;">{{.PayoutTotal}} USDC</td></tr>
-    <tr><td style="padding:0 16px 13px;color:#64748b;">对账差额（Claimable - Payout）</td><td style="padding:0 16px 13px;font-weight:700;color:{{.DifferenceColor}};">{{.Difference}} USDC</td></tr>
+	    <tr><td style="padding:0 16px 11px;color:#64748b;">本轮两类数据库 Payout 合计</td><td style="padding:0 16px 11px;font-weight:700;">{{.PayoutTotal}} USDC</td></tr>
+	    <tr><td style="padding:0 16px 13px;color:#64748b;">对账差额（Claimable - Payout 合计）</td><td style="padding:0 16px 13px;font-weight:700;color:{{.DifferenceColor}};">{{.Difference}} USDC</td></tr>
   </table>
   {{if .Builders}}
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:12px;font-size:13px;border-collapse:collapse;">

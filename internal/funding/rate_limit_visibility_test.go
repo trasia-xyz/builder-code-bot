@@ -125,13 +125,16 @@ func TestRecoveredPayoutRetainsRateLimitVisibilityBoundary(t *testing.T) {
 	fx := newRateLimitVisibilityFixture(200, 200, 199)
 	fx.report.submittedAccounts = nil
 	state := &RunState{
-		Phase: PhasePayoutSubmitting,
-		Manifest: Manifest{
-			Settlement: "0xsettlement",
+		Targets: []PayoutTargetState{
+			{
+				Kind: PayoutKindPointsRebate, Phase: PhasePayoutSubmitting,
+				Manifest: Manifest{Settlement: "0xsettlement"},
+				Payout:   &PayoutJournal{},
+			},
+			{Kind: PayoutKindReferral, Phase: PhasePrepared},
 		},
-		Payout: &PayoutJournal{},
 	}
-	markRecoveredPayoutSubmission(&fx.report, state, StateLoadMetadata{})
+	markRecoveredPayoutSubmission(&fx.report, state, &state.Targets[0], StateLoadMetadata{})
 
 	fx.orchestrator.observeUserRateLimits(context.Background(), &fx.report)
 
@@ -143,26 +146,29 @@ func TestRecoveredPayoutRetainsRateLimitVisibilityBoundary(t *testing.T) {
 
 func TestOnlyBackupPreparedPayoutMayHaveBeenSubmitted(t *testing.T) {
 	state := &RunState{
-		Phase: PhasePayoutPrepared,
-		Manifest: Manifest{
-			Settlement: "0xsettlement",
+		Targets: []PayoutTargetState{
+			{
+				Kind: PayoutKindPointsRebate, Phase: PhasePayoutPrepared,
+				Manifest: Manifest{Settlement: "0xsettlement"},
+				Payout:   &PayoutJournal{},
+			},
+			{Kind: PayoutKindReferral, Phase: PhasePrepared},
 		},
-		Payout: &PayoutJournal{},
 	}
 	primary := newRunReport(
 		time.Unix(0, 0), TriggerUTC, ReportExecution{}, "mainnet",
-		nil, nil, "0xsettlement", "0xrecipient",
+		nil, nil, "0xsettlement", "0xrecipient", "0xreferral",
 	)
-	markRecoveredPayoutSubmission(&primary, state, StateLoadMetadata{})
+	markRecoveredPayoutSubmission(&primary, state, &state.Targets[0], StateLoadMetadata{})
 	if primary.submitted("0xsettlement") {
 		t.Fatal("primary payout_prepared was marked as submitted")
 	}
 	backup := newRunReport(
 		time.Unix(0, 0), TriggerUTC, ReportExecution{}, "mainnet",
-		nil, nil, "0xsettlement", "0xrecipient",
+		nil, nil, "0xsettlement", "0xrecipient", "0xreferral",
 	)
 	markRecoveredPayoutSubmission(
-		&backup, state, StateLoadMetadata{RecoveredFromBackup: true},
+		&backup, state, &state.Targets[0], StateLoadMetadata{RecoveredFromBackup: true},
 	)
 	if !backup.submitted("0xsettlement") {
 		t.Fatal("backup payout_prepared was not marked as possibly submitted")
@@ -229,7 +235,7 @@ func newRateLimitVisibilityFixture(remaining ...uint64) rateLimitVisibilityFixtu
 	}
 	report := newRunReport(
 		time.Unix(0, 0), TriggerUTC, ReportExecution{}, "mainnet",
-		nil, nil, "0xsettlement", "0xrecipient",
+		nil, nil, "0xsettlement", "0xrecipient", "0xreferral",
 	)
 	report.markSubmitted("0xsettlement")
 	return rateLimitVisibilityFixture{

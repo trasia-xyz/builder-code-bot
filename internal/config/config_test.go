@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	builderOneAddress = "0x1111111111111111111111111111111111111111"
-	builderTwoAddress = "0x2222222222222222222222222222222222222222"
-	settlementAddress = "0x3333333333333333333333333333333333333333"
-	recipientAddress  = "0x4444444444444444444444444444444444444444"
+	builderOneAddress         = "0x1111111111111111111111111111111111111111"
+	builderTwoAddress         = "0x2222222222222222222222222222222222222222"
+	settlementAddress         = "0x3333333333333333333333333333333333333333"
+	referralPayoutAddress     = "0x4444444444444444444444444444444444444444"
+	pointsRebatePayoutAddress = "0x5555555555555555555555555555555555555555"
 )
 
 func TestLoadFileRejectsUnknownField(t *testing.T) {
@@ -37,6 +38,12 @@ func TestLoadFileDecodesMultipleBuildersAndSeparateSettlement(t *testing.T) {
 	}
 	if cfg.Settlement.Address != settlementAddress {
 		t.Fatalf("Settlement.Address = %q", cfg.Settlement.Address)
+	}
+	if cfg.ReferralPayout.RecipientAddress != referralPayoutAddress {
+		t.Fatalf("ReferralPayout.RecipientAddress = %q", cfg.ReferralPayout.RecipientAddress)
+	}
+	if cfg.PointsRebatePayout.RecipientAddress != pointsRebatePayoutAddress {
+		t.Fatalf("PointsRebatePayout.RecipientAddress = %q", cfg.PointsRebatePayout.RecipientAddress)
 	}
 	if cfg.MySQL.Password.Reveal() != "" || cfg.Signing.DecryptPassword.Reveal() != "" {
 		t.Fatal("empty passwords must be accepted and preserved")
@@ -148,26 +155,78 @@ func TestLoadFileRejectsSettlementBuilderAddress(t *testing.T) {
 	}
 }
 
-func TestLoadFileRejectsRecipientSettlementAddress(t *testing.T) {
-	content := strings.Replace(validConfig(), recipientAddress, settlementAddress, 1)
+func TestLoadFileRejectsInvalidPayoutRecipientAddresses(t *testing.T) {
+	tests := []struct {
+		name        string
+		address     string
+		replacement string
+		wantError   string
+	}{
+		{
+			name:    "referral payout uses settlement",
+			address: referralPayoutAddress, replacement: settlementAddress,
+			wantError: "referral payout recipient address must differ from settlement address",
+		},
+		{
+			name:    "points rebate payout uses settlement",
+			address: pointsRebatePayoutAddress, replacement: settlementAddress,
+			wantError: "points rebate payout recipient address must differ from settlement address",
+		},
+		{
+			name:    "referral payout uses builder",
+			address: referralPayoutAddress, replacement: builderOneAddress,
+			wantError: "referral payout recipient address must differ from builder addresses",
+		},
+		{
+			name:    "points rebate payout uses builder",
+			address: pointsRebatePayoutAddress, replacement: builderOneAddress,
+			wantError: "points rebate payout recipient address must differ from builder addresses",
+		},
+		{
+			name:    "referral payout uses zero address",
+			address: referralPayoutAddress, replacement: zeroAddress,
+			wantError: "referral payout recipient address must not be the zero address",
+		},
+		{
+			name:    "points rebate payout uses zero address",
+			address: pointsRebatePayoutAddress, replacement: zeroAddress,
+			wantError: "points rebate payout recipient address must not be the zero address",
+		},
+		{
+			name:    "referral payout uses malformed address",
+			address: referralPayoutAddress, replacement: "not-an-address",
+			wantError: "referral payout recipient address must match",
+		},
+		{
+			name:    "points rebate payout uses malformed address",
+			address: pointsRebatePayoutAddress, replacement: "not-an-address",
+			wantError: "points rebate payout recipient address must match",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := strings.Replace(validConfig(), tt.address, tt.replacement, 1)
+			_, err := LoadFile(writeConfig(t, content))
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("LoadFile() error = %v, want substring %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestLoadFileRejectsDuplicatePayoutRecipientAddresses(t *testing.T) {
+	content := strings.Replace(validConfig(), pointsRebatePayoutAddress, referralPayoutAddress, 1)
 	_, err := LoadFile(writeConfig(t, content))
-	if err == nil || !strings.Contains(err.Error(), "recipient") {
+	if err == nil || !strings.Contains(err.Error(), "payout recipient addresses must differ") {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 }
 
-func TestLoadFileRejectsRecipientBuilderAddress(t *testing.T) {
-	content := strings.Replace(validConfig(), recipientAddress, builderOneAddress, 1)
+func TestLoadFileRejectsLegacyPayoutSection(t *testing.T) {
+	content := strings.Replace(validConfig(), "[referral_payout]", "[payout]", 1)
 	_, err := LoadFile(writeConfig(t, content))
-	if err == nil || !strings.Contains(err.Error(), "recipient") {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-}
-
-func TestLoadFileRejectsZeroRecipientAddress(t *testing.T) {
-	content := strings.Replace(validConfig(), recipientAddress, zeroAddress, 1)
-	_, err := LoadFile(writeConfig(t, content))
-	if err == nil || !strings.Contains(err.Error(), "zero address") {
+	if err == nil || !strings.Contains(err.Error(), "payout") {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 }
@@ -268,8 +327,11 @@ encrypted_private_key = "ciphertext-two"
 address = "` + settlementAddress + `"
 encrypted_private_key = "settlement-ciphertext"
 
-[payout]
-recipient_address = "` + recipientAddress + `"
+[referral_payout]
+recipient_address = "` + referralPayoutAddress + `"
+
+[points_rebate_payout]
+recipient_address = "` + pointsRebatePayoutAddress + `"
 
 [aws]
 region = "ap-northeast-1"

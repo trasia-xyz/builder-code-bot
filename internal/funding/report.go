@@ -90,9 +90,21 @@ type PayoutReport struct {
 	Settlement            string
 	Recipient             string
 	SettlementTotalBefore string
+	SubmitAttempts        int
+	Blocked               bool
 	ConfirmationEvidence  string
 	RequestHash           string
 	Nonce                 uint64
+}
+
+type PayoutTargetReport struct {
+	Kind           PayoutKind
+	RecordsRead    bool
+	RecordCount    int
+	RawTotal       string
+	PayoutTotal    string
+	Payout         PayoutReport
+	DatabaseStatus ReportStepStatus
 }
 
 type SettlementBalanceReport struct {
@@ -127,7 +139,7 @@ type RunReport struct {
 	Stages                                   []ReportStage
 	Builders                                 []BuilderReport
 	DailyConsolidation                       DailyConsolidationReport
-	Payout                                   PayoutReport
+	Payouts                                  []PayoutTargetReport
 	SettlementBalance                        SettlementBalanceReport
 	SettlementRateLimitRemaining             uint64
 	SettlementRateLimitObserved              bool
@@ -148,7 +160,7 @@ func newRunReport(
 	network string,
 	builders []string,
 	builderNames map[string]string,
-	settlement, recipient string,
+	settlement, pointsRebateRecipient, referralRecipient string,
 ) RunReport {
 	report := RunReport{
 		Trigger:     trigger,
@@ -161,11 +173,29 @@ func newRunReport(
 			{Key: "snapshot", Label: "数据快照", Status: ReportStepPending},
 			{Key: "rewards", Label: "Reward", Status: ReportStepPending},
 			{Key: "sweep", Label: "资金归集", Status: ReportStepPending},
-			{Key: "payout", Label: "Payout", Status: ReportStepPending},
-			{Key: "database", Label: "数据库", Status: ReportStepPending},
+			{Key: targetStageKey(PayoutKindPointsRebate, "payout"), Label: "Points Rebate Payout", Status: ReportStepPending},
+			{Key: targetStageKey(PayoutKindPointsRebate, "database"), Label: "Points Rebate 数据库", Status: ReportStepPending},
+			{Key: targetStageKey(PayoutKindReferral, "payout"), Label: "Referral Payout", Status: ReportStepPending},
+			{Key: targetStageKey(PayoutKindReferral, "database"), Label: "Referral 数据库", Status: ReportStepPending},
+			{Key: "finalize", Label: "状态归档", Status: ReportStepPending},
 		},
-		Payout: PayoutReport{
-			Status: ReportStepPending, Settlement: settlement, Recipient: recipient,
+		Payouts: []PayoutTargetReport{
+			{
+				Kind: PayoutKindPointsRebate,
+				Payout: PayoutReport{
+					Status: ReportStepPending, Settlement: settlement,
+					Recipient: pointsRebateRecipient,
+				},
+				DatabaseStatus: ReportStepPending,
+			},
+			{
+				Kind: PayoutKindReferral,
+				Payout: PayoutReport{
+					Status: ReportStepPending, Settlement: settlement,
+					Recipient: referralRecipient,
+				},
+				DatabaseStatus: ReportStepPending,
+			},
 		},
 		SettlementBalance: SettlementBalanceReport{Address: settlement},
 	}
@@ -190,21 +220,133 @@ func (r *RunReport) syncState(state *RunState) {
 	}
 	r.RunID = state.RunID
 	r.UTCDate = state.UTCDate
-	r.Phase = state.Phase
-	r.RecordCount = len(state.Manifest.Records)
-	r.RecordsRead = true
-	r.RawTotal = state.Manifest.RawTotal
-	r.PayoutTotal = state.Manifest.PayoutTotal
-	r.Payout.Amount = state.Manifest.PayoutTotal
-	r.Payout.Settlement = state.Manifest.Settlement
-	r.Payout.Recipient = state.Manifest.Recipient
-	r.SettlementBalance.Address = state.Manifest.Settlement
-	r.token = cloneToken(state.Manifest.Token)
-	if state.Payout != nil {
-		r.Payout.SettlementTotalBefore = state.Payout.TotalBefore
-		r.Payout.RequestHash = state.Payout.Prepared.RequestHash
-		r.Payout.Nonce = state.Payout.Prepared.Nonce
+	active, _, activeErr := state.activePayoutTarget()
+	if activeErr == nil && active != nil {
+		r.Phase = active.Phase
+	} else if activeErr == nil {
+		r.Phase = PhaseCompleted
 	}
+	r.RecordCount = 0
+	r.RecordsRead = len(state.Targets) > 0
+	rawTotal := decimal.Zero
+	payoutTotal := decimal.Zero
+	for index := range state.Targets {
+		stateTarget := &state.Targets[index]
+		targetReport := r.target(stateTarget.Kind)
+		targetReport.RecordsRead = true
+		targetReport.RecordCount = len(stateTarget.Manifest.Records)
+		targetReport.RawTotal = stateTarget.Manifest.RawTotal
+		targetReport.PayoutTotal = stateTarget.Manifest.PayoutTotal
+		targetReport.Payout.Amount = stateTarget.Manifest.PayoutTotal
+		targetReport.Payout.Settlement = stateTarget.Manifest.Settlement
+		targetReport.Payout.Recipient = stateTarget.Manifest.Recipient
+		r.RecordCount += len(stateTarget.Manifest.Records)
+		if parsed, err := decimal.NewFromString(stateTarget.Manifest.RawTotal); err == nil {
+			rawTotal = rawTotal.Add(parsed)
+		}
+		if parsed, err := decimal.NewFromString(stateTarget.Manifest.PayoutTotal); err == nil {
+			payoutTotal = payoutTotal.Add(parsed)
+		}
+		if r.SettlementBalance.Address == "" {
+			r.SettlementBalance.Address = stateTarget.Manifest.Settlement
+		}
+		if r.token == nil && stateTarget.Manifest.Token != nil {
+			r.token = cloneToken(stateTarget.Manifest.Token)
+		}
+		if stateTarget.Payout != nil {
+			targetReport.Payout.SettlementTotalBefore = stateTarget.Payout.TotalBefore
+			targetReport.Payout.SubmitAttempts = stateTarget.Payout.SubmitAttempts
+			targetReport.Payout.RequestHash = stateTarget.Payout.Prepared.RequestHash
+			targetReport.Payout.Nonce = stateTarget.Payout.Prepared.Nonce
+		}
+		targetReport.Payout.Blocked = isUncertainPayoutBlock(stateTarget)
+		if stateTarget.ConfirmationEvidence != "" {
+			targetReport.Payout.ConfirmationEvidence = stateTarget.ConfirmationEvidence
+		}
+		r.syncTargetStatuses(stateTarget, targetReport)
+	}
+	r.RawTotal = rawTotal.StringFixed(18)
+	r.PayoutTotal = payoutTotal.String()
+}
+
+func (r *RunReport) syncTargetStatuses(
+	stateTarget *PayoutTargetState,
+	targetReport *PayoutTargetReport,
+) {
+	if r == nil || stateTarget == nil || targetReport == nil {
+		return
+	}
+	switch stateTarget.Phase {
+	case PhasePayoutConfirmed:
+		targetReport.Payout.Status = ReportStepSuccess
+		r.setTargetStage(stateTarget.Kind, "payout", ReportStepSuccess, "Payout 已确认")
+	case PhaseCompleted:
+		if len(stateTarget.Manifest.Records) == 0 {
+			targetReport.Payout.Status = ReportStepSkipped
+			targetReport.DatabaseStatus = ReportStepSkipped
+			r.setTargetStage(stateTarget.Kind, "payout", ReportStepSkipped, "没有待处理记录")
+			r.setTargetStage(stateTarget.Kind, "database", ReportStepSkipped, "没有待完成记录")
+		} else {
+			if stateTarget.Manifest.PayoutTotal == "0" {
+				targetReport.Payout.Status = ReportStepSkipped
+				r.setTargetStage(stateTarget.Kind, "payout", ReportStepSkipped, "无需付款")
+			} else {
+				targetReport.Payout.Status = ReportStepSuccess
+				r.setTargetStage(stateTarget.Kind, "payout", ReportStepSuccess, "Payout 已确认")
+			}
+			targetReport.DatabaseStatus = ReportStepSuccess
+			r.setTargetStage(
+				stateTarget.Kind, "database", ReportStepSuccess,
+				fmt.Sprintf("%d 条记录已完成", len(stateTarget.Manifest.Records)),
+			)
+		}
+	}
+}
+
+func targetStageKey(kind PayoutKind, stage string) string {
+	return string(kind) + "_" + stage
+}
+
+func (r *RunReport) target(kind PayoutKind) *PayoutTargetReport {
+	if r == nil {
+		return nil
+	}
+	for index := range r.Payouts {
+		if r.Payouts[index].Kind == kind {
+			return &r.Payouts[index]
+		}
+	}
+	r.Payouts = append(r.Payouts, PayoutTargetReport{
+		Kind:           kind,
+		Payout:         PayoutReport{Status: ReportStepPending},
+		DatabaseStatus: ReportStepPending,
+	})
+	return &r.Payouts[len(r.Payouts)-1]
+}
+
+func (r *RunReport) setTargetStage(
+	kind PayoutKind,
+	stage string,
+	status ReportStepStatus,
+	summary string,
+) {
+	r.setStage(targetStageKey(kind, stage), status, summary)
+}
+
+func (r *RunReport) markTargetNoData(kind PayoutKind) {
+	if r == nil {
+		return
+	}
+	target := r.target(kind)
+	target.RecordsRead = true
+	target.RecordCount = 0
+	target.RawTotal = "0.000000000000000000"
+	target.PayoutTotal = "0"
+	target.Payout.Amount = "0"
+	target.Payout.Status = ReportStepSkipped
+	target.DatabaseStatus = ReportStepSkipped
+	r.setTargetStage(kind, "payout", ReportStepSkipped, "没有待处理记录")
+	r.setTargetStage(kind, "database", ReportStepSkipped, "没有待完成记录")
 }
 
 func (r *RunReport) markSubmitted(address string) {
@@ -296,12 +438,30 @@ func (r *RunReport) fail(stage, summary, nextAction string) {
 	r.FailureStage = stage
 	r.FailureSummary = summary
 	r.NextAction = nextAction
-	if stage == "payout" {
-		r.Payout.Status = ReportStepFailed
-	}
 	if stage != "" {
 		r.setStage(stage, ReportStepFailed, summary)
 	}
+}
+
+func (r *RunReport) failTarget(
+	kind PayoutKind,
+	stage, summary, nextAction string,
+) {
+	if r == nil {
+		return
+	}
+	stageKey := targetStageKey(kind, stage)
+	r.FailureStage = stageKey
+	r.FailureSummary = summary
+	r.NextAction = nextAction
+	target := r.target(kind)
+	if stage == "payout" {
+		target.Payout.Status = ReportStepFailed
+	}
+	if stage == "database" {
+		target.DatabaseStatus = ReportStepFailed
+	}
+	r.setTargetStage(kind, stage, ReportStepFailed, summary)
 }
 
 func (r *RunReport) finalize(now time.Time, runErr error) bool {
@@ -387,7 +547,7 @@ func (r *RunReport) reconcileDailyConsolidation() {
 	consolidation.BelowPayout = true
 	consolidation.ShortfallUSDC = shortfall.String()
 	r.addWarning(fmt.Sprintf(
-		"UTC 00:00 Claimable 合计 %s USDC，低于数据库 Payout %s USDC，短缺 %s USDC，请人工核查结算口径",
+		"UTC 00:00 Claimable 合计 %s USDC，低于两类数据库 Payout 合计 %s USDC，短缺 %s USDC，请人工核查结算口径",
 		claimable.String(), payout.String(), shortfall.String(),
 	))
 }

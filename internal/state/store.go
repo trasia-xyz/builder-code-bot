@@ -137,7 +137,10 @@ func (s *Store) Clear(ctx context.Context) error {
 	if err := ensurePrivateDir(s.dataDir); err != nil {
 		return fmt.Errorf("prepare state directory: %w", err)
 	}
-	for _, name := range []string{currentFilename, backupFilename} {
+	// Remove the stale generation first. If the process stops between removes,
+	// recovery still sees the newest terminal current state instead of falling
+	// back to a pre-terminal backup that could authorize another payout attempt.
+	for _, name := range []string{backupFilename, currentFilename} {
 		if err := os.Remove(filepath.Join(s.dataDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove %s: %w", name, err)
 		}

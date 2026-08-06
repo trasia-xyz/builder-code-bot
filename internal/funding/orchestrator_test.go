@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -61,7 +62,8 @@ func TestDailyConsolidationAndFundingAreSeparatePhases(t *testing.T) {
 		t.Fatalf("completed IDs = %v, archive = %q", fx.repo.completedIDs, fx.store.archiveResult)
 	}
 	report := onlyReport(t, fx.notifier)
-	if report.Status != ReportStatusSuccess || report.Payout.Status != ReportStepSuccess ||
+	if report.Status != ReportStatusSuccess ||
+		report.target(PayoutKindPointsRebate).Payout.Status != ReportStepSuccess ||
 		!report.DailyConsolidation.Observed ||
 		report.DailyConsolidation.TotalClaimableUSDC != "1.5" ||
 		!report.DailyConsolidation.CoversPayout ||
@@ -94,10 +96,11 @@ func TestFinalReportWaitsForAcceptedPayoutBalanceVisibility(t *testing.T) {
 
 	report := onlyReport(t, fx.notifier)
 	balance := report.SettlementBalance
-	if report.Payout.Status != ReportStepSuccess || !balance.Observed ||
+	pointsPayout := report.target(PayoutKindPointsRebate).Payout
+	if pointsPayout.Status != ReportStepSuccess || !balance.Observed ||
 		balance.QueryFailed || balance.PostPayoutUnconfirmed ||
 		balance.Total != "1" || balance.Hold != "0.25" || balance.Available != "0.75" {
-		t.Fatalf("final report payout=%#v settlement balance=%#v", report.Payout, balance)
+		t.Fatalf("final report payout=%#v settlement balance=%#v", pointsPayout, balance)
 	}
 	if calls := fx.chain.balanceCalls["0xsettlement"] - balanceCallsBefore; calls != 4 {
 		t.Fatalf("UTC 01:00 settlement balance calls = %d, want two payout checks plus two final observations", calls)
@@ -132,7 +135,8 @@ func TestFinalReportDoesNotLabelStalePostPayoutBalanceAsEndingBalance(t *testing
 	report := onlyReport(t, fx.notifier)
 	balance := report.SettlementBalance
 	warning := "Settlement: Payout 后余额未在有限观察内更新，任务结束余额无法确认"
-	if report.Status != ReportStatusWarning || report.Payout.Status != ReportStepSuccess ||
+	if report.Status != ReportStatusWarning ||
+		report.target(PayoutKindPointsRebate).Payout.Status != ReportStepSuccess ||
 		balance.Observed || balance.QueryFailed || !balance.PostPayoutUnconfirmed ||
 		balance.Total != "" || balance.Hold != "" || balance.Available != "" ||
 		!containsString(report.Warnings, warning) {
@@ -143,7 +147,7 @@ func TestFinalReportDoesNotLabelStalePostPayoutBalanceAsEndingBalance(t *testing
 		t.Fatalf("UTC 01:00 settlement balance calls = %d, want %d payout checks + %d final observations",
 			calls, settlementBalanceRequiredConfirmations, settlementFinalBalanceObservationAttempts)
 	}
-	wantDelays := 1 + 1 + settlementFinalBalanceObservationAttempts
+	wantDelays := 1 + settlementFinalBalanceObservationAttempts
 	if delays := countDelay(fx.sleeper.delays, settlementFinalBalanceObservationInterval) - delaysBefore; delays != wantDelays {
 		t.Fatalf("payout boundary and post-payout observation delays = %d, want %d",
 			delays, wantDelays)
@@ -159,7 +163,9 @@ func TestFinalReportRejectsHistoricalLowerBalanceUntilExpectedTotalIsStable(t *t
 	prePayout := info.SpotBalanceAmounts{
 		Total: decimal.RequireFromString("2.5"), Available: decimal.RequireFromString("2.5"),
 	}
-	historicalLower := info.SpotBalanceAmounts{Total: decimal.Zero, Available: decimal.Zero}
+	historicalLower := info.SpotBalanceAmounts{
+		Total: decimal.RequireFromString("0.25"), Available: decimal.RequireFromString("0.25"),
+	}
 	expected := info.SpotBalanceAmounts{Total: decimal.NewFromInt(1), Available: decimal.NewFromInt(1)}
 	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
 		prePayout, prePayout,
@@ -184,10 +190,10 @@ func TestFinalReportRequiresStableAvailableAtExpectedTotal(t *testing.T) {
 	report := newRunReport(
 		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
 		fx.orchestrator.builders, fx.orchestrator.builderNames,
-		"0xsettlement", "0xrecipient",
+		"0xsettlement", "0xrecipient", "0xreferral",
 	)
 	report.token = cloneToken(&fx.chain.token)
-	report.Payout = PayoutReport{
+	report.target(PayoutKindPointsRebate).Payout = PayoutReport{
 		Status: ReportStepSuccess, Amount: "1.5", SettlementTotalBefore: "2.5",
 	}
 	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
@@ -210,10 +216,10 @@ func TestFinalReportQueryErrorsDoNotConsumeVisibilitySamples(t *testing.T) {
 	report := newRunReport(
 		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
 		fx.orchestrator.builders, fx.orchestrator.builderNames,
-		"0xsettlement", "0xrecipient",
+		"0xsettlement", "0xrecipient", "0xreferral",
 	)
 	report.token = cloneToken(&fx.chain.token)
-	report.Payout = PayoutReport{
+	report.target(PayoutKindPointsRebate).Payout = PayoutReport{
 		Status: ReportStepSuccess, Amount: "1.5", SettlementTotalBefore: "2.5",
 	}
 	fx.chain.balanceErrorSequence["0xsettlement"] = []error{
@@ -237,10 +243,10 @@ func TestFinalReportAllowsConfirmationAfterOrdinaryVisibilityWindow(t *testing.T
 	report := newRunReport(
 		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
 		fx.orchestrator.builders, fx.orchestrator.builderNames,
-		"0xsettlement", "0xrecipient",
+		"0xsettlement", "0xrecipient", "0xreferral",
 	)
 	report.token = cloneToken(&fx.chain.token)
-	report.Payout = PayoutReport{
+	report.target(PayoutKindPointsRebate).Payout = PayoutReport{
 		Status: ReportStepSuccess, Amount: "1.5", SettlementTotalBefore: "2.5",
 	}
 	stale := info.SpotBalanceAmounts{
@@ -266,10 +272,10 @@ func TestFinalReportFailsClosedWhenSuccessfulPayoutBoundaryIsInvalid(t *testing.
 	report := newRunReport(
 		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
 		fx.orchestrator.builders, fx.orchestrator.builderNames,
-		"0xsettlement", "0xrecipient",
+		"0xsettlement", "0xrecipient", "0xreferral",
 	)
 	report.token = cloneToken(&fx.chain.token)
-	report.Payout = PayoutReport{Status: ReportStepSuccess, Amount: "1.5"}
+	report.target(PayoutKindPointsRebate).Payout = PayoutReport{Status: ReportStepSuccess, Amount: "1.5"}
 
 	fx.orchestrator.observeSettlementFinalBalance(context.Background(), &report)
 
@@ -643,7 +649,8 @@ func TestAcceptedSweepDoesNotExposePreSubmitBalanceAsFinal(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(report.Builders) != 1 || report.Builders[0].SweepStatus != ReportStepSuccess ||
-		report.Builders[0].FinalTotal != "" || report.Builders[0].FinalAvailable != "" {
+		report.Builders[0].FinalTotal != "" || report.Builders[0].FinalAvailable != "" ||
+		report.stage("finalize").Status != ReportStepSkipped {
 		t.Fatalf("builder report = %#v", report.Builders)
 	}
 }
@@ -710,7 +717,7 @@ func TestUnderfundedFundingRetryDoesNotFallBackToBuilderActions(t *testing.T) {
 		fx.chain.balanceCalls["0xbuilder"] != 0 {
 		t.Fatalf("underfunded payout touched builders: events=%v", fx.chain.events)
 	}
-	if fx.store.current == nil || fx.store.current.Phase != PhasePrepared {
+	if fx.store.current == nil || testActiveTarget(t, fx.store.current).Phase != PhasePrepared {
 		t.Fatalf("current = %#v, want prepared retry state", fx.store.current)
 	}
 
@@ -740,8 +747,9 @@ func TestPayoutPreflightRetriesStaleUnderfundedBalance(t *testing.T) {
 		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
 		t.Fatalf("events=%v completed=%v", fx.chain.events, fx.repo.completedIDs)
 	}
-	if report := onlyReport(t, fx.notifier); report.Payout.SettlementTotalBefore != "1.5" {
-		t.Fatalf("payout total before = %q, want final funded sample", report.Payout.SettlementTotalBefore)
+	if report := onlyReport(t, fx.notifier); report.target(PayoutKindPointsRebate).Payout.SettlementTotalBefore != "1.5" {
+		t.Fatalf("payout total before = %q, want final funded sample",
+			report.target(PayoutKindPointsRebate).Payout.SettlementTotalBefore)
 	}
 }
 
@@ -759,63 +767,50 @@ func TestPayoutPreflightRetriesQueryErrorBeforeFundedBalance(t *testing.T) {
 		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
 		t.Fatalf("events=%v completed=%v", fx.chain.events, fx.repo.completedIDs)
 	}
-	if report := onlyReport(t, fx.notifier); report.Payout.SettlementTotalBefore != "1.5" {
-		t.Fatalf("payout total before = %q, want final funded sample", report.Payout.SettlementTotalBefore)
+	if report := onlyReport(t, fx.notifier); report.target(PayoutKindPointsRebate).Payout.SettlementTotalBefore != "1.5" {
+		t.Fatalf("payout total before = %q, want final funded sample",
+			report.target(PayoutKindPointsRebate).Payout.SettlementTotalBefore)
 	}
 }
 
-func TestPayoutIsNotSubmittedWithoutRecipientBalanceBaseline(t *testing.T) {
+func TestPayoutDoesNotQueryRecipientBalance(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
 	fx.chain.balanceErrors["0xrecipient"] = errors.New("recipient info unavailable")
 
-	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil || containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
-		t.Fatalf("Run() error=%v events=%v", err, fx.chain.events)
-	}
-	if fx.store.current == nil || fx.store.current.Phase != PhasePrepared ||
-		fx.store.current.Payout != nil {
-		t.Fatalf("current = %#v", fx.store.current)
-	}
-}
-
-func TestPayoutRecipientBaselineMustStabilizeBeforeSubmit(t *testing.T) {
-	fx := newFixture(t)
-	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
-	fx.chain.balances["0xrecipient"] = decimal.NewFromInt(5)
-	fx.chain.balanceSequence["0xrecipient"] = []info.SpotBalanceAmounts{
-		{Total: decimal.Zero, Available: decimal.Zero},
-		{Total: decimal.NewFromInt(5), Available: decimal.NewFromInt(5)},
-		{Total: decimal.NewFromInt(5), Available: decimal.NewFromInt(5)},
-	}
-
 	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
 		t.Fatal(err)
 	}
-	if fx.chain.balanceCalls["0xrecipient"] < 3 ||
-		fx.store.archived.Payout == nil ||
-		fx.store.archived.Payout.RecipientTotalBefore != "5" {
-		t.Fatalf("recipient calls=%d archived payout=%#v",
-			fx.chain.balanceCalls["0xrecipient"], fx.store.archived.Payout)
+	if countString(fx.chain.events, "submit:spotSend:0xsettlement") != 1 ||
+		fx.chain.balanceCalls["0xrecipient"] != 0 ||
+		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
+		t.Fatalf("events=%v recipient calls=%d completed=%v",
+			fx.chain.events, fx.chain.balanceCalls["0xrecipient"], fx.repo.completedIDs)
 	}
 }
 
 func TestClaimableBelowPayoutWarnsWithoutBlockingFundedPayout(t *testing.T) {
 	fx := newFixture(t)
-	fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString("1.4")
+	fx.referralRepo.records = []Record{
+		{ID: 9, PeriodStartAt: 30, Amount: "0.250000000000000001"},
+	}
+	fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString("1.6")
 	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.750001")
 	fx.orchestrator.clock = fixedClock{now: time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)}
 	if err := fx.orchestrator.RunScheduled(context.Background(), TriggerUTC, 1, 6); err != nil {
 		t.Fatal(err)
 	}
 	report := onlyReport(t, fx.notifier)
-	warning := "UTC 00:00 Claimable 合计 1.4 USDC，低于数据库 Payout 1.5 USDC，短缺 0.1 USDC，请人工核查结算口径"
-	if report.Status != ReportStatusWarning || report.Payout.Status != ReportStepSuccess ||
+	warning := "UTC 00:00 Claimable 合计 1.6 USDC，低于两类数据库 Payout 合计 1.750001 USDC，短缺 0.150001 USDC，请人工核查结算口径"
+	if report.Status != ReportStatusWarning ||
+		report.PayoutTotal != "1.750001" ||
+		report.target(PayoutKindPointsRebate).Payout.Status != ReportStepSuccess ||
+		report.target(PayoutKindReferral).Payout.Status != ReportStepSuccess ||
 		!report.DailyConsolidation.BelowPayout ||
-		report.DailyConsolidation.ShortfallUSDC != "0.1" ||
+		report.DailyConsolidation.ShortfallUSDC != "0.150001" ||
 		!containsString(report.Warnings, warning) {
 		t.Fatalf("claimed reconciliation report = %#v", report)
 	}
@@ -870,7 +865,7 @@ func TestClaimAtOrBelowThresholdIsRecordedAsZero(t *testing.T) {
 
 func TestConsolidateOnlyDoesNotReadOrWriteDailyRecord(t *testing.T) {
 	fx := newFixture(t)
-	fx.store.current = &RunState{RunID: "existing", Phase: PhasePrepared}
+	fx.store.current = &RunState{RunID: "existing"}
 	fx.store.consolidations = map[string]DailyConsolidation{
 		"2026-07-12": {
 			UTCDate: "2026-07-12", Status: DailyConsolidationCompleted,
@@ -917,12 +912,14 @@ func TestDailyConsolidationUsesOneSharedClaimVisibilityWait(t *testing.T) {
 	fx.chain.claimableRewards["0xbuilder-2"] = decimal.RequireFromString("1.25")
 	fx.chain.balances["0xbuilder-2"] = decimal.Zero
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: fx.repo, Store: fx.store, DailyConsolidations: fx.store, Chain: fx.chain,
+		PointsRebateRepository: fx.repo, ReferralRepository: fx.referralRepo,
+		Store: fx.store, DailyConsolidations: fx.store, Chain: fx.chain,
 		Notifier: fx.notifier, Logger: fx.logger,
 		Builders:     []string{"0xbuilder", "0xbuilder-2"},
 		BuilderNames: map[string]string{"0xbuilder": "builder-1", "0xbuilder-2": "builder-2"},
-		Settlement:   "0xsettlement", Recipient: "0xrecipient",
-		Clock: fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
+		Settlement:   "0xsettlement", PointsRebateRecipient: "0xrecipient",
+		ReferralRecipient: "0xreferral",
+		Clock:             fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
 		Sleeper: fx.sleeper,
 	})
 	if err != nil {
@@ -1125,7 +1122,7 @@ func TestClaimVisibilityWarningSurvivesLaterSweepFailure(t *testing.T) {
 	report := newRunReport(
 		fx.clock.now.Add(time.Hour), TriggerUTC, ReportExecution{}, "mainnet",
 		fx.orchestrator.builders, fx.orchestrator.builderNames,
-		"0xsettlement", "0xrecipient",
+		"0xsettlement", "0xrecipient", "0xreferral",
 	)
 	fx.orchestrator.attachDailyConsolidation(
 		context.Background(), &report, "2026-07-12",
@@ -1183,7 +1180,8 @@ func TestPayoutUsesAvailableButUncertainConfirmationUsesTotal(t *testing.T) {
 		{Total: decimal.NewFromInt(2), Available: decimal.Zero},
 	}
 	err = fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
-	if err == nil || !IsFatal(err) || fx.store.current == nil || fx.store.current.Phase != PhaseBlocked {
+	if err == nil || !IsFatal(err) || fx.store.current == nil ||
+		testActiveTarget(t, fx.store.current).Phase != PhaseBlocked {
 		t.Fatalf("available-only decrease error=%v current=%#v", err, fx.store.current)
 	}
 	report := onlyReport(t, fx.notifier)
@@ -1216,8 +1214,8 @@ func TestUnknownPayoutConfirmsOnlyAfterSettlementTotalDecreases(t *testing.T) {
 		t.Fatalf("unknown applied payout current=%#v archive=%q", fx.store.current, fx.store.archiveResult)
 	}
 	report := onlyReport(t, fx.notifier)
-	if report.Payout.ConfirmationEvidence != "paired_balance_boundary" {
-		t.Fatalf("payout report = %#v", report.Payout)
+	if report.target(PayoutKindPointsRebate).Payout.ConfirmationEvidence != "settlement_balance_decreased" {
+		t.Fatalf("payout report = %#v", report.target(PayoutKindPointsRebate).Payout)
 	}
 }
 
@@ -1230,6 +1228,10 @@ func TestExplicitlyRejectedPayoutIsArchivedAndCleared(t *testing.T) {
 	err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart)
 	if err == nil || !IsFatal(err) || fx.store.current != nil || fx.store.archiveResult != "rejected" {
 		t.Fatalf("rejected payout error=%v current=%#v archive=%q", err, fx.store.current, fx.store.archiveResult)
+	}
+	report := onlyReport(t, fx.notifier)
+	if stage := report.stage("finalize"); stage == nil || stage.Status != ReportStepSuccess {
+		t.Fatalf("rejected finalize stage = %#v", stage)
 	}
 }
 
@@ -1244,8 +1246,9 @@ func TestPayoutIsNotSubmittedUntilBothDurableBoundariesSucceed(t *testing.T) {
 	if containsString(fx.chain.events, "submit:spotSend:0xsettlement") {
 		t.Fatalf("payout submitted after state save failure: %v", fx.chain.events)
 	}
-	if fx.store.current == nil || fx.store.current.Phase != PhasePayoutSubmitting ||
-		fx.store.current.Payout == nil {
+	if fx.store.current == nil ||
+		testActiveTarget(t, fx.store.current).Phase != PhasePayoutSubmitting ||
+		testActiveTarget(t, fx.store.current).Payout == nil {
 		t.Fatalf("durable current = %#v", fx.store.current)
 	}
 }
@@ -1254,8 +1257,8 @@ func TestPayoutRecoveryNeverResubmitsUncertainState(t *testing.T) {
 	t.Run("submitting observes total decrease", func(t *testing.T) {
 		fx := newFixture(t)
 		state := fx.positiveState(t, PhasePayoutSubmitting)
-		state.Payout = &PayoutJournal{
-			Prepared: validPayout(t, state, 900), TotalBefore: "2", RecipientTotalBefore: "0",
+		testTarget(t, &state, PayoutKindPointsRebate).Payout = &PayoutJournal{
+			Prepared: validPayout(t, state, 900), TotalBefore: "2", SubmitAttempts: 1,
 		}
 		fx.store.current = &state
 		before := info.SpotBalanceAmounts{Total: decimal.NewFromInt(2), Available: decimal.NewFromInt(2)}
@@ -1275,20 +1278,27 @@ func TestPayoutRecoveryNeverResubmitsUncertainState(t *testing.T) {
 	t.Run("backup prepared is uncertain", func(t *testing.T) {
 		fx := newFixture(t)
 		state := fx.positiveState(t, PhasePayoutPrepared)
-		state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 901), TotalBefore: "2"}
+		testTarget(t, &state, PayoutKindPointsRebate).Payout = &PayoutJournal{
+			Prepared: validPayout(t, state, 901), TotalBefore: "2", SubmitAttempts: 1,
+		}
 		fx.store.current = &state
 		fx.store.metadata = StateLoadMetadata{RecoveredFromBackup: true, PrimaryInvalid: true}
 		fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-		err := fx.orchestrator.Recover(context.Background())
-		if err == nil || !IsFatal(err) || len(fx.chain.events) != 0 {
-			t.Fatalf("backup recovery error=%v events=%v", err, fx.chain.events)
+		if err := fx.orchestrator.Recover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if len(fx.chain.submittedActions) != 1 ||
+			!reflect.DeepEqual(fx.chain.submittedActions[0], validPayout(t, state, 901)) {
+			t.Fatalf("backup recovery actions=%#v", fx.chain.submittedActions)
 		}
 	})
 
 	t.Run("primary prepared submits persisted request", func(t *testing.T) {
 		fx := newFixture(t)
 		state := fx.positiveState(t, PhasePayoutPrepared)
-		state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 902), TotalBefore: "2"}
+		testTarget(t, &state, PayoutKindPointsRebate).Payout = &PayoutJournal{
+			Prepared: validPayout(t, state, 902), TotalBefore: "2", SubmitAttempts: 1,
+		}
 		fx.store.current = &state
 		fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
 		if err := fx.orchestrator.Recover(context.Background()); err != nil {
@@ -1297,9 +1307,9 @@ func TestPayoutRecoveryNeverResubmitsUncertainState(t *testing.T) {
 		if !equalStrings(fx.chain.events, []string{"submit:spotSend:0xsettlement"}) {
 			t.Fatalf("events = %v", fx.chain.events)
 		}
-		if fx.store.archived.Payout == nil ||
-			fx.store.archived.Payout.RecipientTotalBefore != "0" {
-			t.Fatalf("legacy recipient boundary was not persisted: %#v", fx.store.archived.Payout)
+		archivedTarget := testTarget(t, &fx.store.archived, PayoutKindPointsRebate)
+		if archivedTarget.Payout == nil || archivedTarget.Payout.SubmitAttempts != 1 {
+			t.Fatalf("payout journal was not persisted: %#v", archivedTarget.Payout)
 		}
 	})
 }
@@ -1307,7 +1317,9 @@ func TestPayoutRecoveryNeverResubmitsUncertainState(t *testing.T) {
 func TestConfirmedPayoutRecoveryOnlyCompletesDatabase(t *testing.T) {
 	fx := newFixture(t)
 	state := fx.positiveState(t, PhasePayoutConfirmed)
-	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 903), TotalBefore: "2"}
+	testTarget(t, &state, PayoutKindPointsRebate).Payout = &PayoutJournal{
+		Prepared: validPayout(t, state, 903), TotalBefore: "2", SubmitAttempts: 1,
+	}
 	fx.store.current = &state
 	if err := fx.orchestrator.Recover(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1324,14 +1336,14 @@ func TestConfirmedPayoutRecoveryFailsClosedWithoutValidJournal(t *testing.T) {
 	}{
 		{name: "missing", journal: func(*testing.T, RunState) *PayoutJournal { return nil }},
 		{name: "invalid settlement boundary", journal: func(t *testing.T, state RunState) *PayoutJournal {
-			return &PayoutJournal{Prepared: validPayout(t, state, 905), TotalBefore: "bad"}
+			return &PayoutJournal{Prepared: validPayout(t, state, 905), TotalBefore: "bad", SubmitAttempts: 1}
 		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fx := newFixture(t)
 			state := fx.positiveState(t, PhasePayoutConfirmed)
-			state.Payout = test.journal(t, state)
+			testTarget(t, &state, PayoutKindPointsRebate).Payout = test.journal(t, state)
 			fx.store.current = &state
 
 			err := fx.orchestrator.Recover(context.Background())
@@ -1348,7 +1360,9 @@ func TestRecoveryUsesDailyConsolidationForPersistedUTCDate(t *testing.T) {
 	fx := newFixture(t)
 	state := fx.positiveState(t, PhasePayoutConfirmed)
 	state.UTCDate = "2026-07-11"
-	state.Payout = &PayoutJournal{Prepared: validPayout(t, state, 904), TotalBefore: "2"}
+	testTarget(t, &state, PayoutKindPointsRebate).Payout = &PayoutJournal{
+		Prepared: validPayout(t, state, 904), TotalBefore: "2", SubmitAttempts: 1,
+	}
 	fx.store.current = &state
 	fx.store.consolidations = map[string]DailyConsolidation{
 		"2026-07-11": {
@@ -1397,7 +1411,11 @@ func TestRunNoDataDoesNotCreatePayoutState(t *testing.T) {
 		t.Fatalf("no-data events=%v archive=%q saved=%d", fx.chain.events, fx.store.archiveResult, len(fx.store.saved))
 	}
 	report := onlyReport(t, fx.notifier)
-	if report.Status != ReportStatusNoData || report.Outcome != "no_data" {
+	if report.Status != ReportStatusNoData || report.Outcome != "no_data" ||
+		!report.RecordsRead || report.RecordCount != 0 || report.PayoutTotal != "0" ||
+		!report.target(PayoutKindPointsRebate).RecordsRead ||
+		!report.target(PayoutKindReferral).RecordsRead ||
+		report.stage("finalize").Status != ReportStepSkipped {
 		t.Fatalf("no-data report = %#v", report)
 	}
 }
@@ -1423,10 +1441,12 @@ func TestNewOrchestratorRejectsUnsafeAccounts(t *testing.T) {
 	for _, recipient := range []string{"0xbuilder", zeroEthereumAddress, "0xsettlement"} {
 		t.Run(recipient, func(t *testing.T) {
 			_, err := NewOrchestrator(OrchestratorConfig{
-				Repository: fx.repo, Store: fx.store, DailyConsolidations: fx.store,
+				PointsRebateRepository: fx.repo, ReferralRepository: fx.referralRepo,
+				Store: fx.store, DailyConsolidations: fx.store,
 				Chain: fx.chain, Builders: []string{"0xbuilder"},
-				Settlement: "0xsettlement", Recipient: recipient,
-				Clock: fx.clock, Nonce: &fakeNonce{next: 1}, Sleeper: fx.sleeper,
+				Settlement: "0xsettlement", PointsRebateRecipient: recipient,
+				ReferralRecipient: "0xreferral",
+				Clock:             fx.clock, Nonce: &fakeNonce{next: 1}, Sleeper: fx.sleeper,
 			})
 			if err == nil {
 				t.Fatalf("NewOrchestrator() accepted recipient %q", recipient)
@@ -1438,6 +1458,7 @@ func TestNewOrchestratorRejectsUnsafeAccounts(t *testing.T) {
 type fixture struct {
 	orchestrator *Orchestrator
 	repo         *fakeRepository
+	referralRepo *fakeRepository
 	store        *fakeStore
 	chain        *fakeChain
 	sleeper      *fakeSleeper
@@ -1452,12 +1473,14 @@ func newTwoBuilderOrchestrator(t *testing.T, fx *fixture) *Orchestrator {
 	fx.chain.balances["0xbuilder-2"] = decimal.Zero
 	fx.chain.rateLimits["0xbuilder-2"] = info.UserRateLimit{NRequestsCap: 10_000}
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: fx.repo, Store: fx.store, DailyConsolidations: fx.store, Chain: fx.chain,
+		PointsRebateRepository: fx.repo, ReferralRepository: fx.referralRepo,
+		Store: fx.store, DailyConsolidations: fx.store, Chain: fx.chain,
 		Notifier: fx.notifier, Logger: fx.logger,
 		Builders:     []string{"0xbuilder", "0xbuilder-2"},
 		BuilderNames: map[string]string{"0xbuilder": "builder-1", "0xbuilder-2": "builder-2"},
-		Settlement:   "0xsettlement", Recipient: "0xrecipient",
-		Clock: fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
+		Settlement:   "0xsettlement", PointsRebateRecipient: "0xrecipient",
+		ReferralRecipient: "0xreferral",
+		Clock:             fx.clock, Nonce: &fakeNonce{next: uint64(fx.clock.now.UnixMilli())},
 		Sleeper: fx.sleeper,
 	})
 	if err != nil {
@@ -1472,6 +1495,7 @@ func newFixture(t *testing.T) *fixture {
 		{ID: 1, PeriodStartAt: 10, Amount: "1"},
 		{ID: 2, PeriodStartAt: 20, Amount: "0.5"},
 	}}
+	referralRepo := &fakeRepository{}
 	store := &fakeStore{}
 	chain := &fakeChain{
 		token: info.Token{Name: "USDC", TokenID: "0", WireToken: "USDC:0", WeiDecimals: 6},
@@ -1502,17 +1526,20 @@ func newFixture(t *testing.T) *fixture {
 	logger := &fakeLogger{}
 	clock := fixedClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	orchestrator, err := NewOrchestrator(OrchestratorConfig{
-		Repository: repo, Store: store, DailyConsolidations: store,
+		PointsRebateRepository: repo, ReferralRepository: referralRepo,
+		Store: store, DailyConsolidations: store,
 		Chain: chain, Notifier: notifier, Logger: logger,
 		Builders: []string{"0xbuilder"}, BuilderNames: map[string]string{"0xbuilder": "builder-1"},
-		Settlement: "0xsettlement", Recipient: "0xrecipient", Network: "mainnet",
+		Settlement: "0xsettlement", PointsRebateRecipient: "0xrecipient",
+		ReferralRecipient: "0xreferral", Network: "mainnet",
 		Clock: clock, Nonce: &fakeNonce{next: uint64(clock.now.UnixMilli())}, Sleeper: sleeper,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &fixture{
-		orchestrator: orchestrator, repo: repo, store: store, chain: chain,
+		orchestrator: orchestrator, repo: repo, referralRepo: referralRepo,
+		store: store, chain: chain,
 		sleeper: sleeper, notifier: notifier, logger: logger, clock: clock,
 	}
 }
@@ -1526,9 +1553,18 @@ func (f *fixture) positiveState(t *testing.T, phase Phase) RunState {
 	if err != nil {
 		t.Fatal(err)
 	}
+	referral, err := BuildManifest(ManifestInput{
+		Token: &f.chain.token, Settlement: "0xsettlement", Recipient: "0xreferral",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return RunState{
 		RunID: "run", Trigger: TriggerUTC, UTCDate: "2026-07-12",
-		Phase: phase, Manifest: manifest,
+		Targets: []PayoutTargetState{
+			{Kind: PayoutKindPointsRebate, Phase: phase, Manifest: manifest},
+			{Kind: PayoutKindReferral, Phase: PhasePrepared, Manifest: referral},
+		},
 	}
 }
 
@@ -1570,7 +1606,8 @@ func (s *fakeStore) Save(_ context.Context, state RunState) error {
 	copy := cloneState(&state)
 	s.current = copy
 	s.saved = append(s.saved, *cloneState(&state))
-	if state.Phase == s.failPhase && s.failPhase != "" {
+	active, _, _ := state.activePayoutTarget()
+	if active != nil && active.Phase == s.failPhase && s.failPhase != "" {
 		return errors.New("save failed")
 	}
 	return nil
@@ -1653,6 +1690,7 @@ type fakeChain struct {
 	applyUnknownSweep      bool
 	applyUnknownClaim      bool
 	payoutResult           exchange.SubmitResult
+	payoutResults          map[string][]exchange.SubmitResult
 	applyUnknownPayout     bool
 	events                 []string
 	submittedActions       []exchange.PreparedAction
@@ -1807,12 +1845,17 @@ func (c *fakeChain) Submit(
 	}
 	amount := decimal.RequireFromString(action.Amount)
 	if action.Signer == "0xsettlement" {
-		if c.payoutResult.Accepted || c.applyUnknownPayout {
+		result := c.payoutResult
+		if sequence := c.payoutResults[action.Destination]; len(sequence) > 0 {
+			result = sequence[0]
+			c.payoutResults[action.Destination] = sequence[1:]
+		}
+		if result.Accepted || c.applyUnknownPayout {
 			c.balances[action.Signer] = c.balances[action.Signer].Sub(amount)
 			c.balances[action.Destination] = c.balances[action.Destination].Add(amount)
 			c.incrementRateLimitUsageLocked(action.Signer)
 		}
-		return c.payoutResult, nil
+		return result, nil
 	}
 	available := c.balances[action.Signer].Sub(c.holds[action.Signer])
 	if amount.GreaterThan(available) {
@@ -1961,10 +2004,38 @@ func preparedAction(
 }
 
 func validPayout(t *testing.T, state RunState, nonce uint64) exchange.PreparedAction {
+	t.Helper()
+	target := testTarget(t, &state, PayoutKindPointsRebate)
 	return preparedAction(
-		t, "spotSend", state.Manifest.Settlement, state.Manifest.Recipient,
-		state.Manifest.Token.WireToken, state.Manifest.PayoutTotal, nonce,
+		t, "spotSend", target.Manifest.Settlement, target.Manifest.Recipient,
+		target.Manifest.Token.WireToken, target.Manifest.PayoutTotal, nonce,
 	)
+}
+
+func testTarget(t *testing.T, state *RunState, kind PayoutKind) *PayoutTargetState {
+	t.Helper()
+	if state == nil {
+		t.Fatal("run state is nil")
+	}
+	for index := range state.Targets {
+		if state.Targets[index].Kind == kind {
+			return &state.Targets[index]
+		}
+	}
+	t.Fatalf("run state has no %s target", kind)
+	return nil
+}
+
+func testActiveTarget(t *testing.T, state *RunState) *PayoutTargetState {
+	t.Helper()
+	target, _, err := state.activePayoutTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target == nil {
+		t.Fatal("run state has no active payout target")
+	}
+	return target
 }
 
 func cloneState(state *RunState) *RunState {

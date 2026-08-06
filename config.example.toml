@@ -29,8 +29,11 @@ encrypted_private_key = "REPLACE_WITH_KEYTOOL_OUTPUT_FOR_BUILDER_2"
 address = "0x0000000000000000000000000000000000000003"
 encrypted_private_key = "REPLACE_WITH_KEYTOOL_OUTPUT_FOR_SETTLEMENT"
 
-[payout]
+[referral_payout]
 recipient_address = "0x0000000000000000000000000000000000000004"
+
+[points_rebate_payout]
+recipient_address = "0x0000000000000000000000000000000000000005"
 
 [logging]
 format = "console"

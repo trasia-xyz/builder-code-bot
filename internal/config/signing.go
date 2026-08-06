@@ -77,19 +77,50 @@ func (cfg *Config) normalizeAndValidateAccounts() error {
 		return fmt.Errorf("settlement address must differ from builder addresses")
 	}
 
-	cfg.Payout.RecipientAddress = strings.TrimSpace(cfg.Payout.RecipientAddress)
-	if !addressPattern.MatchString(cfg.Payout.RecipientAddress) {
-		return fmt.Errorf("recipient address must match %s", addressPattern)
+	if err := normalizeAndValidatePayoutRecipient(
+		"referral payout",
+		&cfg.ReferralPayout,
+		cfg.Settlement.Address,
+		addresses,
+	); err != nil {
+		return err
 	}
-	recipientAddress := strings.ToLower(cfg.Payout.RecipientAddress)
+	if err := normalizeAndValidatePayoutRecipient(
+		"points rebate payout",
+		&cfg.PointsRebatePayout,
+		cfg.Settlement.Address,
+		addresses,
+	); err != nil {
+		return err
+	}
+	if strings.EqualFold(
+		cfg.ReferralPayout.RecipientAddress,
+		cfg.PointsRebatePayout.RecipientAddress,
+	) {
+		return fmt.Errorf("referral and points rebate payout recipient addresses must differ")
+	}
+	return nil
+}
+
+func normalizeAndValidatePayoutRecipient(
+	name string,
+	payout *PayoutConfig,
+	settlementAddress string,
+	builderAddresses map[string]struct{},
+) error {
+	payout.RecipientAddress = strings.TrimSpace(payout.RecipientAddress)
+	if !addressPattern.MatchString(payout.RecipientAddress) {
+		return fmt.Errorf("%s recipient address must match %s", name, addressPattern)
+	}
+	recipientAddress := strings.ToLower(payout.RecipientAddress)
 	if recipientAddress == zeroAddress {
-		return fmt.Errorf("recipient address must not be the zero address")
+		return fmt.Errorf("%s recipient address must not be the zero address", name)
 	}
-	if strings.EqualFold(cfg.Payout.RecipientAddress, cfg.Settlement.Address) {
-		return fmt.Errorf("recipient address must differ from settlement address")
+	if strings.EqualFold(payout.RecipientAddress, settlementAddress) {
+		return fmt.Errorf("%s recipient address must differ from settlement address", name)
 	}
-	if _, exists := addresses[recipientAddress]; exists {
-		return fmt.Errorf("recipient address must differ from builder addresses")
+	if _, exists := builderAddresses[recipientAddress]; exists {
+		return fmt.Errorf("%s recipient address must differ from builder addresses", name)
 	}
 	return nil
 }

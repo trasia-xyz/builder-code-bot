@@ -12,33 +12,87 @@ import (
 const (
 	completeBatchSize = 500
 
-	listPendingSQL = `SELECT id, period_start_at, amount
+	pointsRebateListPendingSQL = `SELECT id, period_start_at, amount
 FROM trasia_points_rebate_funding_record
 WHERE status = 0
 ORDER BY period_start_at, id`
 
-	updatePrefix = `UPDATE trasia_points_rebate_funding_record
+	pointsRebateUpdatePrefix = `UPDATE trasia_points_rebate_funding_record
 SET status = 1
 WHERE status = 0 AND id IN`
 
-	statusPrefix = `SELECT id, status
+	pointsRebateStatusPrefix = `SELECT id, status
 FROM trasia_points_rebate_funding_record
 WHERE id IN`
+
+	referralListPendingSQL = `SELECT id, period_start_at, amount
+FROM trasia_referral_funding_record
+WHERE cycle_type IN (1, 2) AND status = 0
+ORDER BY period_start_at, id`
+
+	referralUpdatePrefix = `UPDATE trasia_referral_funding_record
+SET status = 1
+WHERE cycle_type IN (1, 2) AND status = 0 AND id IN`
+
+	referralStatusPrefix = `SELECT id, status
+FROM trasia_referral_funding_record
+WHERE cycle_type IN (1, 2) AND id IN`
+)
+
+type repositoryQueries struct {
+	listPendingSQL    string
+	updatePrefix      string
+	statusPrefix      string
+	listOperation     string
+	completeOperation string
+}
+
+var (
+	pointsRebateQueries = repositoryQueries{
+		listPendingSQL:    pointsRebateListPendingSQL,
+		updatePrefix:      pointsRebateUpdatePrefix,
+		statusPrefix:      pointsRebateStatusPrefix,
+		listOperation:     "list_pending",
+		completeOperation: "complete_funding_records",
+	}
+	referralQueries = repositoryQueries{
+		listPendingSQL:    referralListPendingSQL,
+		updatePrefix:      referralUpdatePrefix,
+		statusPrefix:      referralStatusPrefix,
+		listOperation:     "list_pending_referral",
+		completeOperation: "complete_referral_funding_records",
+	}
 )
 
 type Repository struct {
 	db      *sql.DB
 	retryer Retryer
+	queries repositoryQueries
 }
 
+// NewRepository preserves the original Points Rebate repository constructor.
+// New code that assembles both payout targets should use the two explicit
+// constructors below.
 func NewRepository(db *sql.DB, retryer Retryer) *Repository {
-	return &Repository{db: db, retryer: retryer}
+	return NewPointsRebateRepository(db, retryer)
+}
+
+func NewPointsRebateRepository(db *sql.DB, retryer Retryer) *Repository {
+	return newRepository(db, retryer, pointsRebateQueries)
+}
+
+func NewReferralRepository(db *sql.DB, retryer Retryer) *Repository {
+	return newRepository(db, retryer, referralQueries)
+}
+
+func newRepository(db *sql.DB, retryer Retryer, queries repositoryQueries) *Repository {
+	return &Repository{db: db, retryer: retryer, queries: queries}
 }
 
 func (r *Repository) ListPending(ctx context.Context) ([]funding.Record, error) {
 	var records []funding.Record
-	err := r.retryer.Do(ctx, "list_pending", func(ctx context.Context) error {
-		rows, err := r.db.QueryContext(ctx, listPendingSQL)
+	err := r.retryer.Do(ctx, r.queries.listOperation, func(ctx context.Context) error {
+		rows, err := r.db.QueryContext(ctx, r.queries.listPendingSQL)
 		if err != nil {
 			return err
 		}
@@ -75,9 +129,9 @@ func (r *Repository) Complete(ctx context.Context, ids []uint64) error {
 		resolveCommit bool
 		commitErr     error
 	)
-	return r.retryer.Do(ctx, "complete_funding_records", func(ctx context.Context) error {
+	return r.retryer.Do(ctx, r.queries.completeOperation, func(ctx context.Context) error {
 		if resolveCommit {
-			zeroIDs, err := readStatuses(ctx, r.db, manifestIDs)
+			zeroIDs, err := readStatuses(ctx, r.db, r.queries, manifestIDs)
 			if err != nil {
 				return err
 			}
@@ -91,7 +145,7 @@ func (r *Repository) Complete(ctx context.Context, ids []uint64) error {
 			resolveCommit = false
 		}
 
-		committed, err := completeTransaction(ctx, r.db, remaining)
+		committed, err := completeTransaction(ctx, r.db, r.queries, remaining)
 		if err == nil {
 			return nil
 		}
@@ -104,7 +158,7 @@ func (r *Repository) Complete(ctx context.Context, ids []uint64) error {
 		// manifest ID; only confirmed status-zero rows may be replayed.
 		resolveCommit = true
 		commitErr = err
-		zeroIDs, statusErr := readStatuses(ctx, r.db, manifestIDs)
+		zeroIDs, statusErr := readStatuses(ctx, r.db, r.queries, manifestIDs)
 		if statusErr != nil {
 			return statusErr
 		}
@@ -120,7 +174,12 @@ func (r *Repository) Complete(ctx context.Context, ids []uint64) error {
 	})
 }
 
-func completeTransaction(ctx context.Context, db *sql.DB, ids []uint64) (commitAttempted bool, err error) {
+func completeTransaction(
+	ctx context.Context,
+	db *sql.DB,
+	queries repositoryQueries,
+	ids []uint64,
+) (commitAttempted bool, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -128,7 +187,11 @@ func completeTransaction(ctx context.Context, db *sql.DB, ids []uint64) (commitA
 	defer func() { _ = tx.Rollback() }()
 
 	forEachIDBatch(ids, func(batch []uint64) bool {
-		result, execErr := tx.ExecContext(ctx, updatePrefix+" ("+placeholders(len(batch))+")", uint64Args(batch)...)
+		result, execErr := tx.ExecContext(
+			ctx,
+			queries.updatePrefix+" ("+placeholders(len(batch))+")",
+			uint64Args(batch)...,
+		)
 		if execErr != nil {
 			err = execErr
 			return false
@@ -147,7 +210,7 @@ func completeTransaction(ctx context.Context, db *sql.DB, ids []uint64) (commitA
 	if err != nil {
 		return false, err
 	}
-	zeroIDs, err := readStatuses(ctx, tx, ids)
+	zeroIDs, err := readStatuses(ctx, tx, queries, ids)
 	if err != nil {
 		return false, err
 	}
@@ -166,13 +229,18 @@ type statusQueryer interface {
 
 // readStatuses returns only status-zero IDs. Missing rows and statuses other
 // than zero or one are permanent integrity errors.
-func readStatuses(ctx context.Context, queryer statusQueryer, ids []uint64) ([]uint64, error) {
+func readStatuses(
+	ctx context.Context,
+	queryer statusQueryer,
+	queries repositoryQueries,
+	ids []uint64,
+) ([]uint64, error) {
 	zeroIDs := make([]uint64, 0)
 	var readErr error
 	forEachIDBatch(ids, func(batch []uint64) bool {
 		rows, err := queryer.QueryContext(
 			ctx,
-			statusPrefix+" ("+placeholders(len(batch))+") ORDER BY id",
+			queries.statusPrefix+" ("+placeholders(len(batch))+") ORDER BY id",
 			uint64Args(batch)...,
 		)
 		if err != nil {

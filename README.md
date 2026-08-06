@@ -4,8 +4,10 @@ At UTC 00:00 this service concurrently captures canonical-USDC claimable
 rewards for all configured builders and persists that reconciliation boundary
 before any claim is submitted. It then claims in parallel, sweeps each
 builder's available spot USDC into an operator-controlled settlement account,
-and records the execution result. At UTC 01:00 it sends one payout for the
-pending MySQL records to a fixed recipient and marks those records complete.
+and records the execution result. At UTC 01:00 it freezes two independent
+pending MySQL batches, verifies that settlement can fund their aggregate payout,
+then sends `PointsRebatePayout` followed by `ReferralPayout` and completes each
+batch as soon as its own transfer is confirmed.
 
 Claim visibility is measured against a stable pre-claim balance tuple. The
 captured reward is normalized to token precision and used as a lower-bound
@@ -17,20 +19,35 @@ ambiguous sweep waits, reloads the latest stable Available balance, and retries
 with a fresh nonce up to three times. A lower stale snapshot is guarded by
 retrying at least the last ambiguous amount. A later accepted retry is reported
 with a warning because the cumulative amount of earlier ambiguous requests is
-unknown; retries never apply to the final payout.
+unknown. Final payouts use a separate rule described below: an ambiguous first
+submission may replay the exact persisted request once, never a newly prepared
+request.
 
 The design treats builder-to-settlement transfers as repeatable internal fund
-movement. Only the final settlement-to-recipient payout has a durable recovery
-journal. An accepted response confirms the payout directly; an ambiguous
-response is confirmed only after the post-submit pre-balance has been observed
-and two consecutive paired observations show both the exact expected settlement
-total and the exact expected recipient total. The observer waits before its
-first query and keeps up to ten successful paired observations; a later recovery
-may repeat this read-only check but never resubmits the payout. Available balance
-(`total - hold`) is used separately for sweep amounts and payout sufficiency. An
-explicit rejection or unresolved ambiguity alerts and terminates the process.
-Settlement and recipient pre-payout boundaries also require consecutive stable
-reads, and post-submit pre-balance evidence is persisted as soon as it appears.
+movement. Each final settlement-to-recipient payout has its own durable recovery
+journal and at-most-once transfer boundary. Before the first transfer, the
+service checks stable settlement Available balance against the aggregate amount
+of both payout targets. Each target total is independently rounded up to six
+decimal places. The possible new-address charge is handled only as an exact
+post-submit balance boundary and is not included in database payout totals or
+claimable reconciliation.
+An accepted response confirms that target directly. After an ambiguous first
+submission, the service observes only the settlement account. Two consecutive
+observations confirm payment when settlement Total is exactly either
+`total_before - amount` or `total_before - amount - 1 USDC`; the second boundary
+allows Hyperliquid's possible one-time charge when the destination is a new
+address. Recipient activity is deliberately not used as evidence because the
+recipient may immediately move the received funds. If every successful sample
+in the complete first observation window remains exactly at `total_before`, the
+service submits the byte-for-byte persisted request once more with the same
+nonce and signature. Query gaps or any other balance change block without a
+replay. It never prepares a new request. After that one exact replay, it observes
+again but never submits a third time. Remaining ambiguity is reported as blocked
+and the funding task ends. If
+the second target fails, a completed first target is neither rolled back nor sent
+again. Available balance (`total - hold`) is used separately for sweep amounts
+and payout sufficiency. The settlement pre-payout boundary requires consecutive
+stable reads.
 
 This balance rule requires the settlement account to be exclusively controlled
 by this service. No person or other process may send spot USDC from settlement.
@@ -73,11 +90,22 @@ chmod 0600 config.toml
 
 Configuration is decoded as strict TOML; unknown fields are rejected.
 
+```toml
+[points_rebate_payout]
+recipient_address = "0x..."
+
+[referral_payout]
+recipient_address = "0x..."
+```
+
 Verify that every configured address matches the address printed by `keytool`.
-Builders, settlement, and recipient must satisfy the separation checks in the
-configuration: recipient must be non-zero and differ from every builder and
-settlement. Keep `signing.decrypt_password` empty in production to read it once
-from a controlling TTY at startup.
+Configure the two destinations in `[points_rebate_payout]` and
+`[referral_payout]`; the former `[payout]` section is not supported. Builders,
+settlement, and both payout recipients must satisfy the separation checks in the
+configuration: each recipient must be non-zero, the two recipients must differ,
+and neither may equal a builder or settlement address. Keep
+`signing.decrypt_password` empty in production to read it once from a
+controlling TTY at startup.
 
 ## Run
 
@@ -131,12 +159,18 @@ parallel. Ambiguous claims are observed without a second nonce; ambiguous
 Builder-to-settlement sweeps instead reload current Available and retry with a
 fresh nonce because both accounts are operator-controlled. The record is
 updated to `completed` after the bounded processing finishes.
-At UTC 01:00 (Asia/Shanghai 09:00), it freezes pending records and performs the
-single settlement-to-recipient payout; it never claims or sweeps builders in
-this phase. The SES report compares the captured zero-hour claimable total with
-the database payout. Missing or incomplete claimable data prevents a numeric
-conclusion; a lower complete total produces a warning. Neither condition blocks
-a payout that the settlement balance can fund. Confirmed payouts enter
-unlimited MySQL retry and are never sent again during database recovery.
-Ordinary funding failures retry at most five times at one-minute intervals,
-while retry exhaustion and fatal payout outcomes exit immediately.
+At UTC 01:00 (Asia/Shanghai 09:00), it freezes pending points-rebate records and
+pending cycle-1/2 referral records, independently rounds each target total up to
+six decimal places, and checks the aggregate payout total against stable
+settlement Available balance before sending anything. It then pays `PointsRebatePayout`
+followed by `ReferralPayout`; it never claims or sweeps builders in this phase.
+Each confirmed transfer immediately enters unlimited MySQL Complete retry for
+its corresponding table and is never sent again during database recovery. A
+failure in the referral payout does not undo or resend a completed points-rebate
+payout. The SES report compares the captured zero-hour claimable total with the
+sum of both actual rounded payout totals and shows each target separately.
+Missing or incomplete claimable data prevents a numeric conclusion; a lower
+complete total produces a warning. Neither condition blocks payouts that the
+settlement balance can fund. Ordinary funding failures retry at most five times
+at one-minute intervals, while retry exhaustion and fatal payout outcomes exit
+immediately.

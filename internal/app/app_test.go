@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -10,8 +11,10 @@ import (
 
 	"builder-code-bot/internal/config"
 	"builder-code-bot/internal/crypt/keycipher"
+	"builder-code-bot/internal/dev/hyperliquidmock"
 	"builder-code-bot/internal/funding"
 	"builder-code-bot/internal/hyperliquid/signing"
+	"builder-code-bot/internal/logging"
 	"builder-code-bot/internal/secret"
 	"builder-code-bot/internal/state"
 )
@@ -153,6 +156,75 @@ func TestBuildBuilderSignersDoesNotDecryptSettlementKey(t *testing.T) {
 	}
 }
 
+func TestAssembleOrchestratorWiresBothRepositoriesAndRecipients(t *testing.T) {
+	server := hyperliquidmock.New(t)
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	mock.MatchExpectationsInOrder(false)
+	emptyRows := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"id", "period_start_at", "amount"})
+	}
+	mock.ExpectQuery("FROM trasia_points_rebate_funding_record").WillReturnRows(emptyRows())
+	mock.ExpectQuery("FROM trasia_referral_funding_record").WillReturnRows(emptyRows())
+
+	const (
+		builderAddress        = "0x0000000000000000000000000000000000000001"
+		settlementAddress     = "0x0000000000000000000000000000000000000002"
+		pointsRebateRecipient = "0x0000000000000000000000000000000000000003"
+		referralRecipient     = "0x0000000000000000000000000000000000000004"
+	)
+	cfg := config.Config{
+		Hyperliquid: config.HyperliquidConfig{Network: "testnet", BaseURL: server.URL},
+		Builders:    []config.BuilderConfig{{Name: "builder", Address: builderAddress}},
+		Settlement:  config.AccountConfig{Address: settlementAddress},
+		PointsRebatePayout: config.PayoutConfig{
+			RecipientAddress: pointsRebateRecipient,
+		},
+		ReferralPayout: config.PayoutConfig{RecipientAddress: referralRecipient},
+	}
+	notifier := &recordingFundingNotifier{}
+	orchestrator, err := assembleOrchestrator(
+		cfg,
+		map[string]signing.PrivateKey{},
+		db,
+		nil,
+		notifier,
+		logging.New(logging.Config{Format: "json", Output: io.Discard}),
+	)
+	if err != nil {
+		t.Fatalf("assembleOrchestrator() error = %v", err)
+	}
+	if err := orchestrator.Run(context.Background(), funding.TriggerRunOnStart); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("repository queries were not both executed: %v", err)
+	}
+	if len(notifier.reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(notifier.reports))
+	}
+
+	report := notifier.reports[0]
+	wantRecipients := map[funding.PayoutKind]string{
+		funding.PayoutKindPointsRebate: pointsRebateRecipient,
+		funding.PayoutKindReferral:     referralRecipient,
+	}
+	if len(report.Payouts) != len(wantRecipients) {
+		t.Fatalf("payout reports = %d, want %d", len(report.Payouts), len(wantRecipients))
+	}
+	for _, payout := range report.Payouts {
+		if payout.Payout.Recipient != wantRecipients[payout.Kind] {
+			t.Errorf("%s recipient = %q, want %q", payout.Kind, payout.Payout.Recipient, wantRecipients[payout.Kind])
+		}
+		if !payout.RecordsRead || payout.RecordCount != 0 {
+			t.Errorf("%s record snapshot = read:%v count:%d, want read empty snapshot", payout.Kind, payout.RecordsRead, payout.RecordCount)
+		}
+	}
+}
+
 func TestRuntimeRunOnStartRunsPayoutPhase(t *testing.T) {
 	runner := &recordingRunner{}
 	if err := startRuntime(context.Background(), runner, true); err != nil {
@@ -222,6 +294,14 @@ func (p *fakeSecretPrompt) ReadSecret(string) (secret.SecretString, error) {
 }
 
 type recordingRunner struct{ calls []string }
+
+type recordingFundingNotifier struct{ reports []funding.RunReport }
+
+func (*recordingFundingNotifier) Alert(context.Context, string, funding.AlertSeverity, string) {}
+
+func (n *recordingFundingNotifier) Report(_ context.Context, report funding.RunReport) {
+	n.reports = append(n.reports, report)
+}
 
 type recordingScheduler struct{ ctx context.Context }
 

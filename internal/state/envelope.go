@@ -9,7 +9,7 @@ import (
 	"builder-code-bot/internal/funding"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type envelope struct {
 	SchemaVersion int              `json:"schema_version"`

@@ -243,7 +243,9 @@ func assembleOrchestrator(
 		return nil, fmt.Errorf("initialize Hyperliquid exchange client: %w", err)
 	}
 	retryObserver := notification.NewMySQLRetryObserver(dispatcher, logger)
-	repository := mysql.NewRepository(db, mysql.NewRetryer(retryObserver))
+	retryer := mysql.NewRetryer(retryObserver)
+	pointsRebateRepository := mysql.NewPointsRebateRepository(db, retryer)
+	referralRepository := mysql.NewReferralRepository(db, retryer)
 	builders := make([]string, len(cfg.Builders))
 	builderNames := make(map[string]string, len(cfg.Builders))
 	for index, builder := range cfg.Builders {
@@ -252,19 +254,21 @@ func assembleOrchestrator(
 	}
 	stateStore := state.NewStore(state.DataDir)
 	return funding.NewOrchestrator(funding.OrchestratorConfig{
-		Repository:          repository,
-		Store:               stateStore,
-		DailyConsolidations: stateStore,
-		Chain:               hyperliquidChain{info: infoClient, exchange: exchangeClient},
-		Notifier:            notifier,
-		Logger:              logger,
-		Builders:            builders,
-		BuilderNames:        builderNames,
-		Settlement:          cfg.Settlement.Address,
-		Recipient:           cfg.Payout.RecipientAddress,
-		Network:             cfg.Hyperliquid.Network,
-		Clock:               systemClock{},
-		Nonce:               signing.NewNonceGenerator(),
+		PointsRebateRepository: pointsRebateRepository,
+		ReferralRepository:     referralRepository,
+		Store:                  stateStore,
+		DailyConsolidations:    stateStore,
+		Chain:                  hyperliquidChain{info: infoClient, exchange: exchangeClient},
+		Notifier:               notifier,
+		Logger:                 logger,
+		Builders:               builders,
+		BuilderNames:           builderNames,
+		Settlement:             cfg.Settlement.Address,
+		PointsRebateRecipient:  cfg.PointsRebatePayout.RecipientAddress,
+		ReferralRecipient:      cfg.ReferralPayout.RecipientAddress,
+		Network:                cfg.Hyperliquid.Network,
+		Clock:                  systemClock{},
+		Nonce:                  signing.NewNonceGenerator(),
 	})
 }
 

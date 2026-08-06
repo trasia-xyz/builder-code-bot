@@ -32,16 +32,17 @@ func TestUncertainPayoutRequiresConsecutiveExpectedPostBalance(t *testing.T) {
 	fx.orchestrator.chain = chain
 
 	if err := fx.orchestrator.observeUncertainPayout(
-		context.Background(), state, report,
+		context.Background(), state, testActiveTarget(t, state), report,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if chain.calls != 5 {
 		t.Fatalf("settlement balance calls = %d, want 5", chain.calls)
 	}
-	if report.Payout.Status != ReportStepSuccess ||
-		report.Payout.ConfirmationEvidence != "paired_balance_boundary" {
-		t.Fatalf("payout report = %#v", report.Payout)
+	pointsPayout := report.target(PayoutKindPointsRebate).Payout
+	if pointsPayout.Status != ReportStepSuccess ||
+		pointsPayout.ConfirmationEvidence != "settlement_balance_decreased" {
+		t.Fatalf("payout report = %#v", pointsPayout)
 	}
 	if len(fx.chain.events) != 0 {
 		t.Fatalf("uncertain observation submitted chain action: %v", fx.chain.events)
@@ -49,19 +50,9 @@ func TestUncertainPayoutRequiresConsecutiveExpectedPostBalance(t *testing.T) {
 	if !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
 		t.Fatalf("completed IDs = %v", fx.repo.completedIDs)
 	}
-	persistedPreStateCopies := 0
-	for _, saved := range fx.store.saved {
-		if saved.Phase == PhasePayoutSubmitting && saved.Payout != nil &&
-			saved.Payout.PreBalanceObservedAfterSubmit {
-			persistedPreStateCopies++
-		}
-	}
-	if persistedPreStateCopies < 2 {
-		t.Fatalf("post-submit pre-balance evidence was not persisted: %#v", fx.store.saved)
-	}
 }
 
-func TestUncertainPayoutPostStateFromFirstSampleRemainsBlocked(t *testing.T) {
+func TestUncertainPayoutPostStateFromFirstSampleConfirms(t *testing.T) {
 	fx := newFixture(t)
 	state, report := payoutVisibilityState(t, fx, PhasePayoutSubmitting, "2")
 	expected := info.SpotBalanceAmounts{
@@ -76,11 +67,12 @@ func TestUncertainPayoutPostStateFromFirstSampleRemainsBlocked(t *testing.T) {
 	}
 	fx.orchestrator.chain = chain
 
-	err := fx.orchestrator.observeUncertainPayout(context.Background(), state, report)
-	if err == nil || !IsFatal(err) || fx.store.current == nil ||
-		fx.store.current.Phase != PhaseBlocked || len(fx.repo.completedIDs) != 0 {
-		t.Fatalf("observation error=%v current=%#v completed=%v",
-			err, fx.store.current, fx.repo.completedIDs)
+	err := fx.orchestrator.observeUncertainPayout(
+		context.Background(), state, testActiveTarget(t, state), report,
+	)
+	if err != nil || fx.store.current != nil ||
+		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
+		t.Fatalf("observation error=%v current=%#v completed=%v", err, fx.store.current, fx.repo.completedIDs)
 	}
 }
 
@@ -108,7 +100,7 @@ func TestUncertainPayoutQueryErrorsDoNotConsumeSuccessfulObservations(t *testing
 	fx.orchestrator.chain = chain
 
 	if err := fx.orchestrator.observeUncertainPayout(
-		context.Background(), state, report,
+		context.Background(), state, testActiveTarget(t, state), report,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +121,7 @@ func TestUncertainPayoutQueryErrorsDoNotConsumeSuccessfulObservations(t *testing
 	}
 }
 
-func TestUncertainPayoutDoesNotConfirmWithoutRecipientCredit(t *testing.T) {
+func TestUncertainPayoutConfirmsWithoutRecipientCredit(t *testing.T) {
 	fx := newFixture(t)
 	state, report := payoutVisibilityState(t, fx, PhasePayoutSubmitting, "2")
 	fx.chain.balances["0xrecipient"] = decimal.Zero
@@ -148,65 +140,25 @@ func TestUncertainPayoutDoesNotConfirmWithoutRecipientCredit(t *testing.T) {
 	}
 	fx.orchestrator.chain = chain
 
-	err := fx.orchestrator.observeUncertainPayout(context.Background(), state, report)
-	if err == nil || !IsFatal(err) || fx.store.current == nil ||
-		fx.store.current.Phase != PhaseBlocked {
+	err := fx.orchestrator.observeUncertainPayout(
+		context.Background(), state, testActiveTarget(t, state), report,
+	)
+	if err != nil || fx.store.current != nil ||
+		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
 		t.Fatalf("observation error=%v current=%#v", err, fx.store.current)
 	}
-	if len(fx.chain.events) != 0 || len(fx.repo.completedIDs) != 0 {
+	if len(fx.chain.events) != 0 {
 		t.Fatalf("events=%v completed=%v", fx.chain.events, fx.repo.completedIDs)
 	}
 }
 
-func TestBlockedUncertainPayoutRecoveryRechecksWithoutResubmitting(t *testing.T) {
-	fx := newFixture(t)
-	state, report := payoutVisibilityState(t, fx, PhasePayoutSubmitting, "2")
-	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
-	chain := &payoutVisibilityChain{fakeChain: fx.chain, sleeper: fx.sleeper}
-	fx.orchestrator.chain = chain
-
-	err := fx.orchestrator.observeUncertainPayout(context.Background(), state, report)
-	if err == nil || !IsFatal(err) || fx.store.current == nil ||
-		fx.store.current.Phase != PhaseBlocked || !isUncertainPayoutBlock(fx.store.current) {
-		t.Fatalf("first observation error=%v current=%#v", err, fx.store.current)
-	}
-	if chain.calls != payoutBalanceObservationAttempts {
-		t.Fatalf("first observation balance calls = %d, want %d", chain.calls, payoutBalanceObservationAttempts)
-	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("first observation submitted chain action: %v", fx.chain.events)
-	}
-
-	// Verify that a blocked snapshot written by the previous implementation is
-	// also recoverable after upgrading.
-	fx.store.current.BlockedReason =
-		"final payout result remained uncertain and settlement balance did not decrease"
-	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("0.5")
-	chain.calls = 0
-	chain.delaysAtCalls = nil
-
-	if err := fx.orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(fx.chain.events) != 0 {
-		t.Fatalf("blocked recovery submitted chain action: %v", fx.chain.events)
-	}
-	if fx.store.current != nil || fx.store.archiveResult != "completed" ||
-		!equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
-		t.Fatalf("recovered current=%#v archive=%q completed=%v",
-			fx.store.current, fx.store.archiveResult, fx.repo.completedIDs)
-	}
-	if chain.calls < payoutBalanceRequiredConfirmations {
-		t.Fatalf("recovery balance calls = %d", chain.calls)
-	}
-}
-
-func TestLegacyBlockedPayoutWithoutRecipientBoundaryNeverAutoConfirms(t *testing.T) {
+func TestBlockedUncertainPayoutRecoveryRemainsTerminalWithoutObservation(t *testing.T) {
 	fx := newFixture(t)
 	state, report := payoutVisibilityState(t, fx, PhaseBlocked, "2")
-	state.BlockedReason = uncertainPayoutBlockedReasonPrefix + " (legacy)"
-	state.Payout.RecipientTotalBefore = ""
-	state.Payout.PreBalanceObservedAfterSubmit = true
+	target := testActiveTarget(t, state)
+	target.Payout.SubmitAttempts = 2
+	target.BlockedReason = uncertainPayoutBlockedReasonPrefix + " after exhausted replay"
+	fx.store.current = state
 	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("0.5")
 	chain := &payoutVisibilityChain{fakeChain: fx.chain, sleeper: fx.sleeper}
 	fx.orchestrator.chain = chain
@@ -214,17 +166,22 @@ func TestLegacyBlockedPayoutWithoutRecipientBoundaryNeverAutoConfirms(t *testing
 	err := fx.orchestrator.recoverState(
 		context.Background(), state, StateLoadMetadata{}, report,
 	)
-	if err == nil || !IsFatal(err) || len(fx.repo.completedIDs) != 0 ||
-		len(fx.chain.events) != 0 {
-		t.Fatalf("recovery error=%v completed=%v events=%v",
-			err, fx.repo.completedIDs, fx.chain.events)
+	if err == nil || !IsFatal(err) {
+		t.Fatalf("recoverState() error = %v, want terminal blocked result", err)
+	}
+	if len(fx.chain.events) != 0 || chain.calls != 0 {
+		t.Fatalf("blocked recovery calls=%d events=%v", chain.calls, fx.chain.events)
+	}
+	if fx.store.current == nil || fx.store.archiveResult != "" || len(fx.repo.completedIDs) != 0 {
+		t.Fatalf("recovered current=%#v archive=%q completed=%v",
+			fx.store.current, fx.store.archiveResult, fx.repo.completedIDs)
 	}
 }
 
 func TestExplicitlyRejectedBlockedPayoutRemainsTerminal(t *testing.T) {
 	fx := newFixture(t)
 	state, report := payoutVisibilityState(t, fx, PhaseBlocked, "2")
-	state.BlockedReason = explicitlyRejectedPayoutBlockedReason
+	testActiveTarget(t, state).BlockedReason = explicitlyRejectedPayoutBlockedReason
 	chain := &payoutVisibilityChain{fakeChain: fx.chain, sleeper: fx.sleeper}
 	fx.orchestrator.chain = chain
 
@@ -278,15 +235,15 @@ func payoutVisibilityState(
 ) (*RunState, *RunReport) {
 	t.Helper()
 	state := fx.positiveState(t, phase)
-	state.Payout = &PayoutJournal{
-		Prepared: validPayout(t, state, 901), TotalBefore: totalBefore,
-		RecipientTotalBefore: "0",
+	target := testTarget(t, &state, PayoutKindPointsRebate)
+	target.Payout = &PayoutJournal{
+		Prepared: validPayout(t, state, 901), TotalBefore: totalBefore, SubmitAttempts: 1,
 	}
-	fx.chain.balances["0xrecipient"] = decimal.RequireFromString(state.Manifest.PayoutTotal)
+	fx.chain.balances["0xrecipient"] = decimal.RequireFromString(target.Manifest.PayoutTotal)
 	report := newRunReport(
 		fx.clock.now, state.Trigger, ReportExecution{}, fx.orchestrator.network,
 		fx.orchestrator.builders, fx.orchestrator.builderNames,
-		state.Manifest.Settlement, state.Manifest.Recipient,
+		target.Manifest.Settlement, target.Manifest.Recipient, "0xreferral",
 	)
 	report.Outcome = "completed"
 	report.syncState(&state)

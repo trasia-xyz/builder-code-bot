@@ -11,20 +11,20 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-func TestRepositoryListPendingPreservesExactDecimalText(t *testing.T) {
+func TestPointsRebateRepositoryListPendingPreservesExactDecimalText(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New() error = %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	mock.ExpectQuery(regexp.QuoteMeta(listPendingSQL)).WillReturnRows(
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateListPendingSQL)).WillReturnRows(
 		sqlmock.NewRows([]string{"id", "period_start_at", "amount"}).
 			AddRow(2, 100, []byte("0.000000000000000001")).
 			AddRow(9, 101, []byte("123456789012345678901234567890.123456789012345678")),
 	)
 
-	repository := NewRepository(db, immediateRetryer())
+	repository := NewPointsRebateRepository(db, immediateRetryer())
 	records, err := repository.ListPending(context.Background())
 	if err != nil {
 		t.Fatalf("ListPending() error = %v", err)
@@ -44,7 +44,39 @@ func TestRepositoryListPendingPreservesExactDecimalText(t *testing.T) {
 	assertSQLMockExpectations(t, mock)
 }
 
-func TestRepositoryCompleteUpdatesOnlyManifestIDsAndVerifiesStatus(t *testing.T) {
+func TestReferralRepositoryListPendingUsesFixedCycleTypesAndPreservesRecords(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectQuery(regexp.QuoteMeta(referralListPendingSQL)).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "period_start_at", "amount"}).
+			AddRow(4, 200, []byte("0.000000000000000001")).
+			AddRow(8, 201, []byte("9876543210.123456789012345678")),
+	)
+
+	repository := NewReferralRepository(db, immediateRetryer())
+	records, err := repository.ListPending(context.Background())
+	if err != nil {
+		t.Fatalf("ListPending() error = %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("record count = %d, want 2", len(records))
+	}
+	if records[0].ID != 4 || records[0].PeriodStartAt != 200 ||
+		records[0].Amount != "0.000000000000000001" {
+		t.Errorf("first record = %#v", records[0])
+	}
+	if records[1].ID != 8 || records[1].PeriodStartAt != 201 ||
+		records[1].Amount != "9876543210.123456789012345678" {
+		t.Errorf("second record = %#v", records[1])
+	}
+	assertSQLMockExpectations(t, mock)
+}
+
+func TestPointsRebateRepositoryCompleteUpdatesOnlyManifestIDsAndVerifiesStatus(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New() error = %v", err)
@@ -52,17 +84,64 @@ func TestRepositoryCompleteUpdatesOnlyManifestIDsAndVerifiesStatus(t *testing.T)
 	t.Cleanup(func() { _ = db.Close() })
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix+" (?,?)")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix+" (?,?)")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix+" (?,?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix+" (?,?) ORDER BY id")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(3, 1).AddRow(7, 1))
 	mock.ExpectCommit()
 
-	repository := NewRepository(db, immediateRetryer())
+	repository := NewPointsRebateRepository(db, immediateRetryer())
 	if err := repository.Complete(context.Background(), []uint64{3, 7}); err != nil {
 		t.Fatalf("Complete() error = %v", err)
+	}
+	assertSQLMockExpectations(t, mock)
+}
+
+func TestReferralRepositoryCompleteKeepsFixedCycleTypesInUpdateAndStatusRead(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(referralUpdatePrefix+" (?,?)")).
+		WithArgs(uint64(3), uint64(7)).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectQuery(regexp.QuoteMeta(referralStatusPrefix+" (?,?) ORDER BY id")).
+		WithArgs(uint64(3), uint64(7)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(3, 1).AddRow(7, 1))
+	mock.ExpectCommit()
+
+	repository := NewReferralRepository(db, immediateRetryer())
+	if err := repository.Complete(context.Background(), []uint64{3, 7}); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	assertSQLMockExpectations(t, mock)
+}
+
+func TestReferralRepositoryCompleteRejectsRecordOutsideFixedCycleTypes(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(referralUpdatePrefix + " (?)")).
+		WithArgs(uint64(3)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(regexp.QuoteMeta(referralStatusPrefix + " (?) ORDER BY id")).
+		WithArgs(uint64(3)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}))
+	mock.ExpectRollback()
+
+	repository := NewReferralRepository(db, immediateRetryer())
+	err = repository.Complete(context.Background(), []uint64{3})
+	if err == nil || IsRetryable(err) {
+		t.Fatalf("Complete() error = %v, want permanent out-of-scope record error", err)
 	}
 	assertSQLMockExpectations(t, mock)
 }
@@ -75,10 +154,10 @@ func TestRepositoryCompleteRejectsMissingRecord(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix+" (?,?)")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix+" (?,?)")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix+" (?,?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix+" (?,?) ORDER BY id")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(3, 1))
 	mock.ExpectRollback()
@@ -99,7 +178,7 @@ func TestRepositoryCompleteRejectsUnexpectedAffectedRows(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix + " (?)")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix + " (?)")).
 		WithArgs(uint64(3)).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectRollback()
@@ -120,10 +199,10 @@ func TestRepositoryCompleteRejectsRecordStillPendingAfterUpdate(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix + " (?)")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix + " (?)")).
 		WithArgs(uint64(3)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix + " (?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix + " (?) ORDER BY id")).
 		WithArgs(uint64(3)).
 		WillReturnRows(statusRows([]uint64{3}, 0))
 	mock.ExpectRollback()
@@ -151,16 +230,16 @@ func TestRepositoryCompleteBatchesFiveHundredIDsInOneTransaction(t *testing.T) {
 	secondArgs := driverArgs(ids[500:])
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix + " (" + placeholders(500) + ")")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix + " (" + placeholders(500) + ")")).
 		WithArgs(firstArgs...).
 		WillReturnResult(sqlmock.NewResult(0, 500))
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix + " (?)")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix + " (?)")).
 		WithArgs(secondArgs...).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix + " (" + placeholders(500) + ") ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix + " (" + placeholders(500) + ") ORDER BY id")).
 		WithArgs(firstArgs...).
 		WillReturnRows(statusRows(ids[:500], 1))
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix + " (?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix + " (?) ORDER BY id")).
 		WithArgs(secondArgs...).
 		WillReturnRows(statusRows(ids[500:], 1))
 	mock.ExpectCommit()
@@ -180,14 +259,14 @@ func TestRepositoryCompleteResolvesAmbiguousCommitAsSuccess(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix+" (?,?)")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix+" (?,?)")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix+" (?,?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix+" (?,?) ORDER BY id")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnRows(statusRows([]uint64{3, 7}, 1))
 	mock.ExpectCommit().WillReturnError(io.EOF)
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix+" (?,?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix+" (?,?) ORDER BY id")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnRows(statusRows([]uint64{3, 7}, 1))
 
@@ -206,21 +285,21 @@ func TestRepositoryCompleteRetriesOnlyZeroStatusAfterAmbiguousCommit(t *testing.
 	t.Cleanup(func() { _ = db.Close() })
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix+" (?,?)")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix+" (?,?)")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix+" (?,?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix+" (?,?) ORDER BY id")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnRows(statusRows([]uint64{3, 7}, 1))
 	mock.ExpectCommit().WillReturnError(io.EOF)
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix+" (?,?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix+" (?,?) ORDER BY id")).
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(3, 1).AddRow(7, 0))
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(updatePrefix + " (?)")).
+	mock.ExpectExec(regexp.QuoteMeta(pointsRebateUpdatePrefix + " (?)")).
 		WithArgs(uint64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(statusPrefix + " (?) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateStatusPrefix + " (?) ORDER BY id")).
 		WithArgs(uint64(7)).
 		WillReturnRows(statusRows([]uint64{7}, 1))
 	mock.ExpectCommit()
@@ -230,6 +309,47 @@ func TestRepositoryCompleteRetriesOnlyZeroStatusAfterAmbiguousCommit(t *testing.
 		t.Fatalf("Complete() error = %v", err)
 	}
 	assertSQLMockExpectations(t, mock)
+}
+
+func TestReferralRepositoryCompleteRetriesOnlyScopedZeroStatusAfterAmbiguousCommit(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(referralUpdatePrefix+" (?,?)")).
+		WithArgs(uint64(3), uint64(7)).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectQuery(regexp.QuoteMeta(referralStatusPrefix+" (?,?) ORDER BY id")).
+		WithArgs(uint64(3), uint64(7)).
+		WillReturnRows(statusRows([]uint64{3, 7}, 1))
+	mock.ExpectCommit().WillReturnError(io.EOF)
+	mock.ExpectQuery(regexp.QuoteMeta(referralStatusPrefix+" (?,?) ORDER BY id")).
+		WithArgs(uint64(3), uint64(7)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(3, 1).AddRow(7, 0))
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(referralUpdatePrefix + " (?)")).
+		WithArgs(uint64(7)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(referralStatusPrefix + " (?) ORDER BY id")).
+		WithArgs(uint64(7)).
+		WillReturnRows(statusRows([]uint64{7}, 1))
+	mock.ExpectCommit()
+
+	repository := NewReferralRepository(db, immediateRetryer())
+	if err := repository.Complete(context.Background(), []uint64{3, 7}); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	assertSQLMockExpectations(t, mock)
+}
+
+func TestNewRepositoryRemainsPointsRebateCompatibilityConstructor(t *testing.T) {
+	repository := NewRepository(nil, Retryer{})
+	if repository.queries != pointsRebateQueries {
+		t.Fatalf("NewRepository() queries = %#v, want Points Rebate", repository.queries)
+	}
 }
 
 func immediateRetryer() Retryer {

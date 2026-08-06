@@ -93,14 +93,18 @@ func (o *Orchestrator) runConsolidation(
 	state.Manifest.Settlement = o.settlement
 	report = newRunReport(
 		o.clock.Now(), trigger, ReportExecution{}, o.network,
-		o.builders, o.builderNames, o.settlement, "",
+		o.builders, o.builderNames, o.settlement, "", "",
 	)
 	report.Outcome = "completed"
 	report.syncState(&state)
 	report.setStage("snapshot", ReportStepSkipped, "仅执行内部资金归集")
-	report.setStage("payout", ReportStepSkipped, "仅归集，不执行 Payout")
-	report.setStage("database", ReportStepSkipped, "不读取或更新 funding records")
-	report.Payout.Status = ReportStepSkipped
+	report.setStage("finalize", ReportStepSkipped, "仅归集，不持久化 Payout 状态")
+	for _, kind := range payoutExecutionOrder {
+		report.setTargetStage(kind, "payout", ReportStepSkipped, "仅归集，不执行 Payout")
+		report.setTargetStage(kind, "database", ReportStepSkipped, "不读取或更新 funding records")
+		report.target(kind).Payout.Status = ReportStepSkipped
+		report.target(kind).DatabaseStatus = ReportStepSkipped
+	}
 	defer func() {
 		if !errors.Is(err, context.Canceled) {
 			o.observeUserRateLimits(rateLimitObservationContext(ctx), &report)

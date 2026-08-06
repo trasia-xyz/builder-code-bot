@@ -26,6 +26,7 @@ const (
 	integrationKey2      = "0x0000000000000000000000000000000000000000000000000000000000000002"
 	integrationKey3      = "0x0000000000000000000000000000000000000000000000000000000000000003"
 	integrationRecipient = "0x00000000000000000000000000000000000000aa"
+	integrationReferral  = "0x00000000000000000000000000000000000000ab"
 )
 
 func TestIntegrationFundingFlow(t *testing.T) {
@@ -115,9 +116,61 @@ func TestIntegrationFundingFlow(t *testing.T) {
 	}
 }
 
+func TestIntegrationDualPayoutFlow(t *testing.T) {
+	env := newIntegrationEnvironment(t, false, false)
+	env.referralRepo.records = []funding.Record{
+		{ID: 1, PeriodStartAt: 300, Amount: "0.250000000000000001"},
+	}
+	if err := env.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.orchestrator.Run(context.Background(), funding.TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if !env.repository.completed || !env.referralRepo.completed {
+		t.Fatalf("points completed=%t referral completed=%t",
+			env.repository.completed, env.referralRepo.completed)
+	}
+	if got := env.balance(t, integrationRecipient); !got.Equal(env.payoutAmount) {
+		t.Fatalf("points recipient balance = %s, want %s", got, env.payoutAmount)
+	}
+	referralAmount := decimal.RequireFromString("0.250001")
+	if got := env.balance(t, integrationReferral); !got.Equal(referralAmount) {
+		t.Fatalf("referral recipient balance = %s, want %s", got, referralAmount)
+	}
+
+	var payouts []hyperliquidmock.RecordedRequest
+	for _, request := range env.server.Requests() {
+		if request.ActionType == "spotSend" &&
+			(strings.EqualFold(request.Destination, integrationRecipient) ||
+				strings.EqualFold(request.Destination, integrationReferral)) {
+			payouts = append(payouts, request)
+		}
+	}
+	if len(payouts) != 2 ||
+		!strings.EqualFold(payouts[0].Destination, integrationRecipient) ||
+		!strings.EqualFold(payouts[1].Destination, integrationReferral) {
+		t.Fatalf("payout requests = %#v", payouts)
+	}
+	if len(env.notifier.reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(env.notifier.reports))
+	}
+	report := env.notifier.reports[0]
+	wantTotal := env.payoutAmount.Add(referralAmount)
+	wantFinal := decimal.NewFromInt(4).Sub(wantTotal)
+	if report.PayoutTotal != wantTotal.String() || report.RecordCount != 3 ||
+		!report.SettlementBalance.Observed || report.SettlementBalance.Total != wantFinal.String() ||
+		len(report.Payouts) != 2 ||
+		report.Payouts[0].Payout.Status != funding.ReportStepSuccess ||
+		report.Payouts[1].Payout.Status != funding.ReportStepSuccess {
+		t.Fatalf("dual payout report = %#v", report)
+	}
+}
+
 type integrationEnvironment struct {
 	server       *hyperliquidmock.Server
 	repository   *integrationRepository
+	referralRepo *integrationRepository
 	store        *state.Store
 	orchestrator *funding.Orchestrator
 	notifier     *integrationNotifier
@@ -162,11 +215,13 @@ func newIntegrationEnvironment(
 	server.SetClaimReward(addresses[1], "USDC:0", "1.25")
 	server.SetSpotBalance(addresses[2], "USDC:0", "0")
 	server.SetSpotBalance(integrationRecipient, "USDC:0", "0")
+	server.SetSpotBalance(integrationReferral, "USDC:0", "0")
 
 	repository := &integrationRepository{records: []funding.Record{
 		{ID: 2, PeriodStartAt: 200, Amount: "2.000000000000000001"},
 		{ID: 1, PeriodStartAt: 100, Amount: "1.123456000000000000"},
 	}}
+	referralRepository := &integrationRepository{}
 	dataDir := filepath.Join(t.TempDir(), "data")
 	store := state.NewStore(dataDir)
 	chain := &integrationChain{
@@ -181,16 +236,19 @@ func newIntegrationEnvironment(
 	clock := fixedIntegrationClock{now: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)}
 	notifier := &integrationNotifier{}
 	orchestrator, err := funding.NewOrchestrator(funding.OrchestratorConfig{
-		Repository: repository, Store: store, DailyConsolidations: store, Chain: chain,
+		PointsRebateRepository: repository, ReferralRepository: referralRepository,
+		Store: store, DailyConsolidations: store, Chain: chain,
 		Builders:   []string{addresses[0], addresses[1]},
-		Settlement: addresses[2], Recipient: integrationRecipient,
-		Notifier: notifier, Clock: clock, Nonce: signing.NewNonceGenerator(), Sleeper: noWaitSleeper{},
+		Settlement: addresses[2], PointsRebateRecipient: integrationRecipient,
+		ReferralRecipient: integrationReferral,
+		Notifier:          notifier, Clock: clock, Nonce: signing.NewNonceGenerator(), Sleeper: noWaitSleeper{},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &integrationEnvironment{
-		server: server, repository: repository, store: store, orchestrator: orchestrator,
+		server: server, repository: repository, referralRepo: referralRepository,
+		store: store, orchestrator: orchestrator,
 		notifier: notifier,
 		info:     info.New(transport), settlement: addresses[2], dataDir: dataDir,
 		builders:     append([]string(nil), addresses[:2]...),

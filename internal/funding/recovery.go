@@ -29,7 +29,7 @@ func (o *Orchestrator) RunScheduled(
 func (o *Orchestrator) run(ctx context.Context, trigger Trigger, execution ReportExecution) (err error) {
 	report := newRunReport(
 		o.clock.Now(), trigger, execution, o.network, o.builders, o.builderNames,
-		o.settlement, o.recipient,
+		o.settlement, o.recipients[PayoutKindPointsRebate], o.recipients[PayoutKindReferral],
 	)
 	defer func() { o.deliverRunReport(ctx, &report, err) }()
 	defer func() {
@@ -77,7 +77,8 @@ func (o *Orchestrator) Recover(ctx context.Context) (err error) {
 	}
 	report := newRunReport(
 		o.clock.Now(), current.Trigger, ReportExecution{Recovery: true}, o.network,
-		o.builders, o.builderNames, o.settlement, o.recipient,
+		o.builders, o.builderNames, o.settlement,
+		o.recipients[PayoutKindPointsRebate], o.recipients[PayoutKindReferral],
 	)
 	report.Outcome = "completed"
 	report.syncState(current)
@@ -103,93 +104,101 @@ func (o *Orchestrator) recoverState(
 	metadata StateLoadMetadata,
 	report *RunReport,
 ) (err error) {
-	markRecoveredPayoutSubmission(report, state, metadata)
+	target, _, targetErr := state.activePayoutTarget()
+	if targetErr != nil {
+		return &FatalError{Err: targetErr}
+	}
+	if target == nil {
+		return o.finishRun(ctx, state, report)
+	}
+	if err := validateTargetProgress(state, target); err != nil {
+		return &FatalError{Err: err}
+	}
+	markRecoveredPayoutSubmission(report, state, target, metadata)
 	o.info(ctx, "funding recovery started",
 		slog.String("event", "recovery_started"), slog.String("run_id", state.RunID),
-		slog.String("phase", string(state.Phase)),
-		slog.Int("record_count", len(state.Manifest.Records)),
-		slog.String("raw_total", state.Manifest.RawTotal),
-		slog.String("payout_total", state.Manifest.PayoutTotal))
+		slog.String("payout_kind", string(target.Kind)),
+		slog.String("phase", string(target.Phase)),
+		slog.Int("record_count", len(target.Manifest.Records)),
+		slog.String("raw_total", target.Manifest.RawTotal),
+		slog.String("payout_total", target.Manifest.PayoutTotal))
 	defer func() {
 		if err == nil {
 			o.info(ctx, "funding recovery completed",
 				slog.String("event", "recovery_completed"), slog.String("run_id", state.RunID))
 		}
 	}()
-	switch state.Phase {
+	switch target.Phase {
 	case PhasePrepared:
-		if state.Manifest.PayoutTotal == "0" {
-			report.setStage("payout", ReportStepSkipped, "无需付款")
-			report.Payout.Status = ReportStepSkipped
-			return o.completeDatabase(ctx, state, report)
+		if len(target.Manifest.Records) == 0 {
+			report.markTargetNoData(target.Kind)
+			return o.completeDatabase(ctx, state, target, report)
 		}
-		return o.runPositive(ctx, state, report)
+		if target.Manifest.PayoutTotal == "0" {
+			report.setTargetStage(target.Kind, "payout", ReportStepSkipped, "无需付款")
+			report.target(target.Kind).Payout.Status = ReportStepSkipped
+			return o.completeDatabase(ctx, state, target, report)
+		}
+		return o.runPositive(ctx, state, target, report)
 	case PhasePayoutPrepared:
 		// A primary payout_prepared state proves that submission never started.
 		// A backup at the same phase may be one boundary behind a submitted
 		// primary, so it must use balance observation instead of resubmission.
 		if metadata.RecoveredFromBackup {
-			return o.observeUncertainPayout(ctx, state, report)
+			return o.observeUncertainPayout(ctx, state, target, report)
 		}
-		if err := o.ensurePreparedPayoutRecipientBoundary(ctx, state, report); err != nil {
-			return err
-		}
-		return o.submitPreparedPayout(ctx, state, report)
+		return o.submitPreparedPayout(ctx, state, target, report)
 	case PhasePayoutSubmitting:
-		return o.observeUncertainPayout(ctx, state, report)
+		return o.observeUncertainPayout(ctx, state, target, report)
+	case PhasePayoutReplaying:
+		// The sole replay was reserved durably before its HTTP call. Recovery
+		// can only observe; it must never create a third Submit attempt.
+		return o.observeUncertainPayout(ctx, state, target, report)
 	case PhasePayoutConfirmed:
-		if err := validateConfirmedPayoutState(state); err != nil {
-			markSettlementPayoutUnconfirmed(report)
-			report.Payout.Status = ReportStepFailed
+		if err := validateConfirmedPayoutState(target); err != nil {
+			markSettlementPayoutUnconfirmed(report, target.Kind)
+			report.target(target.Kind).Payout.Status = ReportStepFailed
 			report.Outcome = "blocked"
-			report.fail(
-				"payout",
+			report.failTarget(
+				target.Kind, "payout",
 				"已确认 Payout 状态不完整，未更新数据库。",
 				"请保留 current 状态并核查 journal、request hash 与付款前余额边界。",
 			)
 			return &FatalError{Err: fmt.Errorf("validate confirmed payout state: %w", err)}
 		}
-		report.Payout.Status = ReportStepSuccess
-		report.setStage("payout", ReportStepSuccess, "已在此前执行中确认")
-		return o.completeDatabase(ctx, state, report)
+		report.target(target.Kind).Payout.Status = ReportStepSuccess
+		report.setTargetStage(target.Kind, "payout", ReportStepSuccess, "已在此前执行中确认")
+		return o.completeDatabase(ctx, state, target, report)
 	case PhaseBlocked:
-		// An ambiguous payout remains safe to inspect again because recovery only
-		// reads settlement state and never resubmits the persisted request. This
-		// lets a balance index that lagged the original observation window heal on
-		// a later recovery while retaining the exactly-once boundary.
-		if isUncertainPayoutBlock(state) {
-			report.Outcome = "completed"
-			report.Payout.Status = ReportStepPending
-			report.setStage("payout", ReportStepPending, "重新只读核查不确定 Payout")
-			return o.observeUncertainPayout(ctx, state, report)
+		if target.BlockedReason == "" {
+			target.BlockedReason = "funding run is blocked"
 		}
-		if state.BlockedReason == "" {
-			state.BlockedReason = "funding run is blocked"
-		}
-		report.Payout.Status = ReportStepFailed
+		markSettlementPayoutUnconfirmed(report, target.Kind)
+		report.target(target.Kind).Payout.Status = ReportStepFailed
 		report.Outcome = "blocked"
-		report.fail(
-			"payout",
-			"检测到 blocked Payout 状态。",
-			"需要人工核查付款结果；在确认前禁止清理状态或重发。",
+		report.failTarget(
+			target.Kind, "payout",
+			"检测到终态 blocked Payout，任务不会继续观察或重发。",
+			"请根据最终报告人工核查；程序不会为该 journal 构造新请求。",
 		)
-		return &FatalError{Err: fmt.Errorf("%s", state.BlockedReason)}
+		return &FatalError{Err: fmt.Errorf("%s", target.BlockedReason)}
 	default:
-		return fmt.Errorf("unsupported persisted funding phase %q", state.Phase)
+		return fmt.Errorf("unsupported persisted funding phase %q for %s", target.Phase, target.Kind)
 	}
 }
 
 func markRecoveredPayoutSubmission(
 	report *RunReport,
 	state *RunState,
+	target *PayoutTargetState,
 	metadata StateLoadMetadata,
 ) {
-	if report == nil || state == nil || state.Payout == nil {
+	if report == nil || state == nil || target == nil || target.Payout == nil {
 		return
 	}
 	possiblySubmitted := false
-	switch state.Phase {
-	case PhasePayoutSubmitting, PhasePayoutConfirmed, PhaseBlocked:
+	switch target.Phase {
+	case PhasePayoutSubmitting, PhasePayoutReplaying, PhasePayoutConfirmed, PhaseBlocked:
 		possiblySubmitted = true
 	case PhasePayoutPrepared:
 		// A backup can be one durable boundary behind a primary from which
@@ -197,7 +206,7 @@ func markRecoveredPayoutSubmission(
 		possiblySubmitted = metadata.RecoveredFromBackup
 	}
 	if possiblySubmitted {
-		report.markSubmitted(state.Manifest.Settlement)
+		report.markSubmitted(target.Manifest.Settlement)
 	}
 }
 

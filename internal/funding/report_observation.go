@@ -24,8 +24,7 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 	// An ambiguous payout may already have moved funds. Its bounded observer has
 	// already failed to establish the exact ending boundary, so a later single
 	// read must not be relabelled as the task's ending balance.
-	if report.SettlementBalance.PostPayoutUnconfirmed &&
-		report.Payout.Status != ReportStepSuccess {
+	if report.SettlementBalance.PostPayoutUnconfirmed {
 		return
 	}
 	token := report.token
@@ -47,7 +46,7 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 	if settlement == "" {
 		settlement = o.settlement
 	}
-	expectedTotal, requirePostPayout, boundaryErr := postPayoutBalanceBoundary(report)
+	expectedTotals, requirePostPayout, boundaryErr := postPayoutBalanceBoundaries(report)
 	if boundaryErr != nil {
 		o.markSettlementFinalBalanceBoundaryInvalid(ctx, report, settlement, boundaryErr)
 		return
@@ -64,6 +63,7 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 
 	var (
 		lastTotal                string
+		candidateTotal           decimal.Decimal
 		candidateAvailable       decimal.Decimal
 		observedAny              bool
 		successfulObservations   int
@@ -90,11 +90,13 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 		observedAny = true
 		successfulObservations++
 		lastTotal = balance.Total.String()
-		matchesExpected := balance.Total.Equal(expectedTotal)
+		matchesExpected := matchesAnyBalanceBoundary(balance.Total, expectedTotals)
 		if matchesExpected {
-			if consecutiveConfirmations > 0 && balance.Available.Equal(candidateAvailable) {
+			if consecutiveConfirmations > 0 && balance.Total.Equal(candidateTotal) &&
+				balance.Available.Equal(candidateAvailable) {
 				consecutiveConfirmations++
 			} else {
+				candidateTotal = balance.Total
 				candidateAvailable = balance.Available
 				consecutiveConfirmations = 1
 			}
@@ -125,7 +127,7 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 		o.info(ctx, "post-payout settlement balance is not visible yet",
 			slog.String("event", "funding_settlement_post_payout_balance_pending"),
 			slog.String("settlement", settlement),
-			slog.String("expected_total", expectedTotal.String()),
+			slog.String("expected_totals", formatBalanceBoundaries(expectedTotals)),
 			slog.String("total", balance.Total.String()),
 			slog.String("available", balance.Available.String()),
 			slog.Int("query_attempt", queryAttempt),
@@ -145,38 +147,70 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 	o.warn(ctx, "post-payout settlement balance remained unconfirmed",
 		slog.String("event", "funding_settlement_post_payout_balance_unconfirmed"),
 		slog.String("settlement", settlement),
-		slog.String("expected_total", expectedTotal.String()),
+		slog.String("expected_totals", formatBalanceBoundaries(expectedTotals)),
 		slog.String("last_total", lastTotal),
 		slog.Int("successful_observations", successfulObservations))
 }
 
-func markSettlementPayoutUnconfirmed(report *RunReport) {
+func markSettlementPayoutUnconfirmed(report *RunReport, kind PayoutKind) {
 	if report == nil {
 		return
 	}
 	address := report.SettlementBalance.Address
 	if strings.TrimSpace(address) == "" {
-		address = report.Payout.Settlement
+		address = report.target(kind).Payout.Settlement
 	}
 	report.SettlementBalance = SettlementBalanceReport{
 		Address: address, PostPayoutUnconfirmed: true,
 	}
 }
 
-func postPayoutBalanceBoundary(report *RunReport) (decimal.Decimal, bool, error) {
-	if report == nil || report.Payout.Status != ReportStepSuccess {
-		return decimal.Zero, false, nil
+func postPayoutBalanceBoundaries(report *RunReport) ([]decimal.Decimal, bool, error) {
+	if report == nil {
+		return nil, false, nil
 	}
-	amount, amountErr := decimal.NewFromString(report.Payout.Amount)
-	totalBefore, beforeErr := decimal.NewFromString(report.Payout.SettlementTotalBefore)
-	if amountErr != nil || beforeErr != nil || !amount.IsPositive() {
-		return decimal.Zero, true, fmt.Errorf("invalid successful payout balance boundary")
+	for index := len(report.Payouts) - 1; index >= 0; index-- {
+		payout := report.Payouts[index].Payout
+		if payout.Status != ReportStepSuccess {
+			continue
+		}
+		amount, amountErr := decimal.NewFromString(payout.Amount)
+		if amountErr == nil && !amount.IsPositive() {
+			continue
+		}
+		totalBefore, beforeErr := decimal.NewFromString(payout.SettlementTotalBefore)
+		if amountErr != nil || beforeErr != nil || !amount.IsPositive() {
+			return nil, true, fmt.Errorf("invalid successful payout balance boundary")
+		}
+		expected, withNewAddressFee, feeBoundaryAvailable :=
+			payoutSettlementBoundaries(totalBefore, amount)
+		if expected.IsNegative() {
+			return nil, true, fmt.Errorf("negative successful payout balance boundary")
+		}
+		boundaries := []decimal.Decimal{expected}
+		if feeBoundaryAvailable {
+			boundaries = append(boundaries, withNewAddressFee)
+		}
+		return boundaries, true, nil
 	}
-	expected := totalBefore.Sub(amount)
-	if expected.IsNegative() {
-		return decimal.Zero, true, fmt.Errorf("negative successful payout balance boundary")
+	return nil, false, nil
+}
+
+func matchesAnyBalanceBoundary(total decimal.Decimal, boundaries []decimal.Decimal) bool {
+	for _, boundary := range boundaries {
+		if total.Equal(boundary) {
+			return true
+		}
 	}
-	return expected, true, nil
+	return false
+}
+
+func formatBalanceBoundaries(boundaries []decimal.Decimal) string {
+	values := make([]string, 0, len(boundaries))
+	for _, boundary := range boundaries {
+		values = append(values, boundary.String())
+	}
+	return strings.Join(values, ",")
 }
 
 func recordSettlementFinalBalance(
