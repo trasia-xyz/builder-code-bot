@@ -320,6 +320,14 @@ func (o *Orchestrator) runPositive(
 			return &FatalError{Err: err}
 		}
 	}
+	if hasPriorPayout {
+		// A balance query made immediately after a successful payout can still
+		// return the pre-transfer balance. Delay the first boundary read for the
+		// next payout target so it observes the settled state more reliably.
+		if err := o.sleeper.Sleep(ctx, payoutBalanceObservationInterval); err != nil {
+			return err
+		}
+	}
 	var (
 		settlement             info.SpotBalanceAmounts
 		candidate              info.SpotBalanceAmounts

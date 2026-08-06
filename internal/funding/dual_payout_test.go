@@ -4,12 +4,62 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"builder-code-bot/internal/hyperliquid/exchange"
 	"builder-code-bot/internal/hyperliquid/info"
 
 	"github.com/shopspring/decimal"
 )
+
+type postPayoutObservationProbe struct {
+	awaitingBalance     bool
+	delayed             bool
+	firstBalanceRead    bool
+	readOccurredTooSoon bool
+}
+
+type postPayoutDelayChain struct {
+	*fakeChain
+	probe *postPayoutObservationProbe
+}
+
+func (c *postPayoutDelayChain) Submit(
+	ctx context.Context,
+	action exchange.PreparedAction,
+) (exchange.SubmitResult, error) {
+	result, err := c.fakeChain.Submit(ctx, action)
+	if err == nil && result.Accepted && action.Kind == "spotSend" &&
+		action.Signer == "0xsettlement" && action.Destination == "0xrecipient" {
+		c.probe.awaitingBalance = true
+	}
+	return result, err
+}
+
+func (c *postPayoutDelayChain) SpotBalance(
+	ctx context.Context,
+	address string,
+	token info.Token,
+) (info.SpotBalanceAmounts, error) {
+	if address == "0xsettlement" && c.probe.awaitingBalance && !c.probe.firstBalanceRead {
+		c.probe.firstBalanceRead = true
+		c.probe.readOccurredTooSoon = !c.probe.delayed
+		c.probe.awaitingBalance = false
+	}
+	return c.fakeChain.SpotBalance(ctx, address, token)
+}
+
+type postPayoutDelaySleeper struct {
+	*fakeSleeper
+	probe *postPayoutObservationProbe
+}
+
+func (s *postPayoutDelaySleeper) Sleep(ctx context.Context, delay time.Duration) error {
+	if s.probe.awaitingBalance && delay >= time.Second {
+		s.probe.delayed = true
+	}
+	return s.fakeSleeper.Sleep(ctx, delay)
+}
 
 func TestDualPayoutExecutesPointsThenReferralAndCompletesBothTargets(t *testing.T) {
 	fx := newFixture(t)
@@ -53,6 +103,26 @@ func TestDualPayoutExecutesPointsThenReferralAndCompletesBothTargets(t *testing.
 	}
 	if stage := report.stage("finalize"); stage == nil || stage.Status != ReportStepSuccess {
 		t.Fatalf("finalize stage = %#v", stage)
+	}
+}
+
+func TestDualPayoutWaitsBeforeFirstPostTransferBalanceRead(t *testing.T) {
+	fx := newFixture(t)
+	fx.referralRepo.records = []Record{{ID: 9, PeriodStartAt: 30, Amount: "0.25"}}
+	fx.chain.balances["0xsettlement"] = decimal.NewFromInt(2)
+	probe := &postPayoutObservationProbe{}
+	fx.orchestrator.chain = &postPayoutDelayChain{fakeChain: fx.chain, probe: probe}
+	fx.orchestrator.sleeper = &postPayoutDelaySleeper{fakeSleeper: fx.sleeper, probe: probe}
+
+	if err := fx.orchestrator.Run(context.Background(), TriggerRunOnStart); err != nil {
+		t.Fatal(err)
+	}
+	if !probe.firstBalanceRead {
+		t.Fatal("no settlement balance read was observed after the Points payout")
+	}
+	if !probe.delayed || probe.readOccurredTooSoon {
+		t.Fatalf("first post-payout read delayed=%t tooSoon=%t, want delay before read",
+			probe.delayed, probe.readOccurredTooSoon)
 	}
 }
 
