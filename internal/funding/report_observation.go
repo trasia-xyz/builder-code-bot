@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"builder-code-bot/internal/logging"
+
 	"github.com/shopspring/decimal"
 )
 
@@ -35,7 +37,8 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 			report.addWarning("Settlement: 任务结束余额查询失败")
 			o.warn(ctx, "final settlement token query failed",
 				slog.String("event", "funding_settlement_final_balance_query_failed"),
-				slog.String("query_kind", "canonical_usdc"))
+				slog.String("query_kind", "canonical_usdc"),
+				logging.Err(err))
 			return
 		}
 		token = &resolved
@@ -54,7 +57,7 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 	if !requirePostPayout {
 		balance, err := o.chain.SpotBalance(ctx, settlement, *token)
 		if err != nil {
-			o.markSettlementFinalBalanceQueryFailed(ctx, report, settlement)
+			o.markSettlementFinalBalanceQueryFailed(ctx, report, settlement, "spot_balance", err)
 			return
 		}
 		recordSettlementFinalBalance(report, settlement, balance.Total, balance.Available)
@@ -69,21 +72,24 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 		successfulObservations   int
 		successfulLimit          = settlementFinalBalanceObservationAttempts
 		consecutiveConfirmations int
+		lastQueryErr             error
 	)
 	for queryAttempt := 1; queryAttempt <= settlementFinalBalanceQueryAttempts &&
 		successfulObservations < successfulLimit; queryAttempt++ {
 		if err := o.sleeper.Sleep(ctx, settlementFinalBalanceObservationInterval); err != nil {
-			o.markSettlementFinalBalanceQueryFailed(ctx, report, settlement)
+			o.markSettlementFinalBalanceQueryFailed(ctx, report, settlement, "observation_wait", err)
 			return
 		}
 		balance, err := o.chain.SpotBalance(ctx, settlement, *token)
 		if err != nil {
+			lastQueryErr = err
 			consecutiveConfirmations = 0
 			o.warn(ctx, "post-payout settlement balance query failed",
 				slog.String("event", "funding_settlement_post_payout_balance_query_failed"),
 				slog.String("settlement", settlement),
 				slog.Int("query_attempt", queryAttempt),
-				slog.Int("successful_observations", successfulObservations))
+				slog.Int("successful_observations", successfulObservations),
+				logging.Err(err))
 			continue
 		}
 
@@ -137,7 +143,7 @@ func (o *Orchestrator) observeSettlementFinalBalance(ctx context.Context, report
 	}
 
 	if !observedAny {
-		o.markSettlementFinalBalanceQueryFailed(ctx, report, settlement)
+		o.markSettlementFinalBalanceQueryFailed(ctx, report, settlement, "spot_balance", lastQueryErr)
 		return
 	}
 	report.SettlementBalance = SettlementBalanceReport{
@@ -229,13 +235,20 @@ func (o *Orchestrator) markSettlementFinalBalanceQueryFailed(
 	ctx context.Context,
 	report *RunReport,
 	settlement string,
+	queryKind string,
+	err error,
 ) {
 	report.SettlementBalance = SettlementBalanceReport{Address: settlement, QueryFailed: true}
 	report.addWarning("Settlement: 任务结束余额查询失败")
-	o.warn(ctx, "final settlement balance query failed",
+	attrs := []slog.Attr{
 		slog.String("event", "funding_settlement_final_balance_query_failed"),
-		slog.String("query_kind", "spot_balance"),
-		slog.String("settlement", settlement))
+		slog.String("query_kind", queryKind),
+		slog.String("settlement", settlement),
+	}
+	if err != nil {
+		attrs = append(attrs, logging.Err(err))
+	}
+	o.warn(ctx, "final settlement balance query failed", attrs...)
 }
 
 func (o *Orchestrator) markSettlementFinalBalanceBoundaryInvalid(
@@ -251,5 +264,5 @@ func (o *Orchestrator) markSettlementFinalBalanceBoundaryInvalid(
 	o.warn(ctx, "successful payout settlement balance boundary is invalid",
 		slog.String("event", "funding_settlement_final_balance_boundary_invalid"),
 		slog.String("settlement", settlement),
-		slog.String("error", err.Error()))
+		logging.Err(err))
 }

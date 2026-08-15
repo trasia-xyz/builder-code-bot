@@ -265,6 +265,33 @@ func TestBuildDailyConsolidationViewShowsCoveredPayoutAsNormal(t *testing.T) {
 	}
 }
 
+func TestBuildDailyConsolidationViewDoesNotPresentMissingClaimableAsZero(t *testing.T) {
+	t.Parallel()
+
+	none := buildDailyConsolidationView(funding.RunReport{
+		DailyConsolidation: funding.DailyConsolidationReport{
+			UTCDate: "2026-07-23", Status: funding.DailyConsolidationCompleted,
+			BuilderCount: 1, RecordedBuilders: 1, Observed: true,
+		},
+	})
+	if none.Total != "—" || none.TotalLabel != "零点 Claimable 合计" ||
+		none.Status != "零点数据不完整" {
+		t.Fatalf("unobserved claimable view = %#v", none)
+	}
+
+	partial := buildDailyConsolidationView(funding.RunReport{
+		DailyConsolidation: funding.DailyConsolidationReport{
+			UTCDate: "2026-07-23", Status: funding.DailyConsolidationCompleted,
+			TotalClaimableUSDC: "1.2", BuilderCount: 2,
+			RecordedBuilders: 2, ObservedBuilders: 1, Observed: true,
+		},
+	})
+	if partial.Total != "1.2" || partial.TotalLabel != "已观测 Claimable 小计" ||
+		partial.Status != "零点数据不完整" {
+		t.Fatalf("partial claimable view = %#v", partial)
+	}
+}
+
 func TestRenderBuildsCompactRetryEmail(t *testing.T) {
 	t.Parallel()
 	report := funding.RunReport{

@@ -11,6 +11,7 @@ import (
 
 	"builder-code-bot/internal/hyperliquid/exchange"
 	"builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/logging"
 
 	"github.com/shopspring/decimal"
 )
@@ -77,6 +78,7 @@ const (
 	claimBalanceObservationInterval        = time.Second
 	claimBalanceRequiredConfirmations      = 2
 	claimRewardThresholdUSDC               = int64(1)
+	claimBelowThresholdRejection           = "Must have at least 1 of a reward token to claim"
 	zeroEthereumAddress                    = "0x0000000000000000000000000000000000000000"
 )
 
@@ -374,7 +376,8 @@ func (o *Orchestrator) runPositive(
 				slog.String("event", "funding_settlement_balance_query_failed"),
 				slog.String("run_id", state.RunID),
 				slog.Int("attempt", attempt),
-				slog.Int("max_attempts", settlementBalanceQueryAttempts))
+				slog.Int("max_attempts", settlementBalanceQueryAttempts),
+				logging.Err(queryErr))
 		}
 		if attempt < settlementBalanceQueryAttempts {
 			if err := o.sleeper.Sleep(ctx, settlementBalanceQueryInterval); err != nil {
@@ -531,7 +534,8 @@ func (o *Orchestrator) queryConsolidationToken(
 			slog.String("run_id", state.RunID),
 			slog.Int("attempt", attempt),
 			slog.Int("max_attempts", claimableQueryAttempts),
-			slog.Bool("will_retry", willRetry))
+			slog.Bool("will_retry", willRetry),
+			logging.Err(err))
 		if willRetry {
 			if err := o.sleeper.Sleep(ctx, claimableQueryRetryInterval); err != nil {
 				return info.Token{}, err
@@ -611,7 +615,8 @@ func (o *Orchestrator) captureBuilderClaimables(
 				slog.String("builder", builder),
 				slog.Int("attempt", attempt),
 				slog.Int("max_attempts", claimableQueryAttempts),
-				slog.Bool("will_retry", attempt < claimableQueryAttempts))
+				slog.Bool("will_retry", attempt < claimableQueryAttempts),
+				logging.Err(result.err))
 		}
 		if len(pendingBuilderIndexes(pending)) == 0 {
 			break
@@ -644,6 +649,7 @@ func pendingBuilderIndexes(pending []bool) []int {
 type claimAttemptResult struct {
 	index      int
 	prepareErr error
+	submitErr  error
 	result     exchange.SubmitResult
 }
 
@@ -653,7 +659,6 @@ type claimBalanceTarget struct {
 	claimableBefore         decimal.Decimal
 	claimableKnown          bool
 	minimumIncrease         decimal.Decimal
-	strictIncrease          bool
 	submitUnknown           bool
 	preStateSeenAfterSubmit bool
 }
@@ -663,11 +668,7 @@ func (t claimBalanceTarget) minimumTotal() decimal.Decimal {
 }
 
 func (t claimBalanceTarget) visible(total decimal.Decimal) bool {
-	minimum := t.minimumTotal()
-	if t.strictIncrease {
-		return total.GreaterThan(minimum)
-	}
-	return !total.LessThan(minimum)
+	return !total.LessThan(t.minimumTotal())
 }
 
 type balanceQueryResult struct {
@@ -681,7 +682,10 @@ func sameSpotBalance(left, right info.SpotBalanceAmounts) bool {
 }
 
 func claimEligible(claimable decimal.Decimal, observed bool) bool {
-	return !observed || claimable.GreaterThan(decimal.NewFromInt(claimRewardThresholdUSDC))
+	// A missing observation falls back to one bounded claim attempt. The
+	// exchange's exact below-threshold rejection is classified locally, while
+	// every other response remains a normal failure or uncertain submission.
+	return !observed || !claimable.LessThan(decimal.NewFromInt(claimRewardThresholdUSDC))
 }
 
 func (o *Orchestrator) captureClaimBalanceBaselines(
@@ -753,7 +757,8 @@ func (o *Orchestrator) captureClaimBalanceBaselines(
 				slog.String("run_id", state.RunID),
 				slog.String("builder", builder),
 				slog.Int("attempt", attempt),
-				slog.Int("max_attempts", claimBaselineQueryAttempts))
+				slog.Int("max_attempts", claimBaselineQueryAttempts),
+				logging.Err(result.err))
 		}
 		if len(pendingBuilderIndexes(pending)) > 0 && attempt < claimBaselineQueryAttempts {
 			if err := o.sleeper.Sleep(ctx, claimBaselineQueryInterval); err != nil {
@@ -799,18 +804,22 @@ func (o *Orchestrator) claimBuilderRewards(
 		if !eligible {
 			if builderReport := report.builder(builder); builderReport != nil {
 				builderReport.ClaimStatus = ReportStepSkipped
-				builderReport.ClaimSummary = "未超过 1 USDC 阈值"
+				builderReport.ClaimSummary = "低于 1 USDC 阈值"
 			}
 		} else if _, baselineObserved := baselines[builder]; baselineObserved {
 			indexes = append(indexes, index)
 		}
-		o.info(ctx, "builder claim eligibility checked",
+		attrs := []slog.Attr{
 			slog.String("event", "funding_builder_claim_eligibility_checked"),
 			slog.String("run_id", state.RunID), slog.String("builder", builder),
-			slog.String("claimable_usdc", claimable.String()),
 			slog.String("threshold_usdc", threshold.String()),
 			slog.Bool("claimable_observed", observed),
-			slog.Bool("eligible", eligible))
+			slog.Bool("eligible", eligible),
+		}
+		if observed {
+			attrs = append(attrs, slog.String("claimable_usdc", claimable.String()))
+		}
+		o.info(ctx, "builder claim eligibility checked", attrs...)
 	}
 
 	nonces := make(map[int]uint64, len(indexes))
@@ -826,8 +835,8 @@ func (o *Orchestrator) claimBuilderRewards(
 				results <- claimAttemptResult{index: index, prepareErr: err}
 				return
 			}
-			result, _ := o.chain.Submit(ctx, prepared)
-			results <- claimAttemptResult{index: index, result: result}
+			result, submitErr := o.chain.Submit(ctx, prepared)
+			results <- claimAttemptResult{index: index, result: result, submitErr: submitErr}
 		}()
 	}
 
@@ -852,20 +861,19 @@ func (o *Orchestrator) claimBuilderRewards(
 			claimableBefore: claimable,
 			claimableKnown:  claimableKnown,
 			minimumIncrease: minimumIncrease,
-			strictIncrease:  !claimableKnown,
 		}
 		result := round[index]
 		if builderReport := report.builder(builder); builderReport != nil {
 			builderReport.ClaimAttempts = 1
 		}
 		if result.prepareErr != nil {
-			o.builderFailure(ctx, state, report, builder, "claimRewards", "prepare")
+			o.builderFailure(ctx, state, report, builder, "claimRewards", "prepare", result.prepareErr)
 			continue
 		}
 		report.markSubmitted(builder)
-		o.logBuilderSubmitResult(ctx, state, builder, "claimRewards", "", result.result)
+		o.logBuilderSubmitResult(ctx, state, builder, "claimRewards", "", result.result, result.submitErr)
 		switch {
-		case result.result.Accepted:
+		case result.submitErr == nil && result.result.Accepted:
 			claimBalanceTargets[builder] = target
 			if builderReport := report.builder(builder); builderReport != nil {
 				builderReport.ClaimStatus = ReportStepSuccess
@@ -874,7 +882,18 @@ func (o *Orchestrator) claimBuilderRewards(
 					builderReport.ClaimSummary += "；零点 Claimable 数据缺失"
 				}
 			}
-		case result.result.Rejected:
+		case result.submitErr == nil && result.result.Rejected &&
+			!claimableKnown && claimBelowThreshold(result.result):
+			if builderReport := report.builder(builder); builderReport != nil {
+				builderReport.ClaimStatus = ReportStepSkipped
+				builderReport.ClaimSummary = "未达到 1 USDC 领取门槛（由交易所确认）"
+			}
+			o.info(ctx, "builder claim below threshold confirmed by exchange",
+				slog.String("event", "funding_builder_claim_below_threshold_confirmed"),
+				slog.String("run_id", state.RunID),
+				slog.String("builder", builder),
+				slog.String("exchange_message", claimBelowThresholdRejection))
+		case result.submitErr == nil && result.result.Rejected:
 			o.builderFailure(ctx, state, report, builder, "claimRewards", "rejected")
 		default:
 			target.submitUnknown = true
@@ -893,6 +912,11 @@ func (o *Orchestrator) claimBuilderRewards(
 	}
 	report.setStage("rewards", aggregateBuilderStep(report.Builders, true), builderStepSummary(report.Builders, true))
 	return claimBalanceTargets, nil
+}
+
+func claimBelowThreshold(result exchange.SubmitResult) bool {
+	message, ok := result.RejectionMessage()
+	return ok && message == claimBelowThresholdRejection
 }
 
 func (o *Orchestrator) markClaimUncertain(
@@ -948,9 +972,9 @@ func (o *Orchestrator) sweepBuilderBalances(
 					return err
 				}
 				if hadUnknown {
-					o.builderFailure(ctx, state, report, builder, "spotSend", "unknown")
+					o.builderFailure(ctx, state, report, builder, "spotSend", "unknown", balanceErr)
 				} else {
-					o.builderFailure(ctx, state, report, builder, "spotBalance", "query")
+					o.builderFailure(ctx, state, report, builder, "spotBalance", "query", balanceErr)
 				}
 				break
 			}
@@ -988,18 +1012,18 @@ func (o *Orchestrator) sweepBuilderBalances(
 			)
 			if prepareErr != nil {
 				if hadUnknown && attempt < sweepSubmitAttempts {
-					o.logSweepRetry(ctx, state, builder, attempt, "prepare")
+					o.logSweepRetry(ctx, state, builder, attempt, "prepare", prepareErr)
 					continue
 				}
 				outcome := "prepare"
 				if hadUnknown {
 					outcome = "unknown"
 				}
-				o.builderFailure(ctx, state, report, builder, "spotSend", outcome)
+				o.builderFailure(ctx, state, report, builder, "spotSend", outcome, prepareErr)
 				break
 			}
 
-			result, _ := o.chain.Submit(ctx, prepared)
+			result, submitErr := o.chain.Submit(ctx, prepared)
 			report.markSubmitted(builder)
 			if builderReport := report.builder(builder); builderReport != nil {
 				// The latest recorded balance was captured before this request and
@@ -1007,8 +1031,8 @@ func (o *Orchestrator) sweepBuilderBalances(
 				builderReport.FinalTotal = ""
 				builderReport.FinalAvailable = ""
 			}
-			o.logBuilderSubmitResult(ctx, state, builder, "spotSend", amount.String(), result)
-			if result.Accepted {
+			o.logBuilderSubmitResult(ctx, state, builder, "spotSend", amount.String(), result, submitErr)
+			if submitErr == nil && result.Accepted {
 				if hadUnknown {
 					markSweepRetryAccepted(
 						report, builder, amount.String(), attempt, unconvergedClaims,
@@ -1020,20 +1044,20 @@ func (o *Orchestrator) sweepBuilderBalances(
 				}
 				break
 			}
-			if result.Rejected && !hadUnknown {
+			if submitErr == nil && result.Rejected && !hadUnknown {
 				o.builderFailure(ctx, state, report, builder, "spotSend", "rejected")
 				break
 			}
 
-			if !result.Rejected {
+			if submitErr != nil || !result.Rejected {
 				hadUnknown = true
 				retryAmount = amount
 			}
 			if attempt == sweepSubmitAttempts {
-				o.builderFailure(ctx, state, report, builder, "spotSend", "unknown")
+				o.builderFailure(ctx, state, report, builder, "spotSend", "unknown", submitErr)
 				break
 			}
-			o.logSweepRetry(ctx, state, builder, attempt, "submit_result")
+			o.logSweepRetry(ctx, state, builder, attempt, "submit_result", submitErr)
 		}
 	}
 	return nil
@@ -1045,14 +1069,20 @@ func (o *Orchestrator) logSweepRetry(
 	builder string,
 	attempt int,
 	reason string,
+	cause ...error,
 ) {
-	o.warn(ctx, "builder sweep remains uncertain; retrying current available balance",
+	attrs := []slog.Attr{
 		slog.String("event", "funding_builder_sweep_retry_planned"),
 		slog.String("run_id", state.RunID),
 		slog.String("builder", builder),
 		slog.String("reason", reason),
 		slog.Int("attempt", attempt),
-		slog.Int("max_attempts", sweepSubmitAttempts))
+		slog.Int("max_attempts", sweepSubmitAttempts),
+	}
+	if len(cause) > 0 && cause[0] != nil {
+		attrs = append(attrs, logging.Err(cause[0]))
+	}
+	o.warn(ctx, "builder sweep remains uncertain; retrying current available balance", attrs...)
 }
 
 func (o *Orchestrator) loadSweepBalance(
@@ -1107,7 +1137,8 @@ func (o *Orchestrator) loadSweepBalance(
 				slog.String("run_id", state.RunID),
 				slog.String("builder", builder),
 				slog.Int("attempt", attempt),
-				slog.Int("max_attempts", sweepBalanceQueryAttempts))
+				slog.Int("max_attempts", sweepBalanceQueryAttempts),
+				logging.Err(err))
 		}
 		if attempt < sweepBalanceQueryAttempts {
 			if err := o.sleeper.Sleep(ctx, sweepBalanceQueryInterval); err != nil {
@@ -1204,7 +1235,8 @@ func (o *Orchestrator) observeClaimBalances(
 					slog.String("run_id", state.RunID),
 					slog.String("builder", builder),
 					slog.Int("attempt", attempt),
-					slog.Int("max_attempts", claimBalanceObservationAttempts))
+					slog.Int("max_attempts", claimBalanceObservationAttempts),
+					logging.Err(err))
 				continue
 			}
 			balances[builder] = balance
@@ -1225,7 +1257,8 @@ func (o *Orchestrator) observeClaimBalances(
 						slog.String("event", "funding_builder_claimable_transition_query_failed"),
 						slog.String("run_id", state.RunID),
 						slog.String("builder", builder),
-						slog.Int("attempt", attempt))
+						slog.Int("attempt", attempt),
+						logging.Err(claimableErr))
 					continue
 				}
 				claimableTransitioned = claimableAfter.LessThan(target.claimableBefore)
@@ -1387,6 +1420,7 @@ func (o *Orchestrator) logBuilderSubmitResult(
 	state *RunState,
 	builder, action, amount string,
 	result exchange.SubmitResult,
+	submitErr error,
 ) {
 	attrs := []slog.Attr{
 		slog.String("event", "funding_builder_submit_result"),
@@ -1397,8 +1431,13 @@ func (o *Orchestrator) logBuilderSubmitResult(
 	if amount != "" {
 		attrs = append(attrs, slog.String("amount", amount))
 	}
+	if submitErr != nil {
+		attrs = append(attrs, logging.Err(submitErr))
+	}
 	if !result.Accepted && len(result.Response) != 0 {
-		attrs = append(attrs, slog.String("response", string(result.Response)))
+		attrs = append(attrs, slog.String(
+			"response", logging.SafeDiagnosticExcerpt(string(result.Response), 1024),
+		))
 	}
 	o.info(ctx, "builder submission returned", attrs...)
 }
@@ -1408,12 +1447,18 @@ func (o *Orchestrator) builderFailure(
 	state *RunState,
 	report *RunReport,
 	builder, action, outcome string,
+	cause ...error,
 ) {
-	o.warn(ctx, "builder action did not complete",
+	attrs := []slog.Attr{
 		slog.String("event", "funding_builder_action_failed"),
 		slog.String("run_id", state.RunID), slog.String("builder", builder),
 		slog.String("action_kind", action),
-		slog.String("outcome", outcome))
+		slog.String("outcome", outcome),
+	}
+	if len(cause) > 0 && cause[0] != nil {
+		attrs = append(attrs, logging.Err(cause[0]))
+	}
+	o.warn(ctx, "builder action did not complete", attrs...)
 	if builderReport := report.builder(builder); builderReport != nil {
 		switch action {
 		case "claimable", "claimRewards":
@@ -1623,9 +1668,15 @@ func (o *Orchestrator) loadCurrent(ctx context.Context) (*RunState, StateLoadMet
 		if current != nil && current.RunID != "" {
 			runID = current.RunID
 		}
-		o.warn(ctx, "funding state recovered from backup",
+		attrs := []slog.Attr{
 			slog.String("event", "state_snapshot_recovered_from_backup"),
-			slog.String("run_id", runID), slog.Bool("primary_invalid", metadata.PrimaryInvalid))
+			slog.String("run_id", runID),
+			slog.Bool("primary_invalid", metadata.PrimaryInvalid),
+		}
+		if metadata.PrimaryError != nil {
+			attrs = append(attrs, logging.Err(metadata.PrimaryError))
+		}
+		o.warn(ctx, "funding state recovered from backup", attrs...)
 		o.alertOnce(
 			ctx, runID, "state_corruption",
 			AlertSeverityWarning, "funding state recovered from backup",

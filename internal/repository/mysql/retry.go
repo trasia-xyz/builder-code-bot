@@ -20,6 +20,13 @@ type RetryObserver interface {
 	Recovered(operation string, attempts int, unavailableFor time.Duration)
 }
 
+// DiagnosticObserver receives dependency errors that are deliberately
+// resolved inside an operation and therefore never reach Retryer.Do's return
+// path. It is optional so lightweight retry observers remain compatible.
+type DiagnosticObserver interface {
+	Diagnostic(operation, stage string, err error)
+}
+
 type Retryer struct {
 	observer RetryObserver
 	now      func() time.Time
@@ -33,6 +40,15 @@ func NewRetryer(observer RetryObserver) Retryer {
 		now:      time.Now,
 		sleep:    sleepContext,
 		jitter:   jitterDelay,
+	}
+}
+
+func (r Retryer) Diagnostic(operation, stage string, err error) {
+	if err == nil {
+		return
+	}
+	if observer, ok := r.observer.(DiagnosticObserver); ok {
+		observer.Diagnostic(operation, stage, err)
 	}
 }
 

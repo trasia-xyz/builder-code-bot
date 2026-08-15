@@ -103,6 +103,35 @@ func TestSubmitClassifiesExplicitExchangeRejection(t *testing.T) {
 	}
 }
 
+func TestSubmitResultRejectionMessageRequiresStructuredStringEnvelope(t *testing.T) {
+	tests := []struct {
+		name   string
+		result SubmitResult
+		want   string
+		ok     bool
+	}{
+		{
+			name: "explicit rejection",
+			result: SubmitResult{Rejected: true, Response: json.RawMessage(
+				`{"status":"err","response":"Must have at least 1 of a reward token to claim"}`,
+			)},
+			want: "Must have at least 1 of a reward token to claim", ok: true,
+		},
+		{name: "not rejected", result: SubmitResult{Response: json.RawMessage(`{"status":"err","response":"reason"}`)}},
+		{name: "accepted envelope", result: SubmitResult{Rejected: true, Response: json.RawMessage(`{"status":"ok","response":"reason"}`)}},
+		{name: "non-string response", result: SubmitResult{Rejected: true, Response: json.RawMessage(`{"status":"err","response":{"message":"reason"}}`)}},
+		{name: "malformed", result: SubmitResult{Rejected: true, Response: json.RawMessage(`{"status":"err"`)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := tt.result.RejectionMessage()
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("RejectionMessage() = %q, %v; want %q, %v", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
 func TestSubmitTreatsBodyReturnedWithTransportErrorAsUncertain(t *testing.T) {
 	for _, status := range []string{"ok", "err"} {
 		t.Run(status, func(t *testing.T) {

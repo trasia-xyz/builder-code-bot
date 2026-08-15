@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -75,6 +76,31 @@ func TestStoreRejectsTamperedDailyConsolidation(t *testing.T) {
 	loaded, err := store.LoadDailyConsolidation(context.Background(), record.UTCDate)
 	if err == nil || loaded != nil || !strings.Contains(err.Error(), "checksum") {
 		t.Fatalf("LoadDailyConsolidation() = %#v, %v; want checksum error", loaded, err)
+	}
+}
+
+func TestStoreSaveDailyConsolidationReturnsTempCleanupError(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	cleanupErr := errors.New("remove daily consolidation temp denied")
+	var removedPath string
+	store.removeTempFile = func(path string) error {
+		removedPath = path
+		return cleanupErr
+	}
+	record := testDailyConsolidation()
+
+	err := store.SaveDailyConsolidation(context.Background(), record)
+	if !errors.Is(err, cleanupErr) ||
+		!strings.Contains(err.Error(), "remove daily consolidation temp file") {
+		t.Fatalf("SaveDailyConsolidation() error = %v, want temp cleanup error", err)
+	}
+	if base := filepath.Base(removedPath); !strings.HasPrefix(base, ".daily-consolidation.tmp-") {
+		t.Fatalf("removed temp path = %q", removedPath)
+	}
+	loaded, loadErr := NewStore(dir).LoadDailyConsolidation(context.Background(), record.UTCDate)
+	if loadErr != nil || loaded == nil || loaded.Status != record.Status {
+		t.Fatalf("saved daily consolidation = %#v, %v", loaded, loadErr)
 	}
 }
 

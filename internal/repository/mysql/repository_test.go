@@ -3,8 +3,10 @@ package mysql
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +74,27 @@ func TestReferralRepositoryListPendingUsesFixedCycleTypesAndPreservesRecords(t *
 	if records[1].ID != 8 || records[1].PeriodStartAt != 201 ||
 		records[1].Amount != "9876543210.123456789012345678" {
 		t.Errorf("second record = %#v", records[1])
+	}
+	assertSQLMockExpectations(t, mock)
+}
+
+func TestRepositoryListPendingPreservesScanAndCloseErrors(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	rows := sqlmock.NewRows([]string{"id", "period_start_at", "amount"}).
+		AddRow("invalid-id", 100, "1").
+		AddRow(2, 101, "2").
+		CloseError(driver.ErrBadConn)
+	mock.ExpectQuery(regexp.QuoteMeta(pointsRebateListPendingSQL)).WillReturnRows(rows)
+
+	_, err = NewPointsRebateRepository(db, immediateRetryer()).ListPending(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "scan pending funding record") ||
+		!strings.Contains(err.Error(), driver.ErrBadConn.Error()) || IsRetryable(err) {
+		t.Fatalf("ListPending() error = %v, want scan and close causes", err)
 	}
 	assertSQLMockExpectations(t, mock)
 }
@@ -270,9 +293,18 @@ func TestRepositoryCompleteResolvesAmbiguousCommitAsSuccess(t *testing.T) {
 		WithArgs(uint64(3), uint64(7)).
 		WillReturnRows(statusRows([]uint64{3, 7}, 1))
 
-	repository := NewRepository(db, immediateRetryer())
+	observer := &recordingRetryObserver{}
+	retryer := immediateRetryer()
+	retryer.observer = observer
+	repository := NewRepository(db, retryer)
 	if err := repository.Complete(context.Background(), []uint64{3, 7}); err != nil {
 		t.Fatalf("Complete() error = %v", err)
+	}
+	if len(observer.events) != 1 || observer.events[0].kind != "diagnostic" ||
+		observer.events[0].operation != "complete_funding_records" ||
+		observer.events[0].stage != "commit_response_failed" ||
+		!errors.Is(observer.events[0].err, io.EOF) {
+		t.Fatalf("commit diagnostics = %#v", observer.events)
 	}
 	assertSQLMockExpectations(t, mock)
 }

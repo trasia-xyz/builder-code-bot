@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -123,6 +126,89 @@ func TestEncryptRejectsPasswordMismatch(t *testing.T) {
 	if !strings.Contains(err.Error(), "do not match") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestCommandOutputErrorsAreReturned(t *testing.T) {
+	writeErr := errors.New("terminal output unavailable")
+	tests := []struct {
+		name   string
+		args   []string
+		prompt *fakePrompt
+		failAt int
+	}{
+		{
+			name: "encrypt signer", args: []string{"encrypt"}, failAt: 1,
+			prompt: encryptPrompt(),
+		},
+		{
+			name: "encrypt ciphertext", args: []string{"encrypt"}, failAt: 2,
+			prompt: encryptPrompt(),
+		},
+		{
+			name: "decrypt signer", args: []string{"decrypt"}, failAt: 1,
+			prompt: decryptPrompt(t),
+		},
+		{
+			name: "decrypt private key", args: []string{"decrypt", "-show-private-key"}, failAt: 2,
+			prompt: decryptPrompt(t),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writer := &failNthWriter{failAt: tt.failAt, err: writeErr}
+			err := run(context.Background(), tt.args, writer, io.Discard, tt.prompt)
+			if !errors.Is(err, writeErr) {
+				t.Fatalf("run() error = %v, want output error", err)
+			}
+		})
+	}
+}
+
+func TestUsageAndPromptOutputErrorsAreReturned(t *testing.T) {
+	writeErr := errors.New("terminal output unavailable")
+	if err := run(
+		context.Background(), []string{"help"},
+		&failNthWriter{failAt: 1, err: writeErr}, io.Discard, &fakePrompt{},
+	); !errors.Is(err, writeErr) {
+		t.Fatalf("help error = %v, want output error", err)
+	}
+	prompt := &terminalPrompt{
+		stderr: &failNthWriter{failAt: 1, err: writeErr},
+		reader: bufio.NewReader(strings.NewReader("value\n")),
+	}
+	if _, err := prompt.ReadLine("label: "); !errors.Is(err, writeErr) {
+		t.Fatalf("ReadLine() error = %v, want prompt output error", err)
+	}
+}
+
+func encryptPrompt() *fakePrompt {
+	return &fakePrompt{secrets: []secret.SecretString{
+		secret.NewString(testPrivateKeyHex),
+		secret.NewString("passphrase"),
+		secret.NewString("passphrase"),
+	}}
+}
+
+func decryptPrompt(t *testing.T) *fakePrompt {
+	t.Helper()
+	return &fakePrompt{
+		lines:   []string{encryptedTestPrivateKey(t).Reveal()},
+		secrets: []secret.SecretString{secret.NewString("passphrase")},
+	}
+}
+
+type failNthWriter struct {
+	writes int
+	failAt int
+	err    error
+}
+
+func (w *failNthWriter) Write(data []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failAt {
+		return 0, w.err
+	}
+	return len(data), nil
 }
 
 type fakePrompt struct {

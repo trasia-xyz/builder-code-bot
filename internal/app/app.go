@@ -104,7 +104,7 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		slog.String("event", "startup_mysql_pool_initialized"))
 	defer func() {
 		if err != nil {
-			_ = db.Close()
+			err = joinStartupCleanupError(err, "close MySQL pool", db.Close())
 		}
 	}()
 
@@ -117,7 +117,7 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		slog.String("data_dir", state.DataDir))
 	defer func() {
 		if err != nil {
-			_ = processLock.Close()
+			err = joinStartupCleanupError(err, "release process lock", processLock.Close())
 		}
 	}()
 
@@ -134,18 +134,7 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 
 	utcScheduler := scheduler.New(
 		func(task scheduler.Task, runErr error) {
-			if task == scheduler.TaskConsolidation {
-				logger.Warn(context.Background(), "scheduled daily consolidation failed",
-					slog.String("event", "scheduled_daily_consolidation_failed"),
-					slog.String("scheduled_task", string(task)),
-					slog.String("error", sanitizeRuntimeError(runErr)),
-				)
-				return
-			}
-			logger.Error(context.Background(), "scheduled funding run failed",
-				slog.String("event", "scheduled_funding_run_failed"),
-				slog.String("scheduled_task", string(task)),
-				slog.String("error", sanitizeRuntimeError(runErr)))
+			logScheduledFailure(logger, task, runErr)
 		},
 		func(task scheduler.Task, nextRunAt time.Time) {
 			logger.Info(context.Background(), "next scheduled task planned",
@@ -158,6 +147,28 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		orchestrator: orchestrator, scheduler: utcScheduler,
 		db: db, processLock: processLock,
 	}, nil
+}
+
+func logScheduledFailure(logger logging.Logger, task scheduler.Task, runErr error) {
+	if task == scheduler.TaskConsolidation {
+		logger.Warn(context.Background(), "scheduled daily consolidation failed",
+			slog.String("event", "scheduled_daily_consolidation_failed"),
+			slog.String("scheduled_task", string(task)),
+			logging.Err(runErr),
+		)
+		return
+	}
+	logger.Error(context.Background(), "scheduled funding run failed",
+		slog.String("event", "scheduled_funding_run_failed"),
+		slog.String("scheduled_task", string(task)),
+		logging.Err(runErr))
+}
+
+func joinStartupCleanupError(startupErr error, operation string, cleanupErr error) error {
+	if cleanupErr == nil {
+		return startupErr
+	}
+	return errors.Join(startupErr, fmt.Errorf("%s after startup failure: %w", operation, cleanupErr))
 }
 
 func configureLogger(cfg config.Config) logging.Logger {
@@ -252,7 +263,7 @@ func assembleOrchestrator(
 		builders[index] = builder.Address
 		builderNames[strings.ToLower(builder.Address)] = builder.Name
 	}
-	stateStore := state.NewStore(state.DataDir)
+	stateStore := state.NewStoreWithLogger(state.DataDir, logger)
 	return funding.NewOrchestrator(funding.OrchestratorConfig{
 		PointsRebateRepository: pointsRebateRepository,
 		ReferralRepository:     referralRepository,
@@ -333,10 +344,3 @@ func (n dispatcherFundingNotifier) Report(ctx context.Context, report funding.Ru
 type systemClock struct{}
 
 func (systemClock) Now() time.Time { return time.Now() }
-
-func sanitizeRuntimeError(err error) string {
-	if err == nil {
-		return ""
-	}
-	return "funding run failed"
-}

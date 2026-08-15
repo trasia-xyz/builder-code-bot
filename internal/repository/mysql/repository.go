@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -91,12 +92,18 @@ func newRepository(db *sql.DB, retryer Retryer, queries repositoryQueries) *Repo
 
 func (r *Repository) ListPending(ctx context.Context) ([]funding.Record, error) {
 	var records []funding.Record
-	err := r.retryer.Do(ctx, r.queries.listOperation, func(ctx context.Context) error {
+	err := r.retryer.Do(ctx, r.queries.listOperation, func(ctx context.Context) (attemptErr error) {
 		rows, err := r.db.QueryContext(ctx, r.queries.listPendingSQL)
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil {
+				attemptErr = appendDiagnosticError(
+					attemptErr, fmt.Errorf("close pending funding rows: %w", closeErr),
+				)
+			}
+		}()
 
 		attemptRecords := make([]funding.Record, 0)
 		for rows.Next() {
@@ -156,6 +163,7 @@ func (r *Repository) Complete(ctx context.Context, ids []uint64) error {
 		// COMMIT may have reached the server even when its response was lost.
 		// Preserve that ambiguity until a fresh pooled connection verifies every
 		// manifest ID; only confirmed status-zero rows may be replayed.
+		r.retryer.Diagnostic(r.queries.completeOperation, "commit_response_failed", err)
 		resolveCommit = true
 		commitErr = err
 		zeroIDs, statusErr := readStatuses(ctx, r.db, r.queries, manifestIDs)
@@ -184,7 +192,11 @@ func completeTransaction(
 	if err != nil {
 		return false, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			err = appendDiagnosticError(err, fmt.Errorf("rollback funding transaction: %w", rollbackErr))
+		}
+	}()
 
 	forEachIDBatch(ids, func(batch []uint64) bool {
 		result, execErr := tx.ExecContext(
@@ -255,20 +267,32 @@ func readStatuses(
 				status int
 			)
 			if err := rows.Scan(&id, &status); err != nil {
-				_ = rows.Close()
 				readErr = fmt.Errorf("scan funding record status: %w", err)
+				if closeErr := rows.Close(); closeErr != nil {
+					readErr = appendDiagnosticError(
+						readErr, fmt.Errorf("close funding status rows: %w", closeErr),
+					)
+				}
 				return false
 			}
 			if _, duplicate := statuses[id]; duplicate {
-				_ = rows.Close()
 				readErr = fmt.Errorf("funding record %d returned more than once", id)
+				if closeErr := rows.Close(); closeErr != nil {
+					readErr = appendDiagnosticError(
+						readErr, fmt.Errorf("close funding status rows: %w", closeErr),
+					)
+				}
 				return false
 			}
 			statuses[id] = status
 		}
 		if err := rows.Err(); err != nil {
-			_ = rows.Close()
 			readErr = err
+			if closeErr := rows.Close(); closeErr != nil {
+				readErr = appendDiagnosticError(
+					readErr, fmt.Errorf("close funding status rows: %w", closeErr),
+				)
+			}
 			return false
 		}
 		if err := rows.Close(); err != nil {
@@ -297,6 +321,27 @@ func readStatuses(
 		return nil, readErr
 	}
 	return zeroIDs, nil
+}
+
+type errorWithDiagnostic struct {
+	primary    error
+	diagnostic error
+}
+
+func (e *errorWithDiagnostic) Error() string {
+	return e.primary.Error() + "\n" + e.diagnostic.Error()
+}
+
+func (e *errorWithDiagnostic) Unwrap() error { return e.primary }
+
+func appendDiagnosticError(primary, diagnostic error) error {
+	if primary == nil {
+		return diagnostic
+	}
+	if diagnostic == nil {
+		return primary
+	}
+	return &errorWithDiagnostic{primary: primary, diagnostic: diagnostic}
 }
 
 func forEachIDBatch(ids []uint64, fn func([]uint64) bool) {

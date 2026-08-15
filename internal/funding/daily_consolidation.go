@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"builder-code-bot/internal/logging"
+
 	"github.com/shopspring/decimal"
 )
 
@@ -242,15 +244,17 @@ func (o *Orchestrator) attachDailyConsolidation(
 	}
 	record, err := o.dailyConsolidations.LoadDailyConsolidation(ctx, utcDate)
 	if err != nil {
+		o.warn(ctx, "daily consolidation load failed",
+			slog.String("event", "funding_daily_consolidation_load_failed"),
+			slog.String("utc_date", utcDate),
+			slog.Bool("context_canceled", ctx.Err() != nil),
+			logging.Err(err))
 		if ctx.Err() != nil {
 			return
 		}
 		summary.LoadFailed = true
 		report.DailyConsolidation = summary
 		o.markMissingDailyConsolidation(report, "UTC 00:00 归集记录读取失败")
-		o.warn(ctx, "daily consolidation load failed",
-			slog.String("event", "funding_daily_consolidation_load_failed"),
-			slog.String("utc_date", utcDate))
 		return
 	}
 	if record == nil {
@@ -308,7 +312,9 @@ func (o *Orchestrator) attachDailyConsolidation(
 			report.addWarning(builder.Name + ": " + fallbackSummary(builder.SweepSummary, "资金归集存在告警"))
 		}
 	}
-	summary.TotalClaimableUSDC = total.String()
+	if summary.ObservedBuilders > 0 {
+		summary.TotalClaimableUSDC = total.String()
+	}
 	report.DailyConsolidation = summary
 	report.setStage("rewards", aggregateBuilderStep(report.Builders, true), builderStepSummary(report.Builders, true))
 	report.setStage("sweep", aggregateBuilderStep(report.Builders, false), builderStepSummary(report.Builders, false))

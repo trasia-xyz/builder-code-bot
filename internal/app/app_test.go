@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"builder-code-bot/internal/funding"
 	"builder-code-bot/internal/hyperliquid/signing"
 	"builder-code-bot/internal/logging"
+	"builder-code-bot/internal/scheduler"
 	"builder-code-bot/internal/secret"
 	"builder-code-bot/internal/state"
 )
@@ -280,6 +282,44 @@ func TestAppCloseReleasesDatabaseAndProcessLock(t *testing.T) {
 		t.Fatalf("process lock was not released: %v", err)
 	}
 	_ = reacquired.Close()
+}
+
+func TestLogScheduledFailureKeepsSafeSpecificCause(t *testing.T) {
+	var output bytes.Buffer
+	logger := logging.New(logging.Config{
+		Format: logging.FormatJSON,
+		Level:  logging.LevelDebug,
+		Output: &output,
+	})
+
+	logScheduledFailure(logger, scheduler.TaskConsolidation,
+		errors.New("claimable query: password=do-not-log; upstream timeout"))
+	logScheduledFailure(logger, scheduler.TaskFunding,
+		errors.New("store payout: deadlock detected"))
+
+	logs := output.String()
+	if strings.Contains(logs, "do-not-log") {
+		t.Fatalf("scheduled failure log leaked credential: %s", logs)
+	}
+	for _, want := range []string{
+		"claimable query", "upstream timeout", "store payout", "deadlock detected",
+		`"event":"scheduled_daily_consolidation_failed"`,
+		`"event":"scheduled_funding_run_failed"`,
+	} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("scheduled failure log missing %q: %s", want, logs)
+		}
+	}
+}
+
+func TestJoinStartupCleanupErrorPreservesBothCauses(t *testing.T) {
+	startupErr := errors.New("startup failed")
+	cleanupErr := errors.New("close failed")
+	got := joinStartupCleanupError(startupErr, "close dependency", cleanupErr)
+	if !errors.Is(got, startupErr) || !errors.Is(got, cleanupErr) ||
+		!strings.Contains(got.Error(), "close dependency") {
+		t.Fatalf("joinStartupCleanupError() = %v", got)
+	}
 }
 
 type fakeSecretPrompt struct {

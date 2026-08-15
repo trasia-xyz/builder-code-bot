@@ -18,7 +18,7 @@ func main() {
 	if err := run(os.Args[1:]); err != nil {
 		logging.Error(context.Background(), "builder code bot stopped with an error",
 			logging.String("event", "service_failed"),
-			logging.String("error", err.Error()),
+			logging.Err(err),
 		)
 		os.Exit(1)
 	}
@@ -29,9 +29,14 @@ func run(args []string) (err error) {
 }
 
 func runWithOutput(args []string, stdout io.Writer) (err error) {
+	if stdout == nil {
+		stdout = io.Discard
+	}
 	opts, err := parseOptions(args)
 	if errors.Is(err, flag.ErrHelp) {
-		writeUsage(stdout)
+		if writeErr := writeUsage(stdout); writeErr != nil {
+			return fmt.Errorf("write usage: %w", writeErr)
+		}
 		return nil
 	}
 	if err != nil {
@@ -92,7 +97,22 @@ func newOptionFlagSet(opts *app.Options, output io.Writer) *flag.FlagSet {
 	return fs
 }
 
-func writeUsage(output io.Writer) {
+func writeUsage(output io.Writer) error {
+	tracked := &errorTrackingWriter{writer: output}
 	opts := app.Options{ConfigPath: "./config.toml"}
-	newOptionFlagSet(&opts, output).Usage()
+	newOptionFlagSet(&opts, tracked).Usage()
+	return tracked.err
+}
+
+type errorTrackingWriter struct {
+	writer io.Writer
+	err    error
+}
+
+func (w *errorTrackingWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	return n, err
 }

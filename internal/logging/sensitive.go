@@ -30,9 +30,14 @@ var defaultSensitiveKeys = []string{
 	"access_token",
 	"api_token",
 	"auth_token",
+	"authorization",
 	"bearer_token",
+	"cookie",
+	"credential",
+	"proxy_authorization",
 	"refresh_token",
 	"session_token",
+	"set_cookie",
 }
 
 // sensitiveMatcher decides whether an attribute key looks sensitive. Both the
@@ -106,10 +111,27 @@ func (m sensitiveMatcher) redact(attr slog.Attr) slog.Attr {
 }
 
 func (m sensitiveMatcher) redactKey(attr slog.Attr, key string) slog.Attr {
+	next, _ := m.redactKeyChanged(attr, key)
+	return next
+}
+
+func (m sensitiveMatcher) redactKeyChanged(attr slog.Attr, key string) (slog.Attr, bool) {
 	if m.matches(key) {
-		return slog.String(attr.Key, redactedValue)
+		return slog.String(attr.Key, redactedValue), true
 	}
-	return attr
+	if isErrorAttrKey(key) {
+		switch attr.Value.Kind() {
+		case slog.KindString:
+			original := attr.Value.String()
+			sanitized := SafeDiagnosticExcerpt(original, maxSafeErrorBytes)
+			return slog.String(attr.Key, sanitized), sanitized != original
+		case slog.KindAny:
+			if err, ok := attr.Value.Any().(error); ok {
+				return slog.String(attr.Key, SafeErrorText(err)), true
+			}
+		}
+	}
+	return attr, false
 }
 
 func (m sensitiveMatcher) sanitizeAttrs(attrs []slog.Attr) []slog.Attr {
@@ -159,8 +181,12 @@ func (m sensitiveMatcher) sanitizeAttr(groups []string, attr slog.Attr) (slog.At
 		}
 		return slog.Attr{Key: attr.Key, Value: slog.GroupValue(out...)}, true
 	}
-	if attr.Key != "" && m.matches(joinGroupKey(groups, attr.Key)) {
-		return slog.String(attr.Key, redactedValue), true
+	if attr.Key != "" {
+		key := joinGroupKey(groups, attr.Key)
+		next, changed := m.redactKeyChanged(attr, key)
+		if changed {
+			return next, true
+		}
 	}
 	return attr, false
 }

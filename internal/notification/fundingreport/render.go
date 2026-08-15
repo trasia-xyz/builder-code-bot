@@ -277,6 +277,10 @@ func buildDailyConsolidationView(report funding.RunReport) dailyConsolidationVie
 		Difference:      "—",
 		DifferenceColor: "#64748b",
 	}
+	if consolidation.Observed && consolidation.ObservedBuilders > 0 &&
+		consolidation.ObservedBuilders != consolidation.BuilderCount {
+		data.TotalLabel = "已观测 Claimable 小计"
+	}
 	switch {
 	case consolidation.LoadFailed:
 		data.Status, data.Color, data.Tint = "读取失败", "#b91c1c", "#fef2f2"

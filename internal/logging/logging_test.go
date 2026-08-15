@@ -711,9 +711,10 @@ func TestConsoleHandlerReturnsWriteError(t *testing.T) {
 
 func TestLoggerReportsHandleErrorToStderr(t *testing.T) {
 	resetLogHandleErrorReporter(t, 30*time.Second)
+	const leakedSecret = "stderr-writer-secret"
 	logger := New(Config{
 		Format: FormatConsole,
-		Output: errorWriter{err: errors.New("write failed")},
+		Output: errorWriter{err: errors.New("write failed: password=" + leakedSecret)},
 	})
 
 	stderr := captureStderr(t, func() {
@@ -724,20 +725,24 @@ func TestLoggerReportsHandleErrorToStderr(t *testing.T) {
 		"logging: failed to write log record",
 		"Level: INFO",
 		`Message: "write_failure"`,
-		"Error: write failed",
+		"Error: write failed: password=" + redactedValue,
 	} {
 		if !strings.Contains(stderr, want) {
 			t.Fatalf("expected %q in stderr diagnostic %q", want, stderr)
 		}
 	}
-	if strings.Contains(stderr, "password") || strings.Contains(stderr, "secret") {
+	if strings.Contains(stderr, leakedSecret) {
+		t.Fatalf("stderr diagnostic leaked the writer error secret: %q", stderr)
+	}
+	if strings.Contains(stderr, "Password:") {
 		t.Fatalf("stderr diagnostic must not include attrs: %q", stderr)
 	}
 }
 
 func TestHandleErrorReporterRateLimitsAndReportsSuppressed(t *testing.T) {
 	reporter := handleErrorReporter{interval: time.Minute}
-	err := errors.New("write failed")
+	const leakedSecret = "rate-limited-writer-secret"
+	err := errors.New("write failed: password=" + leakedSecret)
 	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
 
 	stderr := captureStderr(t, func() {
@@ -758,6 +763,12 @@ func TestHandleErrorReporterRateLimitsAndReportsSuppressed(t *testing.T) {
 	}
 	if strings.Contains(stderr, `Message: "second"`) || strings.Contains(stderr, `Message: "third"`) {
 		t.Fatalf("rate-limited diagnostics should not be emitted individually: %q", stderr)
+	}
+	if strings.Contains(stderr, leakedSecret) {
+		t.Fatalf("rate-limited stderr diagnostic leaked the writer error secret: %q", stderr)
+	}
+	if count := strings.Count(stderr, "password="+redactedValue); count != 2 {
+		t.Fatalf("expected both emitted writer errors to be redacted, got %d in %q", count, stderr)
 	}
 }
 
@@ -1056,6 +1067,20 @@ func (w errorWriter) Write(_ []byte) (int, error) {
 	return 0, w.err
 }
 
+type panicWithAttrsHandler struct {
+	panicValue string
+}
+
+func (panicWithAttrsHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (panicWithAttrsHandler) Handle(context.Context, slog.Record) error { return nil }
+
+func (h panicWithAttrsHandler) WithAttrs([]slog.Attr) slog.Handler {
+	panic(h.panicValue)
+}
+
+func (h panicWithAttrsHandler) WithGroup(string) slog.Handler { return h }
+
 type testStringer string
 
 func (s testStringer) String() string {
@@ -1119,13 +1144,39 @@ func TestSetDefaultIgnoresUninitializedLogger(t *testing.T) {
 func TestLogRecoversFromPanickingValue(t *testing.T) {
 	buf := new(bytes.Buffer)
 	logger := New(Config{Format: FormatConsole, Output: buf})
+	const leakedSecret = "stderr-panic-secret"
 
 	stderr := captureStderr(t, func() {
 		// A value whose String() panics must never take the process down.
-		logger.Info(context.Background(), "panic attr", Any("payload", panicStringer{}))
+		logger.Info(context.Background(), "panic attr", Any("payload", secretPanicStringer{secret: leakedSecret}))
 	})
-	if !strings.Contains(stderr, "recovered panic") {
-		t.Fatalf("expected a recovery message on stderr, got %q", stderr)
+	if stderr != "logging: recovered panic while emitting log\n" {
+		t.Fatalf("unexpected recovery message on stderr: %q", stderr)
+	}
+	if strings.Contains(stderr, leakedSecret) {
+		t.Fatalf("stderr recovery message leaked the panic value: %q", stderr)
+	}
+}
+
+func TestLoggerWithRecoveryDoesNotExposePanicValue(t *testing.T) {
+	const leakedSecret = "stderr-with-secret"
+	handler := panicWithAttrsHandler{panicValue: "password=" + leakedSecret}
+	logger := Logger{
+		logger:  slog.New(handler),
+		matcher: newSensitiveMatcher(defaultSensitiveKeys),
+	}
+
+	stderr := captureStderr(t, func() {
+		derived := logger.With(String("ordinary", "value"))
+		if derived.logger != logger.logger {
+			t.Fatal("With should return the base logger after handler panic")
+		}
+	})
+	if stderr != "logging: recovered panic while deriving logger\n" {
+		t.Fatalf("unexpected recovery message on stderr: %q", stderr)
+	}
+	if strings.Contains(stderr, leakedSecret) {
+		t.Fatalf("stderr recovery message leaked the panic value: %q", stderr)
 	}
 }
 
@@ -1299,3 +1350,9 @@ func resetSourceRootCache(t *testing.T, root string) {
 type panicStringer struct{}
 
 func (panicStringer) String() string { panic("boom from String") }
+
+type secretPanicStringer struct {
+	secret string
+}
+
+func (s secretPanicStringer) String() string { panic("password=" + s.secret) }

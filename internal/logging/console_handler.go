@@ -244,6 +244,9 @@ func (h *consoleHandler) appendAttr(
 		return
 	}
 	attr.Value = attr.Value.Resolve()
+	if next, changed := h.matcher.redactKeyChanged(attr, key); changed {
+		attr = next
+	}
 	if attr.Value.Kind() == slog.KindGroup {
 		nextPrefix := joinKey(prefix, attr.Key)
 		for _, child := range attr.Value.Group() {

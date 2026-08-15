@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -42,11 +43,20 @@ func (p *terminalPrompt) ReadSecret(label string) (secret.SecretString, error) {
 		return secret.SecretString{}, fmt.Errorf("write secret prompt: %w", err)
 	}
 	raw, err := term.ReadPassword(uintptr(p.input.Fd()))
-	_, _ = fmt.Fprintln(p.output)
-	if err != nil {
-		return secret.SecretString{}, fmt.Errorf("read secret from terminal: %w", err)
-	}
 	defer zeroBytes(raw)
+	_, newlineErr := fmt.Fprintln(p.output)
+	if err != nil {
+		readErr := fmt.Errorf("read secret from terminal: %w", err)
+		if newlineErr != nil {
+			return secret.SecretString{}, errors.Join(
+				readErr, fmt.Errorf("write secret prompt newline: %w", newlineErr),
+			)
+		}
+		return secret.SecretString{}, readErr
+	}
+	if newlineErr != nil {
+		return secret.SecretString{}, fmt.Errorf("write secret prompt newline: %w", newlineErr)
+	}
 	return secret.NewString(string(raw)), nil
 }
 

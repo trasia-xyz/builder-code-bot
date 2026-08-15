@@ -104,8 +104,8 @@ func (l Logger) With(attrs ...slog.Attr) (out Logger) {
 	}
 	out = base
 	defer func() {
-		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "logging: recovered panic while deriving logger: %v\n", r)
+		if recover() != nil {
+			fmt.Fprintln(os.Stderr, "logging: recovered panic while deriving logger")
 			out = base
 		}
 	}()
@@ -142,8 +142,8 @@ func (l Logger) log(ctx context.Context, level slog.Level, msg string, attrs ...
 	// values can run third-party String()/MarshalJSON() code that may panic;
 	// contain it here and report to stderr instead of crashing.
 	defer func() {
-		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "logging: recovered panic while emitting log: %v\n", r)
+		if recover() != nil {
+			fmt.Fprintln(os.Stderr, "logging: recovered panic while emitting log")
 		}
 	}()
 
@@ -189,17 +189,17 @@ func (r *handleErrorReporter) report(now time.Time, level slog.Level, msg string
 		return
 	}
 	if suppressed > 0 {
-		fmt.Fprintf(os.Stderr, "logging: failed to write log record%sLevel: %s%sMessage: %q%sError: %v%sSuppressed: %d\n",
+		fmt.Fprintf(os.Stderr, "logging: failed to write log record%sLevel: %s%sMessage: %q%sError: %s%sSuppressed: %d\n",
 			consoleFieldSeparator, levelName(level),
 			consoleFieldSeparator, msg,
-			consoleFieldSeparator, err,
+			consoleFieldSeparator, SafeErrorText(err),
 			consoleFieldSeparator, suppressed)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "logging: failed to write log record%sLevel: %s%sMessage: %q%sError: %v\n",
+	fmt.Fprintf(os.Stderr, "logging: failed to write log record%sLevel: %s%sMessage: %q%sError: %s\n",
 		consoleFieldSeparator, levelName(level),
 		consoleFieldSeparator, msg,
-		consoleFieldSeparator, err)
+		consoleFieldSeparator, SafeErrorText(err))
 }
 
 func (r *handleErrorReporter) shouldReport(now time.Time) (bool, int) {

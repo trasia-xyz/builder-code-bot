@@ -23,15 +23,23 @@ func AcquireProcessLock(dataDir string) (*ProcessLock, error) {
 		return nil, fmt.Errorf("open process lock: %w", err)
 	}
 	if err := file.Chmod(0o600); err != nil {
-		file.Close()
-		return nil, fmt.Errorf("set process lock permissions: %w", err)
+		permissionErr := fmt.Errorf("set process lock permissions: %w", err)
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, errors.Join(permissionErr, fmt.Errorf("close process lock: %w", closeErr))
+		}
+		return nil, permissionErr
 	}
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		file.Close()
+		var lockErr error
 		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
-			return nil, fmt.Errorf("process lock is already locked")
+			lockErr = fmt.Errorf("process lock is already locked")
+		} else {
+			lockErr = fmt.Errorf("acquire process lock: %w", err)
 		}
-		return nil, fmt.Errorf("acquire process lock: %w", err)
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, errors.Join(lockErr, fmt.Errorf("close process lock: %w", closeErr))
+		}
+		return nil, lockErr
 	}
 	return &ProcessLock{file: file}, nil
 }

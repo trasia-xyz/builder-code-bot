@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"builder-code-bot/internal/logging"
 )
 
 const (
@@ -65,7 +67,8 @@ func (o *Orchestrator) observeUserRateLimits(ctx context.Context, report *RunRep
 			o.warn(ctx, "Hyperliquid user rate limit query failed",
 				slog.String("event", "funding_user_rate_limit_query_failed"),
 				slog.String("account_kind", account.kind),
-				slog.String("address", account.address))
+				slog.String("address", account.address),
+				logging.Err(err))
 			continue
 		}
 
@@ -148,7 +151,8 @@ func (o *Orchestrator) observeUserRateLimit(
 				slog.String("account_kind", account.kind),
 				slog.String("address", account.address),
 				slog.Int("attempt", attempt),
-				slog.Int("max_attempts", userRateLimitVisibilityAttempts))
+				slog.Int("max_attempts", userRateLimitVisibilityAttempts),
+				logging.Err(err))
 			return observation, nil
 		}
 
@@ -161,7 +165,8 @@ func (o *Orchestrator) observeUserRateLimit(
 				slog.String("account_kind", account.kind),
 				slog.String("address", account.address),
 				slog.Int("attempt", attempt),
-				slog.Int("max_attempts", userRateLimitVisibilityAttempts))
+				slog.Int("max_attempts", userRateLimitVisibilityAttempts),
+				logging.Err(err))
 			return observation, nil
 		}
 		remaining := limit.RemainingRequests()

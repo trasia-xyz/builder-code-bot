@@ -26,6 +26,7 @@ type DailyConsolidationStore interface {
 type StateLoadMetadata struct {
 	RecoveredFromBackup bool
 	PrimaryInvalid      bool
+	PrimaryError        error
 }
 
 type Repository interface {

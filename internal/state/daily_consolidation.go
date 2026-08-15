@@ -57,7 +57,7 @@ func (s *Store) LoadDailyConsolidation(
 func (s *Store) SaveDailyConsolidation(
 	ctx context.Context,
 	consolidation funding.DailyConsolidation,
-) error {
+) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -76,7 +76,11 @@ func (s *Store) SaveDailyConsolidation(
 	if err != nil {
 		return fmt.Errorf("write daily consolidation temp file: %w", err)
 	}
-	defer os.Remove(tempPath)
+	defer func() {
+		if removeErr := s.removeTempFile(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove daily consolidation temp file: %w", removeErr))
+		}
+	}()
 	if err := os.Rename(tempPath, path); err != nil {
 		return fmt.Errorf("install daily consolidation: %w", err)
 	}
@@ -127,11 +131,13 @@ func writeSyncedDailyConsolidationTemp(
 	}
 	path = file.Name()
 	defer func() {
-		if closeErr := file.Close(); err == nil && closeErr != nil {
-			err = closeErr
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close daily consolidation temp file: %w", closeErr))
 		}
 		if err != nil {
-			os.Remove(path)
+			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				err = errors.Join(err, fmt.Errorf("remove daily consolidation temp file: %w", removeErr))
+			}
 		}
 	}()
 	if err = file.Chmod(0o600); err != nil {

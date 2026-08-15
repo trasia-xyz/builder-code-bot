@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,18 @@ func TestRunHelpPrintsAvailableFlagsAndSucceeds(t *testing.T) {
 		}
 	}
 }
+
+func TestRunHelpReturnsOutputError(t *testing.T) {
+	writeErr := errors.New("terminal output unavailable")
+	err := runWithOutput([]string{"--help"}, errorWriter{err: writeErr})
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("runWithOutput(--help) error = %v, want output error", err)
+	}
+}
+
+type errorWriter struct{ err error }
+
+func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }
 
 func TestParseOptionsDefaults(t *testing.T) {
 	opts, err := parseOptions(nil)

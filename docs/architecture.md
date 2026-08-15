@@ -16,20 +16,24 @@
 3. 将零点 claimable 以 `claimables_captured` 原子写入当日文件；落盘成功后才继续。
 4. 连续两次查询符合条件的 builder 的 claim 前 `Total/Available` 稳定基线；基线无法取得时不提交
    claim。
-5. 并行提交一次 `claimRewards`。结果不确定时不换 nonce 重发，只观察动作关联状态。
-6. Claimable 已捕获时，将其按 token 精度截断为最低增量，要求 claim 后 `Total` 不低于基线加
-   该增量；同一完整余额连续两次满足才视为已刷新。明确接受的响应作为动作证据；不确定提交还
-   必须先在提交后看到完整的 claim 前余额并看到 `ClaimableUSDC` 明确下降。Claimable 缺失时，
-   Total-only 不能解除不确定状态。
+5. 对已观测且至少达到 1 USDC 的 builder，以及 Claimable 查询耗尽的 builder，并行提交一次
+   `claimRewards`。查询耗尽时，只有结构化拒绝中的 `response` 与
+   `Must have at least 1 of a reward token to claim` 逐字相等才作为低于门槛的正常 skip；其它拒绝
+   或 transport error 仍按 warning/不确定结果处理。结果不确定时不换 nonce 重发，只观察动作关联状态。
+6. 将已捕获的 Claimable 按 token 精度截断为最低增量，要求 claim 后 `Total` 不低于基线加
+   该增量；Claimable 缺失时使用至少 1 USDC 的相对增量边界。同一完整余额连续两次满足才视为
+   已刷新。明确接受的响应作为动作证据；不确定提交还必须先在提交后看到完整的 claim 前余额并看到
+   `ClaimableUSDC` 明确下降。Claimable 缺失时，Total-only 不能解除不确定状态。
 7. 每笔 sweep 前重新连续读取稳定的 builder `Total/Available`，按最新 available 提交。明确接受
    后直接完成该 builder，不立即查询余额。结果不确定时等待后重读稳定的当前 Available，并用新
    nonce 最多提交三次；该 builder 最终失败也不阻断其他 builder。
 8. 将 claim/sweep 结果写回当日文件，状态更新为 `completed`。
 
 零点 claimable 是与两类实际 payout 合计对账的唯一数值基准；claim 接受状态是独立的执行结果。
-某个 builder 的 claimable 查询全部失败时标记为数据缺失，在取得余额基线后仍会尝试一次 claim，
-但当日不能得出完整数值对账结论。Claim 在有限观察后仍不确定时保留 warning，不会改写已落盘的零点 claimable，
-也不阻止其他已捕获数据参与合计。
+某个 builder 的 claimable 查询全部失败时标记为数据缺失；取得稳定余额基线后仍尝试一次 claim，
+以避免漏领实际超过门槛的 Reward。交易所精确确认未达到领取门槛时，本次 claim 记为 skipped；
+但零点数值仍保持未观测，不能伪造为 0，当日也不能得出完整数值对账结论。Claim 在有限观察后仍
+不确定时保留 warning，不会改写已落盘的零点 claimable，也不阻止其他已捕获数据参与合计。
 
 ### UTC 01:00：数据库 Payout
 
@@ -55,9 +59,10 @@
 ## 2. 内部归集规则
 
 Claimable 只取 referral info 中 canonical USDC 对应项的 `unclaimedRewards`，不使用外层多币种
-折算汇总。成功读取且金额严格超过 1 USDC 才正常 claim；等于或低于阈值则跳过。若 claimable
-查询最终失败，因无法判断阈值，为避免漏领会执行一次受相同上限保护的 claim，同时将对账数据
-标记为不完整。
+折算汇总。成功读取时，金额至少达到 1 USDC 才 claim，低于阈值则跳过。查询最终失败时
+保留 warning、将对账数据标记为不完整，并在稳定余额基线的保护下仅尝试一次 claim。仅当交易所
+返回上述逐字匹配的结构化业务拒绝时，才把 fallback claim 消化为低于门槛的 skip；不能使用
+substring、忽略大小写或去空格匹配，也不能在 Claimable 已成功观测时套用该特例。
 
 同一轮 builder claim 并行且每个 builder 只提交一次。明确接受证明 claim 动作成功，程序再等待
 相对 `Total` 下界连续成立；后续新 Reward 立即回补不会把已接受动作误报为失败。不确定结果还要求
@@ -197,7 +202,8 @@ data/
 
 调度器串行安排 UTC 00:00 consolidation 与 UTC 01:00 funding。零点顶层失败只记录错误，继续
 等待一点；一点普通失败有限次重试。Fatal payout 或 records 校验错误立即退出。Context 取消
-立即停止。
+立即停止。所有被捕获后继续、重试或降级处理的外部错误都记录具体安全诊断；日志保留 HTTP 状态、
+服务端原因和错误链上下文，同时对密码、私钥、token、URL userinfo 等高风险值脱敏。
 
 最终 funding report 只在 UTC 01:00 funding 结束时发送，内容包括：各 builder 的零点
 claimable 与 claim/sweep 结果、两个 target 各自的 raw/payout total 和状态、完整 claimable 合计与

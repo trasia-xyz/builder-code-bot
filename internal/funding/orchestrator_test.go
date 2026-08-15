@@ -412,9 +412,15 @@ func TestDailyClaimableQueryRetriesOnlyFailedBuilders(t *testing.T) {
 	}
 }
 
-func TestExhaustedClaimableQueryMarksDailyReconciliationIncomplete(t *testing.T) {
+func TestExhaustedClaimableQueryConsumesExactBelowThresholdRejection(t *testing.T) {
 	fx := newFixture(t)
 	fx.chain.claimableErrors["0xbuilder"] = errors.New("info unavailable")
+	fx.chain.claimResult = exchange.SubmitResult{
+		Rejected: true,
+		Response: json.RawMessage(
+			`{"status":"err","response":"Must have at least 1 of a reward token to claim"}`,
+		),
+	}
 	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -422,9 +428,25 @@ func TestExhaustedClaimableQueryMarksDailyReconciliationIncomplete(t *testing.T)
 	if len(record.Builders) != 1 || record.Builders[0].ClaimableObserved ||
 		record.Builders[0].ClaimableQueryAttempts != claimableQueryAttempts ||
 		record.Builders[0].ClaimAttempts != 1 ||
-		record.Builders[0].ClaimStatus != ReportStepSuccess ||
-		!containsString(fx.chain.events, "submit:claimRewards:0xbuilder") {
+		record.Builders[0].ClaimStatus != ReportStepSkipped ||
+		record.Builders[0].ClaimSummary != "未达到 1 USDC 领取门槛（由交易所确认）" ||
+		countString(fx.chain.events, "submit:claimRewards:0xbuilder") != 1 {
 		t.Fatalf("incomplete daily record = %#v, events = %v", record, fx.chain.events)
+	}
+	assertLogFields(t, fx.logger, "funding_builder_claimable_query_failed", map[string]any{
+		"builder": "0xbuilder", "error": "info unavailable",
+	})
+	assertLogFields(t, fx.logger, "funding_builder_claim_eligibility_checked", map[string]any{
+		"builder": "0xbuilder", "claimable_observed": false, "eligible": true,
+		"claimable_usdc": nil,
+	})
+	assertLogFields(t, fx.logger, "funding_builder_claim_below_threshold_confirmed", map[string]any{
+		"builder": "0xbuilder", "exchange_message": claimBelowThresholdRejection,
+	})
+	if containsLogFields(fx.logger, "funding_builder_action_failed", map[string]any{
+		"builder": "0xbuilder", "action_kind": "claimRewards",
+	}) {
+		t.Fatalf("exact below-threshold rejection was reported as a claim failure: %#v", record)
 	}
 
 	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("1.5")
@@ -434,9 +456,208 @@ func TestExhaustedClaimableQueryMarksDailyReconciliationIncomplete(t *testing.T)
 	}
 	report := onlyReport(t, fx.notifier)
 	if report.DailyConsolidation.ObservedBuilders != 0 ||
+		report.DailyConsolidation.TotalClaimableUSDC != "" ||
 		report.DailyConsolidation.CoversPayout || report.DailyConsolidation.BelowPayout ||
 		!containsString(report.Warnings, "UTC 00:00 Claimable 仅成功查询 0/1 个 Builder，当日对账数据不完整") {
 		t.Fatalf("incomplete reconciliation report = %#v", report)
+	}
+}
+
+func TestExhaustedClaimableQueryStillClaimsAndSweepsAcceptedReward(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableErrors["0xbuilder"] = errors.New("info unavailable")
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.ClaimableObserved || builder.ClaimAttempts != 1 ||
+		builder.ClaimStatus != ReportStepSuccess ||
+		builder.ClaimSummary != "Reward 已领取；零点 Claimable 数据缺失" ||
+		builder.SweepStatus != ReportStepSuccess || builder.SweepAmount != "1.5" ||
+		countString(fx.chain.events, "submit:claimRewards:0xbuilder") != 1 ||
+		countString(fx.chain.events, "submit:spotSend:0xbuilder") != 1 {
+		t.Fatalf("fallback claim builder = %#v, events = %v", builder, fx.chain.events)
+	}
+}
+
+func TestExhaustedClaimableQueryAcceptsExactlyOneRewardFromExchange(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableRewards["0xbuilder"] = decimal.NewFromInt(1)
+	fx.chain.claimableErrors["0xbuilder"] = errors.New("info unavailable")
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.ClaimStatus != ReportStepSuccess || builder.ClaimUncertain ||
+		builder.SweepStatus != ReportStepSuccess || builder.SweepAmount != "1" ||
+		countString(fx.chain.events, "submit:claimRewards:0xbuilder") != 1 {
+		t.Fatalf("one-USDC fallback claim = %#v, events = %v", builder, fx.chain.events)
+	}
+}
+
+func TestClaimBelowThresholdRequiresExactStructuredMessage(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{name: "exact", message: claimBelowThresholdRejection, want: true},
+		{name: "trailing space", message: claimBelowThresholdRejection + " "},
+		{name: "prefix", message: "exchange: " + claimBelowThresholdRejection},
+		{name: "case", message: strings.ToLower(claimBelowThresholdRejection)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{"response": tt.message, "status": "err"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := claimBelowThreshold(exchange.SubmitResult{Rejected: true, Response: body})
+			if got != tt.want {
+				t.Fatalf("claimBelowThreshold() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuilderSubmitResponseLogIsBoundedAndRedacted(t *testing.T) {
+	fx := newFixture(t)
+	response := `{"status":"err","accessToken":"raw-secret","response":"` +
+		strings.Repeat("x", 2048) + `"}`
+	fx.orchestrator.logBuilderSubmitResult(
+		context.Background(), &RunState{RunID: "run"}, "0xbuilder", "claimRewards", "",
+		exchange.SubmitResult{Rejected: true, Response: json.RawMessage(response)}, nil,
+	)
+	for _, entry := range fx.logger.entries {
+		if entry.attrs["event"] != "funding_builder_submit_result" {
+			continue
+		}
+		logged, _ := entry.attrs["response"].(string)
+		if strings.Contains(logged, "raw-secret") || len(logged) > 1024 ||
+			!strings.Contains(logged, "[MASKED]") || !strings.Contains(logged, "...[truncated]") {
+			t.Fatalf("logged response = %q (%d bytes)", logged, len(logged))
+		}
+		return
+	}
+	t.Fatal("funding_builder_submit_result was not logged")
+}
+
+func TestObservedClaimableDoesNotConsumeBelowThresholdRejection(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimResult = exchange.SubmitResult{
+		Rejected: true,
+		Response: json.RawMessage(
+			`{"status":"err","response":"Must have at least 1 of a reward token to claim"}`,
+		),
+	}
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if !builder.ClaimableObserved || builder.ClaimStatus != ReportStepWarning ||
+		builder.ClaimAttempts != 1 || containsLogEvent(fx.logger, "funding_builder_claim_below_threshold_confirmed") {
+		t.Fatalf("observed rejected claim = %#v", builder)
+	}
+	assertLogFields(t, fx.logger, "funding_builder_action_failed", map[string]any{
+		"builder": "0xbuilder", "action_kind": "claimRewards", "outcome": "rejected",
+	})
+}
+
+func TestClaimSubmitErrorCannotConsumeBelowThresholdResponse(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableErrors["0xbuilder"] = errors.New("info unavailable")
+	fx.chain.claimResult = exchange.SubmitResult{
+		Rejected: true,
+		Response: json.RawMessage(
+			`{"status":"err","response":"Must have at least 1 of a reward token to claim"}`,
+		),
+	}
+	fx.chain.claimSubmitErr = errors.New("exchange transport interrupted")
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.ClaimStatus != ReportStepWarning || !builder.ClaimUncertain ||
+		builder.ClaimAttempts != 1 || containsLogEvent(fx.logger, "funding_builder_claim_below_threshold_confirmed") {
+		t.Fatalf("transport-error claim = %#v", builder)
+	}
+	assertLogFields(t, fx.logger, "funding_builder_submit_result", map[string]any{
+		"builder": "0xbuilder", "error": "exchange transport interrupted",
+	})
+}
+
+func TestExhaustedClaimableQueryDoesNotConsumeNonExactRejection(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableErrors["0xbuilder"] = errors.New("info unavailable")
+	fx.chain.claimResult = exchange.SubmitResult{
+		Rejected: true,
+		Response: json.RawMessage(
+			`{"status":"err","response":"Must have at least 1 of a reward token to claim "}`,
+		),
+	}
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if builder.ClaimStatus != ReportStepWarning || builder.ClaimAttempts != 1 ||
+		containsLogEvent(fx.logger, "funding_builder_claim_below_threshold_confirmed") ||
+		!containsLogFields(fx.logger, "funding_builder_action_failed", map[string]any{
+			"builder": "0xbuilder", "action_kind": "claimRewards", "outcome": "rejected",
+		}) {
+		t.Fatalf("non-exact fallback rejection = %#v", builder)
+	}
+}
+
+func TestExhaustedClaimableQueryAmbiguousClaimIsNeverResubmitted(t *testing.T) {
+	for _, applied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("applied=%t", applied), func(t *testing.T) {
+			fx := newFixture(t)
+			fx.chain.claimableErrors["0xbuilder"] = errors.New("info unavailable")
+			fx.chain.claimResult = exchange.SubmitResult{}
+			fx.chain.applyUnknownClaim = applied
+
+			if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			builder := fx.store.consolidations["2026-07-12"].Builders[0]
+			if builder.ClaimStatus != ReportStepWarning || !builder.ClaimUncertain ||
+				builder.ClaimAttempts != 1 ||
+				countString(fx.chain.events, "submit:claimRewards:0xbuilder") != 1 {
+				t.Fatalf("ambiguous fallback claim = %#v, events = %v", builder, fx.chain.events)
+			}
+			if applied {
+				if builder.SweepAmount != "1.5" || builder.SweepStatus != ReportStepWarning {
+					t.Fatalf("applied ambiguous fallback was not swept best-effort: %#v", builder)
+				}
+			} else if builder.SweepAmount != "" || builder.SweepStatus != ReportStepWarning {
+				t.Fatalf("unapplied ambiguous fallback = %#v", builder)
+			}
+		})
+	}
+}
+
+func TestClaimableQueryRetryReturningZeroSkipsClaim(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableRewards["0xbuilder"] = decimal.Zero
+	fx.chain.claimableErrorSequence["0xbuilder"] = []error{
+		errors.New("temporary info failure"), nil,
+	}
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if !builder.ClaimableObserved || builder.ClaimableUSDC != "0" ||
+		builder.ClaimableQueryAttempts != 2 || builder.ClaimAttempts != 0 ||
+		builder.ClaimStatus != ReportStepSkipped ||
+		containsString(fx.chain.events, "submit:claimRewards:0xbuilder") {
+		t.Fatalf("zero claimable builder = %#v, events = %v", builder, fx.chain.events)
 	}
 }
 
@@ -842,8 +1063,8 @@ func TestUncertainClaimIsObservedWithoutResubmission(t *testing.T) {
 	}
 }
 
-func TestClaimAtOrBelowThresholdIsRecordedAsZero(t *testing.T) {
-	for _, amount := range []string{"0", "1"} {
+func TestClaimBelowThresholdIsRecordedWithoutSubmission(t *testing.T) {
+	for _, amount := range []string{"0", "0.999999"} {
 		t.Run(amount, func(t *testing.T) {
 			fx := newFixture(t)
 			fx.chain.claimableRewards["0xbuilder"] = decimal.RequireFromString(amount)
@@ -860,6 +1081,23 @@ func TestClaimAtOrBelowThresholdIsRecordedAsZero(t *testing.T) {
 				t.Fatalf("daily builder = %#v", builder)
 			}
 		})
+	}
+}
+
+func TestClaimAtThresholdIsSubmitted(t *testing.T) {
+	fx := newFixture(t)
+	fx.chain.claimableRewards["0xbuilder"] = decimal.NewFromInt(1)
+
+	if err := fx.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	builder := fx.store.consolidations["2026-07-12"].Builders[0]
+	if !builder.ClaimableObserved || builder.ClaimableUSDC != "1" ||
+		builder.ClaimStatus != ReportStepSuccess || builder.ClaimAttempts != 1 ||
+		builder.SweepAmount != "1" ||
+		countString(fx.chain.events, "submit:claimRewards:0xbuilder") != 1 {
+		t.Fatalf("threshold claim builder = %#v, events = %v", builder, fx.chain.events)
 	}
 }
 
@@ -1681,11 +1919,15 @@ type fakeChain struct {
 	rateLimitErrors        map[string]error
 	rateLimitCalls         map[string]int
 	trackRateLimitUsage    bool
+	claimPrepareErr        error
 	claimResult            exchange.SubmitResult
+	claimSubmitErr         error
 	claimResults           map[string][]exchange.SubmitResult
 	claimStarted           chan string
 	claimRelease           chan struct{}
+	sweepPrepareErr        error
 	sweepResult            exchange.SubmitResult
+	sweepSubmitErr         error
 	sweepResults           map[string][]exchange.SubmitResult
 	applyUnknownSweep      bool
 	applyUnknownClaim      bool
@@ -1785,6 +2027,9 @@ func (c *fakeChain) UserRateLimit(
 }
 
 func (c *fakeChain) PrepareClaim(address string, nonce uint64) (exchange.PreparedAction, error) {
+	if c.claimPrepareErr != nil {
+		return exchange.PreparedAction{}, c.claimPrepareErr
+	}
 	return preparedAction(tinyTB{}, "claimRewards", address, "", "", "", nonce), nil
 }
 
@@ -1794,6 +2039,9 @@ func (c *fakeChain) PrepareSpotSend(
 	amount decimal.Decimal,
 	nonce uint64,
 ) (exchange.PreparedAction, error) {
+	if c.sweepPrepareErr != nil {
+		return exchange.PreparedAction{}, c.sweepPrepareErr
+	}
 	return preparedAction(
 		tinyTB{}, "spotSend", address, destination, token.WireToken, amount.String(), nonce,
 	), nil
@@ -1832,7 +2080,8 @@ func (c *fakeChain) Submit(
 			result = sequence[0]
 			c.claimResults[action.Signer] = sequence[1:]
 		}
-		if result.Accepted || (c.applyUnknownClaim && !result.Accepted && !result.Rejected) {
+		if (c.claimSubmitErr == nil && result.Accepted) ||
+			(c.applyUnknownClaim && (c.claimSubmitErr != nil || (!result.Accepted && !result.Rejected))) {
 			reward := c.claimableRewards[action.Signer]
 			c.balances[action.Signer] = c.balances[action.Signer].Add(reward)
 			c.claimableRewards[action.Signer] = decimal.Zero
@@ -1841,7 +2090,7 @@ func (c *fakeChain) Submit(
 			}
 			c.incrementRateLimitUsageLocked(action.Signer)
 		}
-		return result, nil
+		return result, c.claimSubmitErr
 	}
 	amount := decimal.RequireFromString(action.Amount)
 	if action.Signer == "0xsettlement" {
@@ -1866,12 +2115,13 @@ func (c *fakeChain) Submit(
 		result = sequence[0]
 		c.sweepResults[action.Signer] = sequence[1:]
 	}
-	if result.Accepted || (c.applyUnknownSweep && !result.Accepted && !result.Rejected) {
+	if (c.sweepSubmitErr == nil && result.Accepted) ||
+		(c.applyUnknownSweep && (c.sweepSubmitErr != nil || (!result.Accepted && !result.Rejected))) {
 		c.balances[action.Signer] = c.balances[action.Signer].Sub(amount)
 		c.balances[action.Destination] = c.balances[action.Destination].Add(amount)
 		c.incrementRateLimitUsageLocked(action.Signer)
 	}
-	return result, nil
+	return result, c.sweepSubmitErr
 }
 
 func (c *fakeChain) incrementRateLimitUsageLocked(address string) {
@@ -1956,6 +2206,34 @@ func assertLogFields(t *testing.T, logger *fakeLogger, event string, want map[st
 		return
 	}
 	t.Fatalf("event %s was not logged", event)
+}
+
+func containsLogEvent(logger *fakeLogger, event string) bool {
+	for _, entry := range logger.entries {
+		if entry.attrs["event"] == event {
+			return true
+		}
+	}
+	return false
+}
+
+func containsLogFields(logger *fakeLogger, event string, fields map[string]any) bool {
+	for _, entry := range logger.entries {
+		if entry.attrs["event"] != event {
+			continue
+		}
+		matches := true
+		for key, want := range fields {
+			if entry.attrs[key] != want {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
 }
 
 type fixedClock struct{ now time.Time }

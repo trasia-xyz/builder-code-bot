@@ -154,11 +154,16 @@ current and backup payout states, and history archives. At UTC 00:00
 (Asia/Shanghai 08:00), the scheduler captures all builder claimable values in
 parallel, retrying only failed `/info` reads up to five times at 200 ms
 intervals. It writes a `claimables_captured` record before any claim, then
-captures eligible builders' stable balance baselines and submits claims in
-parallel. Ambiguous claims are observed without a second nonce; ambiguous
-Builder-to-settlement sweeps instead reload current Available and retry with a
-fresh nonce because both accounts are operator-controlled. The record is
-updated to `completed` after the bounded processing finishes.
+captures stable balance baselines and submits claims in parallel for builders
+whose observed claimable is at least 1 USDC. If all reads for a builder fail,
+it preserves the missing-data warning but makes one fallback claim attempt. The
+exact structured exchange rejection `Must have at least 1 of a reward token to
+claim` is consumed as a below-threshold skip only on that fallback path; every
+other rejection or transport error remains visible. Ambiguous claims are
+observed without a second nonce; ambiguous Builder-to-settlement sweeps instead
+reload current Available and retry with a fresh nonce because both accounts are
+operator-controlled. The record is updated to `completed` after the bounded
+processing finishes.
 At UTC 01:00 (Asia/Shanghai 09:00), it freezes pending points-rebate records and
 pending cycle-1/2 referral records, independently rounds each target total up to
 six decimal places, and checks the aggregate payout total against stable

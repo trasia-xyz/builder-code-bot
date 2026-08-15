@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"builder-code-bot/internal/funding"
+	"builder-code-bot/internal/logging"
 )
 
 const DataDir = "./data"
@@ -20,13 +21,19 @@ const (
 )
 
 type Store struct {
-	dataDir string
+	dataDir        string
+	logger         logging.Logger
+	removeTempFile func(string) error
 }
 
 var _ funding.StateStore = (*Store)(nil)
 
 func NewStore(dataDir string) *Store {
-	return &Store{dataDir: dataDir}
+	return NewStoreWithLogger(dataDir, logging.Default())
+}
+
+func NewStoreWithLogger(dataDir string, logger logging.Logger) *Store {
+	return &Store{dataDir: dataDir, logger: logger, removeTempFile: os.Remove}
 }
 
 func (s *Store) LoadWithMetadata(ctx context.Context) (*funding.RunState, funding.StateLoadMetadata, error) {
@@ -42,9 +49,14 @@ func (s *Store) LoadWithMetadata(ctx context.Context) (*funding.RunState, fundin
 	backupPath := filepath.Join(s.dataDir, backupFilename)
 	backup, backupExists, backupErr := loadSnapshot(backupPath)
 	if backupErr == nil && backupExists {
+		var primaryError error
+		if currentErr != nil {
+			primaryError = fmt.Errorf("load %s: %w", currentFilename, currentErr)
+		}
 		return backup, funding.StateLoadMetadata{
 			RecoveredFromBackup: true,
 			PrimaryInvalid:      currentErr != nil,
+			PrimaryError:        primaryError,
 		}, nil
 	}
 	if !currentExists && currentErr == nil && !backupExists && backupErr == nil {
@@ -59,7 +71,7 @@ func (s *Store) LoadWithMetadata(ctx context.Context) (*funding.RunState, fundin
 	return nil, funding.StateLoadMetadata{}, fmt.Errorf("load %s: %w", backupFilename, backupErr)
 }
 
-func (s *Store) Save(ctx context.Context, state funding.RunState) error {
+func (s *Store) Save(ctx context.Context, state funding.RunState) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -70,7 +82,11 @@ func (s *Store) Save(ctx context.Context, state funding.RunState) error {
 	if err != nil {
 		return fmt.Errorf("write current snapshot temp file: %w", err)
 	}
-	defer os.Remove(tempPath)
+	defer func() {
+		if removeErr := s.removeTempFile(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove current snapshot temp file: %w", removeErr))
+		}
+	}()
 
 	currentPath := filepath.Join(s.dataDir, currentFilename)
 	backupPath := filepath.Join(s.dataDir, backupFilename)
@@ -80,8 +96,24 @@ func (s *Store) Save(ctx context.Context, state funding.RunState) error {
 		}
 	} else if loadErr != nil {
 		if _, backupExists, backupErr := loadSnapshot(backupPath); !backupExists || backupErr != nil {
-			return fmt.Errorf("refuse to replace invalid current snapshot without a valid backup: %w", loadErr)
+			if backupErr != nil {
+				return fmt.Errorf(
+					"refuse to replace invalid current snapshot without a valid backup: %w",
+					errors.Join(
+						fmt.Errorf("load %s: %w", currentFilename, loadErr),
+						fmt.Errorf("load %s: %w", backupFilename, backupErr),
+					),
+				)
+			}
+			return fmt.Errorf(
+				"refuse to replace invalid current snapshot without a valid backup: %w", loadErr,
+			)
 		}
+		s.logger.Warn(ctx, "invalid primary state snapshot replaced using valid backup protection",
+			logging.String("event", "state_snapshot_primary_invalid_during_save"),
+			logging.String("snapshot", currentFilename),
+			logging.Bool("backup_valid", true),
+			logging.Err(loadErr))
 	}
 	if err := os.Rename(tempPath, currentPath); err != nil {
 		return fmt.Errorf("install current snapshot: %w", err)
@@ -92,7 +124,7 @@ func (s *Store) Save(ctx context.Context, state funding.RunState) error {
 	return nil
 }
 
-func (s *Store) Archive(ctx context.Context, state funding.RunState, result string) error {
+func (s *Store) Archive(ctx context.Context, state funding.RunState, result string) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -116,7 +148,11 @@ func (s *Store) Archive(ctx context.Context, state funding.RunState, result stri
 	if err != nil {
 		return fmt.Errorf("write history temp file: %w", err)
 	}
-	defer os.Remove(tempPath)
+	defer func() {
+		if removeErr := s.removeTempFile(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove history snapshot temp file: %w", removeErr))
+		}
+	}()
 	filename := fmt.Sprintf("%s-%s-%s.json", state.UTCDate, state.RunID, result)
 	if err := os.Rename(tempPath, filepath.Join(historyDir, filename)); err != nil {
 		return fmt.Errorf("install history snapshot: %w", err)
@@ -193,11 +229,13 @@ func writeSyncedEnvelopeTemp(dir, pattern string, state funding.RunState) (path 
 	}
 	path = file.Name()
 	defer func() {
-		if closeErr := file.Close(); err == nil && closeErr != nil {
-			err = closeErr
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close state snapshot temp file: %w", closeErr))
 		}
 		if err != nil {
-			os.Remove(path)
+			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				err = errors.Join(err, fmt.Errorf("remove state snapshot temp file: %w", removeErr))
+			}
 		}
 	}()
 	if err = file.Chmod(0o600); err != nil {
@@ -216,12 +254,16 @@ func writeSyncedEnvelopeTemp(dir, pattern string, state funding.RunState) (path 
 	return path, nil
 }
 
-func syncDir(path string) error {
+func syncDir(path string) (err error) {
 	dir, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close state directory: %w", closeErr))
+		}
+	}()
 	if err := dir.Sync(); err != nil {
 		return err
 	}

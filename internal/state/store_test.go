@@ -1,10 +1,13 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +16,7 @@ import (
 	"time"
 
 	"builder-code-bot/internal/funding"
+	"builder-code-bot/internal/logging"
 )
 
 func TestStoreLoadReturnsNilWhenNoSnapshotExists(t *testing.T) {
@@ -70,6 +74,107 @@ func TestStoreLoadWithMetadataReportsInvalidPrimaryBackupRecovery(t *testing.T) 
 	}
 	if !metadata.RecoveredFromBackup || !metadata.PrimaryInvalid {
 		t.Fatalf("metadata = %#v", metadata)
+	}
+	if metadata.PrimaryError == nil ||
+		!strings.Contains(metadata.PrimaryError.Error(), "load current.json") ||
+		!strings.Contains(metadata.PrimaryError.Error(), "decode state envelope") {
+		t.Fatalf("metadata primary error = %v", metadata.PrimaryError)
+	}
+}
+
+func TestStoreBackupRecoveryDoesNotInventPrimaryErrorWhenCurrentIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	first := testRunState(t, "first")
+	second := testRunState(t, "second")
+	if err := store.Save(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "current.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, metadata, err := store.LoadWithMetadata(context.Background())
+	if err != nil || got == nil || got.RunID != "first" {
+		t.Fatalf("LoadWithMetadata() = %#v, %#v, %v", got, metadata, err)
+	}
+	if !metadata.RecoveredFromBackup || metadata.PrimaryInvalid || metadata.PrimaryError != nil {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestStoreSaveLogsInvalidPrimaryWhenValidBackupAllowsRepair(t *testing.T) {
+	dir := t.TempDir()
+	var output bytes.Buffer
+	logger := logging.New(logging.Config{
+		Format: logging.FormatJSON, Level: logging.LevelDebug, Output: &output,
+	})
+	store := NewStoreWithLogger(dir, logger)
+	if err := store.Save(context.Background(), testRunState(t, "first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(context.Background(), testRunState(t, "second")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, currentFilename), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Save(context.Background(), testRunState(t, "third")); err != nil {
+		t.Fatal(err)
+	}
+	logs := output.String()
+	for _, want := range []string{
+		`"event":"state_snapshot_primary_invalid_during_save"`,
+		`"backup_valid":true`,
+		"decode state envelope",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("repair log missing %q: %s", want, logs)
+		}
+	}
+}
+
+func TestStoreSaveReportsBothInvalidPrimaryAndBackupErrors(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, currentFilename), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, backupFilename), []byte("also-not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := NewStore(dir).Save(context.Background(), testRunState(t, "replacement"))
+	if err == nil || !strings.Contains(err.Error(), "load "+currentFilename) ||
+		!strings.Contains(err.Error(), "load "+backupFilename) {
+		t.Fatalf("Save() error = %v, want both snapshot causes", err)
+	}
+}
+
+func TestStoreSaveReturnsTempCleanupError(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	cleanupErr := errors.New("remove current temp denied")
+	var removedPath string
+	store.removeTempFile = func(path string) error {
+		removedPath = path
+		return cleanupErr
+	}
+
+	err := store.Save(context.Background(), testRunState(t, "cleanup-error"))
+	if !errors.Is(err, cleanupErr) ||
+		!strings.Contains(err.Error(), "remove current snapshot temp file") {
+		t.Fatalf("Save() error = %v, want temp cleanup error", err)
+	}
+	if base := filepath.Base(removedPath); !strings.HasPrefix(base, ".current.json.tmp-") {
+		t.Fatalf("removed temp path = %q", removedPath)
+	}
+	loaded, loadErr := load(context.Background(), NewStore(dir))
+	if loadErr != nil || loaded == nil || loaded.RunID != "cleanup-error" {
+		t.Fatalf("saved snapshot = %#v, %v", loaded, loadErr)
 	}
 }
 
@@ -224,6 +329,59 @@ func TestStoreArchivesBeforeClear(t *testing.T) {
 	}
 	assertMode(t, filepath.Join(dir, "history"), 0o700)
 	assertMode(t, archive, 0o600)
+}
+
+func TestStoreArchiveReturnsTempCleanupError(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	cleanupErr := errors.New("remove history temp denied")
+	var removedPath string
+	store.removeTempFile = func(path string) error {
+		removedPath = path
+		return cleanupErr
+	}
+	state := testRunState(t, "archive-cleanup-error")
+
+	err := store.Archive(context.Background(), state, "completed")
+	if !errors.Is(err, cleanupErr) ||
+		!strings.Contains(err.Error(), "remove history snapshot temp file") {
+		t.Fatalf("Archive() error = %v, want temp cleanup error", err)
+	}
+	if base := filepath.Base(removedPath); !strings.HasPrefix(base, ".history.tmp-") {
+		t.Fatalf("removed temp path = %q", removedPath)
+	}
+	archivePath := filepath.Join(
+		dir,
+		historyDirname,
+		"2026-07-11-archive-cleanup-error-completed.json",
+	)
+	loaded, exists, loadErr := loadSnapshot(archivePath)
+	if loadErr != nil || !exists || loaded == nil || loaded.RunID != state.RunID {
+		t.Fatalf("archived snapshot = %#v, %v, %v", loaded, exists, loadErr)
+	}
+}
+
+func TestStoreTempCleanupIgnoresNotExistAfterRename(t *testing.T) {
+	store := NewStore(t.TempDir())
+	cleanupCalls := 0
+	store.removeTempFile = func(string) error {
+		cleanupCalls++
+		return fmt.Errorf("already renamed: %w", os.ErrNotExist)
+	}
+	state := testRunState(t, "cleanup-not-exist")
+
+	if err := store.Save(context.Background(), state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.Archive(context.Background(), state, "completed"); err != nil {
+		t.Fatalf("Archive() error = %v", err)
+	}
+	if err := store.SaveDailyConsolidation(context.Background(), testDailyConsolidation()); err != nil {
+		t.Fatalf("SaveDailyConsolidation() error = %v", err)
+	}
+	if cleanupCalls != 3 {
+		t.Fatalf("temp cleanup calls = %d, want 3", cleanupCalls)
+	}
 }
 
 func TestStoreTerminalArchiveRemainsEnvelopeReadable(t *testing.T) {

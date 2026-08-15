@@ -167,6 +167,36 @@ func TestIntegrationDualPayoutFlow(t *testing.T) {
 	}
 }
 
+func TestIntegrationZeroClaimableIsObservedWithoutClaimSubmission(t *testing.T) {
+	env := newIntegrationEnvironment(t, false, false)
+	env.server.SetClaimReward(env.builders[0], "USDC:0", "0")
+
+	if err := env.orchestrator.RunDailyConsolidation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	consolidation, err := env.store.LoadDailyConsolidation(context.Background(), "2026-07-12")
+	if err != nil || consolidation == nil || len(consolidation.Builders) != 2 {
+		t.Fatalf("daily consolidation = %#v, error = %v", consolidation, err)
+	}
+	builder := consolidation.Builders[0]
+	if !builder.ClaimableObserved || builder.ClaimableUSDC != "0" ||
+		builder.ClaimableQueryAttempts != 1 || builder.ClaimAttempts != 0 ||
+		builder.ClaimStatus != funding.ReportStepSkipped ||
+		builder.SweepAmount != "0.5" || builder.SweepStatus != funding.ReportStepSuccess {
+		t.Fatalf("zero claimable builder = %#v", builder)
+	}
+
+	claims := 0
+	for _, request := range env.server.Requests() {
+		if request.ActionType == "claimRewards" {
+			claims++
+		}
+	}
+	if claims != 1 {
+		t.Fatalf("claim submissions = %d, want only the positive builder claim", claims)
+	}
+}
+
 type integrationEnvironment struct {
 	server       *hyperliquidmock.Server
 	repository   *integrationRepository

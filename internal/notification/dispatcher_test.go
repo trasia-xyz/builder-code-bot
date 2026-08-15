@@ -42,16 +42,23 @@ func TestDispatcherSendsEveryFundingAlertAndReport(t *testing.T) {
 	}
 }
 
-func TestDispatcherContainsDeliveryFailureWithoutLeakingError(t *testing.T) {
+func TestDispatcherLogsSafeDeliveryFailureCause(t *testing.T) {
 	const secret = "password=do-not-log"
 	var output bytes.Buffer
-	n := &recordingNotifier{err: errors.New(secret)}
+	n := &recordingNotifier{err: errors.New(secret + "; SMTP connection refused")}
 	d := NewDispatcher(n, logging.New(logging.Config{Format: logging.FormatJSON, Level: logging.LevelDebug, Output: &output}))
 	d.Alert(context.Background(), "funding", Message{Subject: "down"})
-	if len(n.snapshot()) != 1 {
-		t.Fatal("notification was not attempted")
+	d.Report(context.Background(), Message{Subject: "report"})
+	if len(n.snapshot()) != 2 {
+		t.Fatal("notifications were not attempted")
 	}
 	if strings.Contains(output.String(), secret) {
 		t.Fatalf("log leaked notifier error: %s", output.String())
+	}
+	if got := strings.Count(output.String(), "SMTP connection refused"); got != 2 {
+		t.Fatalf("safe notifier cause count = %d, want 2: %s", got, output.String())
+	}
+	if got := strings.Count(output.String(), `"error":`); got != 2 {
+		t.Fatalf("error fields = %d, want 2: %s", got, output.String())
 	}
 }

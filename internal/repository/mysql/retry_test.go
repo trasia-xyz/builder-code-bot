@@ -11,8 +11,16 @@ import (
 type retryEvent struct {
 	kind           string
 	operation      string
+	stage          string
+	err            error
 	attempts       int
 	unavailableFor time.Duration
+}
+
+func (o *recordingRetryObserver) Diagnostic(operation, stage string, err error) {
+	o.events = append(o.events, retryEvent{
+		kind: "diagnostic", operation: operation, stage: stage, err: err,
+	})
 }
 
 type recordingRetryObserver struct {

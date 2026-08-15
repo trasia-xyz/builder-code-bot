@@ -49,7 +49,7 @@ func Err(err error) slog.Attr {
 	if err == nil {
 		return slog.Attr{}
 	}
-	return slog.String("error", err.Error())
+	return slog.String("error", SafeErrorText(err))
 }
 
 func String(key, value string) slog.Attr {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"builder-code-bot/internal/hyperliquid/info"
+	"builder-code-bot/internal/logging"
 
 	"github.com/shopspring/decimal"
 )
@@ -166,10 +167,12 @@ func (o *Orchestrator) submitPayoutAttempt(
 	}
 	attrs = append(attrs, slog.String("settlement_total_before", target.Payout.TotalBefore))
 	if submitErr != nil {
-		attrs = append(attrs, slog.String("submit_error", submitErr.Error()))
+		attrs = append(attrs, slog.String("submit_error", logging.SafeErrorText(submitErr)))
 	}
 	if !result.Accepted && len(result.Response) != 0 {
-		attrs = append(attrs, slog.String("response", string(result.Response)))
+		attrs = append(attrs, slog.String(
+			"response", logging.SafeDiagnosticExcerpt(string(result.Response), 1024),
+		))
 	}
 	o.info(ctx, "final payout submission returned", attrs...)
 	switch {
@@ -236,7 +239,8 @@ func (o *Orchestrator) observeUncertainPayout(
 				slog.Int("query_attempt", queryAttempt),
 				slog.Int("max_query_attempts", payoutBalanceQueryAttempts),
 				slog.Int("successful_observations", successfulObservations),
-				slog.Int("query_errors", queryErrors))
+				slog.Int("query_errors", queryErrors),
+				logging.Err(balanceErr))
 			continue
 		}
 		successfulObservations++

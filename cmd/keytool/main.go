@@ -50,7 +50,9 @@ func newTerminalPrompt(stdin *os.File, stderr io.Writer) *terminalPrompt {
 }
 
 func (p *terminalPrompt) ReadLine(label string) (string, error) {
-	fmt.Fprint(p.stderr, label)
+	if _, err := fmt.Fprint(p.stderr, label); err != nil {
+		return "", fmt.Errorf("write input prompt: %w", err)
+	}
 	value, err := p.reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
@@ -63,13 +65,22 @@ func (p *terminalPrompt) ReadSecret(label string) (secret.SecretString, error) {
 	if !term.IsTerminal(fd) {
 		return secret.SecretString{}, fmt.Errorf("secret input must be entered from a terminal")
 	}
-	fmt.Fprint(p.stderr, label)
-	raw, err := term.ReadPassword(fd)
-	fmt.Fprintln(p.stderr)
-	if err != nil {
-		return secret.SecretString{}, err
+	if _, err := fmt.Fprint(p.stderr, label); err != nil {
+		return secret.SecretString{}, fmt.Errorf("write secret prompt: %w", err)
 	}
+	raw, readErr := term.ReadPassword(fd)
 	defer zeroBytes(raw)
+	_, newlineErr := fmt.Fprintln(p.stderr)
+	var resultErr error
+	if readErr != nil {
+		resultErr = fmt.Errorf("read secret from terminal: %w", readErr)
+	}
+	if newlineErr != nil {
+		resultErr = errors.Join(resultErr, fmt.Errorf("write secret prompt newline: %w", newlineErr))
+	}
+	if resultErr != nil {
+		return secret.SecretString{}, resultErr
+	}
 	return secret.NewString(string(raw)), nil
 }
 
@@ -87,7 +98,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer,
 		return fmt.Errorf("prompt is nil")
 	}
 	if len(args) == 0 {
-		printUsage(stderr)
+		if err := printUsage(stderr); err != nil {
+			return fmt.Errorf("write usage: %w", err)
+		}
 		return flag.ErrHelp
 	}
 
@@ -97,8 +110,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer,
 	case "decrypt":
 		return runDecrypt(args[1:], stdout, stderr, prompt)
 	case "-h", "--help", "help":
-		printUsage(stdout)
-		return nil
+		return printUsage(stdout)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -143,8 +155,12 @@ func runEncrypt(args []string, stdout io.Writer, stderr io.Writer, prompt prompt
 		return err
 	}
 
-	fmt.Fprintln(stdout, "signer_address =", address)
-	fmt.Fprintf(stdout, "encrypted_private_key = %q\n", encrypted.Reveal())
+	if _, err := fmt.Fprintln(stdout, "signer_address =", address); err != nil {
+		return fmt.Errorf("write signer address: %w", err)
+	}
+	if _, err := fmt.Fprintf(stdout, "encrypted_private_key = %q\n", encrypted.Reveal()); err != nil {
+		return fmt.Errorf("write encrypted private key: %w", err)
+	}
 	return nil
 }
 
@@ -185,17 +201,28 @@ func runDecrypt(args []string, stdout io.Writer, stderr io.Writer, prompt prompt
 		return err
 	}
 
-	fmt.Fprintln(stdout, "signer_address =", address)
+	if _, err := fmt.Fprintln(stdout, "signer_address =", address); err != nil {
+		return fmt.Errorf("write signer address: %w", err)
+	}
 	if showPrivateKey {
-		fmt.Fprintf(stdout, "private_key = %q\n", privateKey.Reveal())
+		if _, err := fmt.Fprintf(stdout, "private_key = %q\n", privateKey.Reveal()); err != nil {
+			return fmt.Errorf("write private key: %w", err)
+		}
 	}
 	return nil
 }
 
-func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  keytool encrypt")
-	fmt.Fprintln(w, "  keytool decrypt [-show-private-key]")
+func printUsage(w io.Writer) error {
+	if _, err := fmt.Fprintln(w, "usage:"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "  keytool encrypt"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "  keytool decrypt [-show-private-key]"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func normalizeEncryptedPrivateKeyInput(value string) (string, error) {

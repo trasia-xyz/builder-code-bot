@@ -121,10 +121,11 @@ func TestClaimableUSDCRejectsInvalidAmounts(t *testing.T) {
 	}
 }
 
-func TestClaimableUSDCReturnsZeroWithoutUSDCEntry(t *testing.T) {
+func TestClaimableUSDCReturnsZero(t *testing.T) {
 	for _, response := range []json.RawMessage{
 		json.RawMessage(`{"unclaimedRewards":"0","tokenToState":[]}`),
 		json.RawMessage(`{"unclaimedRewards":"4.5","tokenToState":[[235,{"unclaimedRewards":"4.5"}]]}`),
+		json.RawMessage(`{"unclaimedRewards":"0","tokenToState":[[0,{"unclaimedRewards":"0"}]]}`),
 	} {
 		transport := &fakeTransport{responses: []json.RawMessage{response}}
 		claimable, err := New(transport).ClaimableUSDC(context.Background(), "0xsender", Token{Index: 0})
