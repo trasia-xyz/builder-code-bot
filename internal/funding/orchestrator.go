@@ -2,7 +2,6 @@ package funding
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -16,32 +15,25 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-var payoutExecutionOrder = []PayoutKind{
-	PayoutKindPointsRebate,
-	PayoutKindReferral,
-}
-
 type OrchestratorConfig struct {
-	PointsRebateRepository Repository
-	ReferralRepository     Repository
-	Store                  StateStore
-	DailyConsolidations    DailyConsolidationStore
-	Chain                  Chain
-	Notifier               Notifier
-	Logger                 Logger
-	Builders               []string
-	BuilderNames           map[string]string
-	Settlement             string
-	PointsRebateRecipient  string
-	ReferralRecipient      string
-	Network                string
-	Clock                  Clock
-	Nonce                  NonceSource
-	Sleeper                Sleeper
+	ReferralRepository  Repository
+	Store               StateStore
+	DailyConsolidations DailyConsolidationStore
+	Chain               Chain
+	Notifier            Notifier
+	Logger              Logger
+	Builders            []string
+	BuilderNames        map[string]string
+	Settlement          string
+	ReferralRecipient   string
+	Network             string
+	Clock               Clock
+	Nonce               NonceSource
+	Sleeper             Sleeper
 }
 
 type Orchestrator struct {
-	repositories        map[PayoutKind]Repository
+	repository          Repository
 	store               StateStore
 	dailyConsolidations DailyConsolidationStore
 	chain               Chain
@@ -50,7 +42,7 @@ type Orchestrator struct {
 	builders            []string
 	builderNames        map[string]string
 	settlement          string
-	recipients          map[PayoutKind]string
+	recipient           string
 	network             string
 	clock               Clock
 	nonce               NonceSource
@@ -83,13 +75,12 @@ const (
 )
 
 func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
-	if cfg.PointsRebateRepository == nil || cfg.ReferralRepository == nil ||
+	if cfg.ReferralRepository == nil ||
 		cfg.Store == nil || cfg.DailyConsolidations == nil ||
 		cfg.Chain == nil || cfg.Clock == nil || cfg.Nonce == nil {
 		return nil, fmt.Errorf("funding orchestrator dependencies are required")
 	}
 	if len(cfg.Builders) == 0 || strings.TrimSpace(cfg.Settlement) == "" ||
-		strings.TrimSpace(cfg.PointsRebateRecipient) == "" ||
 		strings.TrimSpace(cfg.ReferralRecipient) == "" {
 		return nil, fmt.Errorf("funding accounts are required")
 	}
@@ -107,39 +98,28 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 		}
 		seen[address] = struct{}{}
 	}
-	recipients := map[PayoutKind]string{
-		PayoutKindPointsRebate: strings.TrimSpace(cfg.PointsRebateRecipient),
-		PayoutKindReferral:     strings.TrimSpace(cfg.ReferralRecipient),
+	recipient := strings.TrimSpace(cfg.ReferralRecipient)
+	if strings.EqualFold(recipient, zeroEthereumAddress) {
+		return nil, fmt.Errorf("referral recipient account must not be the zero address")
 	}
-	for kind, recipient := range recipients {
-		if strings.EqualFold(recipient, zeroEthereumAddress) {
-			return nil, fmt.Errorf("%s recipient account must not be the zero address", kind)
-		}
-		if strings.EqualFold(strings.TrimSpace(cfg.Settlement), recipient) {
-			return nil, fmt.Errorf("settlement and %s recipient accounts must differ", kind)
-		}
-		if _, controlled := seen[strings.ToLower(recipient)]; controlled {
-			return nil, fmt.Errorf("%s recipient account must not be a builder", kind)
-		}
+	if strings.EqualFold(strings.TrimSpace(cfg.Settlement), recipient) {
+		return nil, fmt.Errorf("settlement and referral recipient accounts must differ")
 	}
-	if strings.EqualFold(recipients[PayoutKindPointsRebate], recipients[PayoutKindReferral]) {
-		return nil, fmt.Errorf("payout recipient accounts must differ")
+	if _, controlled := seen[strings.ToLower(recipient)]; controlled {
+		return nil, fmt.Errorf("referral recipient account must not be a builder")
 	}
 	sleeper := cfg.Sleeper
 	if sleeper == nil {
 		sleeper = timerSleeper{}
 	}
 	return &Orchestrator{
-		repositories: map[PayoutKind]Repository{
-			PayoutKindPointsRebate: cfg.PointsRebateRepository,
-			PayoutKindReferral:     cfg.ReferralRepository,
-		},
+		repository:          cfg.ReferralRepository,
 		store:               cfg.Store,
 		dailyConsolidations: cfg.DailyConsolidations, chain: cfg.Chain,
 		notifier: cfg.Notifier, logger: cfg.Logger,
 		builders:     append([]string(nil), cfg.Builders...),
 		builderNames: cloneBuilderNames(cfg.BuilderNames),
-		settlement:   cfg.Settlement, recipients: recipients, network: cfg.Network,
+		settlement:   cfg.Settlement, recipient: recipient, network: cfg.Network,
 		clock: cfg.Clock, nonce: cfg.Nonce, sleeper: sleeper,
 		alerts:    make(map[string]struct{}),
 		lowLimits: make(map[string]struct{}),
@@ -147,44 +127,19 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 }
 
 func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *RunReport) error {
-	type queryResult struct {
-		kind    PayoutKind
-		records []Record
-		err     error
-	}
-	o.info(ctx, "pending funding records queries started",
-		slog.String("event", "funding_pending_records_queries_started"))
-	results := make(chan queryResult, len(payoutExecutionOrder))
-	for _, kind := range payoutExecutionOrder {
-		kind := kind
-		go func() {
-			records, err := o.repositories[kind].ListPending(ctx)
-			results <- queryResult{kind: kind, records: records, err: err}
-		}()
-	}
-	recordsByKind := make(map[PayoutKind][]Record, len(payoutExecutionOrder))
-	var queryErr error
-	for range payoutExecutionOrder {
-		result := <-results
-		if result.err != nil {
-			queryErr = errors.Join(queryErr, fmt.Errorf("list %s pending records: %w", result.kind, result.err))
-			continue
-		}
-		recordsByKind[result.kind] = result.records
-		o.info(ctx, "pending funding records query completed",
-			slog.String("event", "funding_pending_records_query_completed"),
-			slog.String("payout_kind", string(result.kind)),
-			slog.Int("record_count", len(result.records)))
-	}
-	if queryErr != nil {
+	o.info(ctx, "pending funding records query started",
+		slog.String("event", "funding_pending_records_query_started"),
+		slog.String("payout_kind", string(PayoutKindReferral)))
+	records, err := o.repository.ListPending(ctx)
+	if err != nil {
 		report.fail("snapshot", "数据库 pending funding records 查询失败。", "请检查 MySQL 可用性与查询权限。")
-		return queryErr
+		return fmt.Errorf("list referral pending records: %w", err)
 	}
-
-	totalRecords := 0
-	for _, kind := range payoutExecutionOrder {
-		totalRecords += len(recordsByKind[kind])
-	}
+	totalRecords := len(records)
+	o.info(ctx, "pending funding records query completed",
+		slog.String("event", "funding_pending_records_query_completed"),
+		slog.String("payout_kind", string(PayoutKindReferral)),
+		slog.Int("record_count", totalRecords))
 	if totalRecords == 0 {
 		report.RecordsRead = true
 		report.RecordCount = 0
@@ -192,9 +147,7 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *RunR
 		report.PayoutTotal = "0"
 		report.Outcome = "no_data"
 		report.setStage("snapshot", ReportStepSuccess, "没有待处理记录")
-		for _, kind := range payoutExecutionOrder {
-			report.markTargetNoData(kind)
-		}
+		report.markTargetNoData(PayoutKindReferral)
 		report.setStage("finalize", ReportStepSkipped, "无需持久化运行状态")
 		o.info(ctx, "no pending funding records", slog.String("event", "funding_no_data"))
 		return nil
@@ -209,24 +162,15 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *RunR
 		slog.String("trigger", string(trigger)), slog.Int("record_count", totalRecords),
 		slog.Int("builder_count", len(o.builders)))
 
-	var validationErr error
-	run.Targets = make([]PayoutTargetState, 0, len(payoutExecutionOrder))
-	for _, kind := range payoutExecutionOrder {
-		manifest, err := buildManifest(ManifestInput{
-			Records: recordsByKind[kind], Settlement: o.settlement,
-			Recipient: o.recipients[kind],
-		}, false)
-		run.Targets = append(run.Targets, PayoutTargetState{
-			Kind: kind, Phase: PhasePrepared, Manifest: manifest,
-		})
-		if err != nil {
-			validationErr = errors.Join(validationErr, fmt.Errorf("validate %s records: %w", kind, err))
-		}
+	manifest, validationErr := buildManifest(ManifestInput{
+		Records: records, Settlement: o.settlement, Recipient: o.recipient,
+	}, false)
+	run.Targets = []PayoutTargetState{
+		{Kind: PayoutKindReferral, Phase: PhasePrepared, Manifest: manifest},
 	}
 	report.syncState(&run)
 	if validationErr != nil {
-		// A failed target has no valid total. Do not reconcile UTC 00:00
-		// claimables against the other target's partial aggregate.
+		// An invalid manifest has no reliable total for claimable reconciliation.
 		report.RawTotal = ""
 		report.PayoutTotal = ""
 		report.Outcome = "failed_validation"
@@ -242,30 +186,26 @@ func (o *Orchestrator) runNew(ctx context.Context, trigger Trigger, report *RunR
 		)
 		return &FatalError{Err: validationErr}
 	}
-	aggregatePayout, aggregateErr := aggregatePayoutTotal(&run, 0)
-	if aggregateErr != nil {
-		return aggregateErr
+	payout, err := decimalFromString(manifest.PayoutTotal)
+	if err != nil {
+		return err
 	}
-	if aggregatePayout.IsPositive() {
+	if payout.IsPositive() {
 		token, tokenErr := o.chain.CanonicalUSDC(ctx)
 		if tokenErr != nil {
 			report.fail("snapshot", "Canonical USDC metadata 查询失败。", "")
 			return tokenErr
 		}
-		for index := range run.Targets {
-			if run.Targets[index].Manifest.PayoutTotal != "0" {
-				run.Targets[index].Manifest.Token = cloneToken(&token)
-			}
-		}
+		run.Targets[0].Manifest.Token = cloneToken(&token)
 	}
 	o.info(ctx, "funding snapshot calculated",
 		slog.String("event", "funding_snapshot_calculated"),
 		slog.String("run_id", run.RunID), slog.Int("record_count", totalRecords),
-		slog.String("payout_total", aggregatePayout.String()))
+		slog.String("payout_total", payout.String()))
 	report.Outcome = "completed"
 	report.syncState(&run)
 	report.setStage("snapshot", ReportStepSuccess, fmt.Sprintf(
-		"%d 条记录，两笔 Payout 合计 %s USDC", totalRecords, aggregatePayout,
+		"%d 条记录，Referral Payout %s USDC", totalRecords, payout,
 	))
 	if err := o.saveActivePhase(ctx, &run, PhasePrepared); err != nil {
 		report.fail("snapshot", "资金快照持久化失败。", "请检查本地 data 目录和文件系统状态。")
@@ -307,29 +247,6 @@ func (o *Orchestrator) runPositive(
 		report.fail("snapshot", "持久化的 Payout 金额无法解析。", "请保留 current 状态并检查数据完整性。")
 		return err
 	}
-	requiredAvailable := payout
-	_, activeIndex, activeErr := state.activePayoutTarget()
-	if activeErr != nil || activeIndex >= len(state.Targets) {
-		return &FatalError{Err: errors.Join(activeErr, fmt.Errorf("active payout target is unavailable"))}
-	}
-	priorBoundary, hasPriorPayout, err := priorPayoutSettlementBoundary(state, activeIndex)
-	if err != nil {
-		return &FatalError{Err: err}
-	}
-	if !hasPriorPayout {
-		requiredAvailable, err = aggregatePayoutTotal(state, activeIndex)
-		if err != nil {
-			return &FatalError{Err: err}
-		}
-	}
-	if hasPriorPayout {
-		// A balance query made immediately after a successful payout can still
-		// return the pre-transfer balance. Delay the first boundary read for the
-		// next payout target so it observes the settled state more reliably.
-		if err := o.sleeper.Sleep(ctx, payoutBalanceObservationInterval); err != nil {
-			return err
-		}
-	}
 	var (
 		settlement             info.SpotBalanceAmounts
 		candidate              info.SpotBalanceAmounts
@@ -343,8 +260,7 @@ func (o *Orchestrator) runPositive(
 		if queryErr == nil {
 			settlement = balance
 			observed = true
-			sufficient := !balance.Available.LessThan(requiredAvailable)
-			matchesPriorBoundary := !hasPriorPayout || priorBoundary.matches(balance.Total)
+			sufficient := !balance.Available.LessThan(payout)
 			lastSufficient = sufficient
 			if consecutiveStableReads > 0 && sameSpotBalance(balance, candidate) {
 				consecutiveStableReads++
@@ -361,12 +277,10 @@ func (o *Orchestrator) runPositive(
 				slog.String("hold", balance.Total.Sub(balance.Available).String()),
 				slog.String("available", balance.Available.String()),
 				slog.String("payout_total", payout.String()),
-				slog.String("required_available", requiredAvailable.String()),
+				slog.String("required_available", payout.String()),
 				slog.Bool("sufficient", sufficient),
-				slog.Bool("matches_prior_payout_boundary", matchesPriorBoundary),
 				slog.Int("consecutive_stable_reads", consecutiveStableReads))
-			if sufficient && matchesPriorBoundary &&
-				consecutiveStableReads >= settlementBalanceRequiredConfirmations {
+			if sufficient && consecutiveStableReads >= settlementBalanceRequiredConfirmations {
 				return o.executePayout(ctx, state, target, balance, payout, report)
 			}
 		} else {
@@ -393,18 +307,6 @@ func (o *Orchestrator) runPositive(
 		)
 		return fmt.Errorf("query settlement spot balance: %w", lastQueryErr)
 	}
-	if hasPriorPayout && !priorBoundary.matches(settlement.Total) {
-		report.failTarget(
-			target.Kind,
-			"payout",
-			"上一笔 Payout 后的 Settlement 余额尚未稳定可见，未提交下一笔 Payout。",
-			"请等待余额索引刷新后重试；已完成的 Payout 不会重发。",
-		)
-		return fmt.Errorf(
-			"settlement total %s does not match prior payout boundary %s",
-			settlement.Total, priorBoundary.description(),
-		)
-	}
 	if lastSufficient {
 		o.alertOnce(
 			ctx, state.RunID, "settlement_balance_unstable",
@@ -423,95 +325,13 @@ func (o *Orchestrator) runPositive(
 	)
 	report.failTarget(
 		target.Kind, "payout",
-		fmt.Sprintf("Settlement 可用余额 %s USDC，低于所需的 %s USDC。", settlement.Available, requiredAvailable),
+		fmt.Sprintf("Settlement 可用余额 %s USDC，低于所需的 %s USDC。", settlement.Available, payout),
 		"",
 	)
 	return fmt.Errorf(
 		"settlement available balance %s is below required payout total %s",
-		settlement.Available, requiredAvailable,
+		settlement.Available, payout,
 	)
-}
-
-func aggregatePayoutTotal(state *RunState, start int) (decimal.Decimal, error) {
-	if state == nil || start < 0 || start > len(state.Targets) {
-		return decimal.Zero, fmt.Errorf("invalid payout aggregate range")
-	}
-	total := decimal.Zero
-	for index := start; index < len(state.Targets); index++ {
-		amount, err := decimalFromString(state.Targets[index].Manifest.PayoutTotal)
-		if err != nil {
-			return decimal.Zero, fmt.Errorf("parse %s payout total: %w", state.Targets[index].Kind, err)
-		}
-		total = total.Add(amount)
-	}
-	return total, nil
-}
-
-type confirmedPayoutBoundary struct {
-	before   decimal.Decimal
-	amount   decimal.Decimal
-	evidence string
-}
-
-func (b confirmedPayoutBoundary) matches(total decimal.Decimal) bool {
-	return matchesConfirmedPayoutBoundary(total, b.before, b.amount, b.evidence)
-}
-
-func (b confirmedPayoutBoundary) description() string {
-	withoutFee, withFee, feeBoundaryAvailable := payoutSettlementBoundaries(b.before, b.amount)
-	switch b.evidence {
-	case "settlement_balance_decreased":
-		return withoutFee.String()
-	case "settlement_balance_decreased_with_activation_fee":
-		return withFee.String()
-	case "exchange_response":
-		if feeBoundaryAvailable {
-			return withoutFee.String() + " or " + withFee.String()
-		}
-		return withoutFee.String()
-	default:
-		return "invalid confirmation evidence"
-	}
-}
-
-func priorPayoutSettlementBoundary(
-	state *RunState,
-	activeIndex int,
-) (confirmedPayoutBoundary, bool, error) {
-	if state == nil {
-		return confirmedPayoutBoundary{}, false, fmt.Errorf("funding run state is nil")
-	}
-	for index := activeIndex - 1; index >= 0; index-- {
-		target := &state.Targets[index]
-		amount, err := decimalFromString(target.Manifest.PayoutTotal)
-		if err != nil {
-			return confirmedPayoutBoundary{}, false, err
-		}
-		if !amount.IsPositive() {
-			continue
-		}
-		if target.Phase != PhaseCompleted || target.Payout == nil {
-			return confirmedPayoutBoundary{}, false, fmt.Errorf("prior positive payout %s is not complete", target.Kind)
-		}
-		before, err := decimalFromString(target.Payout.TotalBefore)
-		if err != nil {
-			return confirmedPayoutBoundary{}, false, err
-		}
-		withoutFee, _, _ := payoutSettlementBoundaries(before, amount)
-		if withoutFee.IsNegative() {
-			return confirmedPayoutBoundary{}, false, fmt.Errorf("prior payout settlement boundary is negative")
-		}
-		boundary := confirmedPayoutBoundary{
-			before: before, amount: amount, evidence: target.ConfirmationEvidence,
-		}
-		if boundary.description() == "invalid confirmation evidence" {
-			return confirmedPayoutBoundary{}, false, fmt.Errorf(
-				"prior payout %s confirmation evidence is invalid", target.Kind,
-			)
-		}
-		return boundary, true, nil
-	}
-	return confirmedPayoutBoundary{}, false, nil
 }
 
 func (o *Orchestrator) queryConsolidationToken(
@@ -1532,7 +1352,7 @@ func (o *Orchestrator) completeDatabase(
 		slog.String("run_id", state.RunID),
 		slog.String("payout_kind", string(target.Kind)),
 		slog.Int("record_count", len(ids)))
-	if err := o.repositories[target.Kind].Complete(ctx, ids); err != nil {
+	if err := o.repository.Complete(ctx, ids); err != nil {
 		o.alertOnce(
 			ctx, state.RunID, string(target.Kind)+"_database_completion_failed",
 			AlertSeverityWarning, "funding database completion failed",
@@ -1582,11 +1402,10 @@ func (o *Orchestrator) finishRun(ctx context.Context, state *RunState, report *R
 	}
 	report.setStage("finalize", ReportStepSuccess, "运行状态已归档并清理")
 	report.syncState(state)
-	aggregate, _ := aggregatePayoutTotal(state, 0)
 	o.info(ctx, "funding run completed",
 		slog.String("event", "funding_run_completed"), slog.String("run_id", state.RunID),
 		slog.Int("record_count", report.RecordCount),
-		slog.String("payout_total", aggregate.String()))
+		slog.String("payout_total", report.PayoutTotal))
 	o.forgetAlerts(state.RunID)
 	return nil
 }

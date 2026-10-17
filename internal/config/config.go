@@ -11,16 +11,15 @@ import (
 )
 
 type Config struct {
-	MySQL              MySQLConfig        `toml:"mysql"`
-	Hyperliquid        HyperliquidConfig  `toml:"hyperliquid"`
-	Signing            SigningConfig      `toml:"signing"`
-	Builders           []BuilderConfig    `toml:"builders"`
-	Settlement         AccountConfig      `toml:"settlement"`
-	ReferralPayout     PayoutConfig       `toml:"referral_payout"`
-	PointsRebatePayout PayoutConfig       `toml:"points_rebate_payout"`
-	Logging            LoggingConfig      `toml:"logging"`
-	AWS                AWSConfig          `toml:"aws"`
-	Notification       NotificationConfig `toml:"notification"`
+	MySQL          MySQLConfig        `toml:"mysql"`
+	Hyperliquid    HyperliquidConfig  `toml:"hyperliquid"`
+	Signing        SigningConfig      `toml:"signing"`
+	Builders       []BuilderConfig    `toml:"builders"`
+	Settlement     AccountConfig      `toml:"settlement"`
+	ReferralPayout PayoutConfig       `toml:"referral_payout"`
+	Logging        LoggingConfig      `toml:"logging"`
+	AWS            AWSConfig          `toml:"aws"`
+	Notification   NotificationConfig `toml:"notification"`
 }
 
 func Default() Config {

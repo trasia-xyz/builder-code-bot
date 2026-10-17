@@ -319,24 +319,6 @@ func payoutSettlementEvidence(total, before, amount decimal.Decimal) (string, bo
 	return "", false
 }
 
-func matchesConfirmedPayoutBoundary(
-	total, before, amount decimal.Decimal,
-	evidence string,
-) bool {
-	matchedEvidence, matches := payoutSettlementEvidence(total, before, amount)
-	if !matches {
-		return false
-	}
-	switch evidence {
-	case "settlement_balance_decreased", "settlement_balance_decreased_with_activation_fee":
-		return matchedEvidence == evidence
-	case "exchange_response":
-		return true
-	default:
-		return false
-	}
-}
-
 func (o *Orchestrator) confirmPayout(
 	ctx context.Context,
 	state *RunState,

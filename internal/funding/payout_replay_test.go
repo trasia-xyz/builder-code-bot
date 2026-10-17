@@ -67,7 +67,7 @@ func TestAmbiguousPayoutUsesOnlyExactSettlementTotalDecrease(t *testing.T) {
 				t.Fatalf("completed IDs = %v", fx.repo.completedIDs)
 			}
 			report := onlyReport(t, fx.notifier)
-			payout := report.target(PayoutKindPointsRebate).Payout
+			payout := report.target(PayoutKindReferral).Payout
 			if payout.Status != ReportStepSuccess ||
 				payout.ConfirmationEvidence != test.evidence {
 				t.Fatalf("payout report = %#v", payout)
@@ -144,7 +144,7 @@ func TestDuplicateNonceReplayResponseRemainsAmbiguousUntilSettlementDecreaseIsVi
 		t.Fatalf("completed=%v current=%#v", fx.repo.completedIDs, fx.store.current)
 	}
 	report := onlyReport(t, fx.notifier)
-	if payout := report.target(PayoutKindPointsRebate).Payout; payout.Status != ReportStepSuccess ||
+	if payout := report.target(PayoutKindReferral).Payout; payout.Status != ReportStepSuccess ||
 		payout.ConfirmationEvidence != "settlement_balance_decreased" {
 		t.Fatalf("payout report = %#v", payout)
 	}
@@ -172,14 +172,14 @@ func TestAmbiguousPayoutStopsAfterOneFailedExactReplayAndReportsBlocked(t *testi
 		t.Fatalf("PrepareSpotSend calls = %d, want 1", got)
 	}
 	if fx.store.current == nil ||
-		testTarget(t, fx.store.current, PayoutKindPointsRebate).Phase != PhaseBlocked ||
+		testTarget(t, fx.store.current, PayoutKindReferral).Phase != PhaseBlocked ||
 		fx.store.archiveResult != "blocked" || len(fx.repo.completedIDs) != 0 {
 		t.Fatalf("current=%#v archive=%q completed=%v",
 			fx.store.current, fx.store.archiveResult, fx.repo.completedIDs)
 	}
 	report := onlyReport(t, fx.notifier)
 	if report.Outcome != "blocked" ||
-		report.target(PayoutKindPointsRebate).Payout.Status != ReportStepFailed {
+		report.target(PayoutKindReferral).Payout.Status != ReportStepFailed {
 		t.Fatalf("blocked report = %#v", report)
 	}
 	if stage := report.stage("finalize"); stage == nil || stage.Status != ReportStepSuccess {
@@ -223,7 +223,7 @@ func TestReplayTransportFailureOrUnclearResponseAlsoEndsBlocked(t *testing.T) {
 			}
 			assertOneExactPayoutReplay(t, chain, "0xrecipient")
 			if fx.store.current == nil ||
-				testTarget(t, fx.store.current, PayoutKindPointsRebate).Phase != PhaseBlocked ||
+				testTarget(t, fx.store.current, PayoutKindReferral).Phase != PhaseBlocked ||
 				len(fx.repo.completedIDs) != 0 {
 				t.Fatalf("current=%#v completed=%v", fx.store.current, fx.repo.completedIDs)
 			}
@@ -260,7 +260,7 @@ func TestExactReplayFailureKindsAllEndInTerminalBlocked(t *testing.T) {
 				t.Fatalf("Run() error = %v, want fatal blocked result", err)
 			}
 			assertOneExactPayoutReplay(t, chain, "0xrecipient")
-			target := testTarget(t, fx.store.current, PayoutKindPointsRebate)
+			target := testTarget(t, fx.store.current, PayoutKindReferral)
 			if target.Phase != PhaseBlocked || target.Payout.SubmitAttempts != 2 ||
 				len(fx.repo.completedIDs) != 0 {
 				t.Fatalf("target=%#v completed=%v", target, fx.repo.completedIDs)
@@ -280,7 +280,7 @@ func TestExactReplayFailureKindsAllEndInTerminalBlocked(t *testing.T) {
 func TestPayoutSubmittingRecoveryReplaysOnlyThePersistedRequest(t *testing.T) {
 	fx := newFixture(t)
 	state := fx.positiveState(t, PhasePayoutSubmitting)
-	target := testTarget(t, &state, PayoutKindPointsRebate)
+	target := testTarget(t, &state, PayoutKindReferral)
 	target.Payout = &PayoutJournal{
 		Prepared: validPayout(t, state, 1801), TotalBefore: "2", SubmitAttempts: 1,
 	}
@@ -311,7 +311,7 @@ func TestPayoutSubmittingRecoveryReplaysOnlyThePersistedRequest(t *testing.T) {
 func TestPayoutReplayingRecoveryNeverSubmitsAgain(t *testing.T) {
 	fx := newFixture(t)
 	state := fx.positiveState(t, PhasePayoutReplaying)
-	target := testTarget(t, &state, PayoutKindPointsRebate)
+	target := testTarget(t, &state, PayoutKindReferral)
 	target.Payout = &PayoutJournal{
 		Prepared: validPayout(t, state, 1802), TotalBefore: "2", SubmitAttempts: 2,
 	}
@@ -330,7 +330,7 @@ func TestPayoutReplayingRecoveryNeverSubmitsAgain(t *testing.T) {
 			chain.submittedActions, chain.prepareCalls)
 	}
 	if fx.store.current == nil ||
-		testTarget(t, fx.store.current, PayoutKindPointsRebate).Phase != PhaseBlocked {
+		testTarget(t, fx.store.current, PayoutKindReferral).Phase != PhaseBlocked {
 		t.Fatalf("current = %#v", fx.store.current)
 	}
 }
@@ -361,7 +361,7 @@ func TestAmbiguousPayoutRejectsAnyOtherSettlementDecrease(t *testing.T) {
 		t.Fatalf("PrepareSpotSend calls = %d, want 1", got)
 	}
 	if len(fx.repo.completedIDs) != 0 || fx.store.current == nil ||
-		testTarget(t, fx.store.current, PayoutKindPointsRebate).Phase != PhaseBlocked {
+		testTarget(t, fx.store.current, PayoutKindReferral).Phase != PhaseBlocked {
 		t.Fatalf("completed=%v current=%#v", fx.repo.completedIDs, fx.store.current)
 	}
 }
@@ -396,22 +396,17 @@ func TestAmbiguousPayoutDoesNotReplayWithoutACompleteSettlementObservationWindow
 		t.Fatalf("PrepareSpotSend calls = %d, want 1", got)
 	}
 	if fx.store.current == nil ||
-		testTarget(t, fx.store.current, PayoutKindPointsRebate).Phase != PhaseBlocked {
+		testTarget(t, fx.store.current, PayoutKindReferral).Phase != PhaseBlocked {
 		t.Fatalf("current = %#v", fx.store.current)
 	}
 }
 
-func TestDualPayoutCarriesObservedActivationFeesIntoTheNextSettlementBoundary(t *testing.T) {
+func TestReferralPayoutReportsBalanceAfterActivationFee(t *testing.T) {
 	fx := newFixture(t)
-	fx.referralRepo.records = []Record{{ID: 9, PeriodStartAt: 30, Amount: "0.25"}}
-	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("3.75")
+	fx.chain.balances["0xsettlement"] = decimal.RequireFromString("2.5")
 	fx.chain.balanceErrors["0xrecipient"] = errors.New("recipient balance unavailable")
-	fx.chain.balanceErrors["0xreferral"] = errors.New("recipient balance unavailable")
 	chain := newPayoutReplayChain(fx.chain, map[string][]payoutReplayStep{
 		"0xrecipient": {{
-			result: exchange.SubmitResult{}, apply: true, activationFee: decimal.NewFromInt(1),
-		}},
-		"0xreferral": {{
 			result: exchange.SubmitResult{}, apply: true, activationFee: decimal.NewFromInt(1),
 		}},
 	})
@@ -422,27 +417,22 @@ func TestDualPayoutCarriesObservedActivationFeesIntoTheNextSettlementBoundary(t 
 	}
 
 	actions := settlementPayoutActions(fx.chain.submittedActions)
-	if len(actions) != 2 || actions[0].Destination != "0xrecipient" ||
-		actions[1].Destination != "0xreferral" {
+	if len(actions) != 1 || actions[0].Destination != "0xrecipient" {
 		t.Fatalf("payout actions = %#v", actions)
 	}
-	if chain.prepareCalls["0xrecipient"] != 1 || chain.prepareCalls["0xreferral"] != 1 {
+	if chain.prepareCalls["0xrecipient"] != 1 {
 		t.Fatalf("prepare calls = %#v", chain.prepareCalls)
 	}
-	if fx.chain.balanceCalls["0xrecipient"] != 0 || fx.chain.balanceCalls["0xreferral"] != 0 {
-		t.Fatalf("recipient balance calls: points=%d referral=%d",
-			fx.chain.balanceCalls["0xrecipient"], fx.chain.balanceCalls["0xreferral"])
+	if fx.chain.balanceCalls["0xrecipient"] != 0 {
+		t.Fatalf("recipient balance calls = %d", fx.chain.balanceCalls["0xrecipient"])
 	}
-	if !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) ||
-		!equalUint64(fx.referralRepo.completedIDs, []uint64{9}) {
-		t.Fatalf("points completed=%v referral completed=%v",
-			fx.repo.completedIDs, fx.referralRepo.completedIDs)
+	if !equalUint64(fx.repo.completedIDs, []uint64{1, 2}) {
+		t.Fatalf("referral completed = %v", fx.repo.completedIDs)
 	}
 	report := onlyReport(t, fx.notifier)
-	if report.target(PayoutKindPointsRebate).Payout.Status != ReportStepSuccess ||
-		report.target(PayoutKindReferral).Payout.Status != ReportStepSuccess ||
+	if report.target(PayoutKindReferral).Payout.Status != ReportStepSuccess ||
 		!report.SettlementBalance.Observed || report.SettlementBalance.Total != "0" {
-		t.Fatalf("dual payout report = %#v", report)
+		t.Fatalf("referral payout report = %#v", report)
 	}
 }
 

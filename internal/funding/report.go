@@ -160,7 +160,7 @@ func newRunReport(
 	network string,
 	builders []string,
 	builderNames map[string]string,
-	settlement, pointsRebateRecipient, referralRecipient string,
+	settlement, referralRecipient string,
 ) RunReport {
 	report := RunReport{
 		Trigger:     trigger,
@@ -173,21 +173,11 @@ func newRunReport(
 			{Key: "snapshot", Label: "数据快照", Status: ReportStepPending},
 			{Key: "rewards", Label: "Reward", Status: ReportStepPending},
 			{Key: "sweep", Label: "资金归集", Status: ReportStepPending},
-			{Key: targetStageKey(PayoutKindPointsRebate, "payout"), Label: "Points Rebate Payout", Status: ReportStepPending},
-			{Key: targetStageKey(PayoutKindPointsRebate, "database"), Label: "Points Rebate 数据库", Status: ReportStepPending},
 			{Key: targetStageKey(PayoutKindReferral, "payout"), Label: "Referral Payout", Status: ReportStepPending},
 			{Key: targetStageKey(PayoutKindReferral, "database"), Label: "Referral 数据库", Status: ReportStepPending},
 			{Key: "finalize", Label: "状态归档", Status: ReportStepPending},
 		},
 		Payouts: []PayoutTargetReport{
-			{
-				Kind: PayoutKindPointsRebate,
-				Payout: PayoutReport{
-					Status: ReportStepPending, Settlement: settlement,
-					Recipient: pointsRebateRecipient,
-				},
-				DatabaseStatus: ReportStepPending,
-			},
 			{
 				Kind: PayoutKindReferral,
 				Payout: PayoutReport{
@@ -547,7 +537,7 @@ func (r *RunReport) reconcileDailyConsolidation() {
 	consolidation.BelowPayout = true
 	consolidation.ShortfallUSDC = shortfall.String()
 	r.addWarning(fmt.Sprintf(
-		"UTC 00:00 Claimable 合计 %s USDC，低于两类数据库 Payout 合计 %s USDC，短缺 %s USDC，请人工核查结算口径",
+		"UTC 00:00 Claimable 合计 %s USDC，低于 Referral Payout %s USDC，短缺 %s USDC，请人工核查结算口径",
 		claimable.String(), payout.String(), shortfall.String(),
 	))
 }

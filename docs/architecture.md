@@ -29,7 +29,7 @@
    nonce 最多提交三次；该 builder 最终失败也不阻断其他 builder。
 8. 将 claim/sweep 结果写回当日文件，状态更新为 `completed`。
 
-零点 claimable 是与两类实际 payout 合计对账的唯一数值基准；claim 接受状态是独立的执行结果。
+零点 claimable 是与实际 Referral Payout 对账的唯一数值基准；claim 接受状态是独立的执行结果。
 某个 builder 的 claimable 查询全部失败时标记为数据缺失；取得稳定余额基线后仍尝试一次 claim，
 以避免漏领实际超过门槛的 Reward。交易所精确确认未达到领取门槛时，本次 claim 记为 skipped；
 但零点数值仍保持未观测，不能伪造为 0，当日也不能得出完整数值对账结论。Claim 在有限观察后仍
@@ -39,18 +39,15 @@
 
 一点任务只处理数据库批次与最终付款：
 
-1. 从 `trasia_points_rebate_funding_record` 冻结全部 `status = 0` records；同时从
-   `trasia_referral_funding_record` 冻结满足 `cycle_type IN (1, 2) AND status = 0` 的 records。
-   两张表均以 `0` 表示 pending、`1` 表示 complete。
-2. 两个 target 分别精确汇总 raw total，并分别执行六位向上取整；数据库 payout total 是两个取整结果
-   之和，不能先合并 raw total 再取整。
-3. 在第一笔发送前连续读取稳定的 settlement `Total/Available`，并按两个 target 的 payout total
-   合计检查资金充足性；不足时一笔也不发送。可能出现的 1 USDC 新地址费用只参与提交后的精确余额
-   判断，不计入数据库 payout total 或零点 Claimable 对账。
-4. 固定按 `PointsRebatePayout`、`ReferralPayout` 的顺序执行。每个 target 都取得并持久化自己的
-   settlement 基线与 payout journal；开始第二笔前还要确认第一笔对应的 settlement 精确余额边界。
-5. 每笔 payout 确认后立即将该 target 冻结的 records 标记完成。第二笔失败不会回滚或重发已经完成的
-   第一笔；非终态错误恢复时从第一个未完成 target 继续，最终 blocked 则停止。
+1. 从 `trasia_referral_funding_record` 冻结满足 `cycle_type IN (1, 2) AND status = 0`
+   的 records；`0` 表示 pending、`1` 表示 complete。
+2. 精确汇总 referral raw total，再执行六位向上取整，得到 payout total。
+3. 发送前连续读取稳定的 settlement `Total/Available`，并按 payout total 检查资金充足性；
+   不足时不发送。可能出现的 1 USDC 新地址费用只参与提交后的精确余额判断，不计入数据库
+   payout total 或零点 Claimable 对账。
+4. 执行 `ReferralPayout`，提交前持久化 settlement 基线与完整 payout journal。
+5. Payout 确认后将冻结的 referral records 标记完成，恢复时不再发送已确认的付款；最终 blocked
+   则停止并等待人工核查。
 6. 读取同一 UTC 日期的零点归集记录，生成最终报告。
 
 一点任务不查询 builder claimable、不 claim、不 sweep。Settlement 不足属于普通错误，调度器
@@ -97,11 +94,9 @@ Spot 查询返回：
 - `Total`：链上 spot 总余额；
 - `Available = Total - Hold`：当前可发送余额。
 
-Builder sweep 金额和 payout 资金充足性使用 `Available`。第一笔 Payout 提交前必须用稳定的
-settlement Available 对两个正金额 target 的 payout total 合计做预检。每个 target
-提交前还必须连续取得
-稳定的 settlement `Total/Available` 基线；journal 保存 settlement 的提交前 total。第二笔基线必须
-与第一笔确认后的精确 settlement 边界一致。
+Builder sweep 金额和 payout 资金充足性使用 `Available`。Referral Payout 提交前必须用稳定的
+settlement Available 对 payout total 做预检。提交前还必须连续取得稳定的 settlement
+`Total/Available` 基线；journal 保存 settlement 的提交前 total。
 
 结果不确定时只观察发送方 settlement，不查询 recipient 余额。Settlement Total 连续两次精确满足
 以下任一边界才确认付款：
@@ -118,20 +113,18 @@ blocked 而不会把数据库 records 标记完成；此时按运维流程人工
 
 ## 5. Records 与金额
 
-两个 target 分别维护 Manifest。Points rebate records 与 referral records 都按
-`period_start_at, id` 排序，referral 的查询、完成与状态复核始终限定 `cycle_type IN (1, 2)`。
-每个 Manifest 独立冻结 records、精确 raw total、六位向上取整后的 payout total、canonical token、
-settlement 和自己的 recipient。Builder 列表属于当前配置，不属于 payout 恢复数据。
+Referral records 按 `period_start_at, id` 排序，查询、完成与状态复核始终限定
+`cycle_type IN (1, 2)`。Manifest 冻结 records、精确 raw total、六位向上取整后的 payout total、
+canonical token、settlement 和 referral recipient。Builder 列表属于当前配置，不属于 payout 恢复数据。
 
-每个 target 都先按 decimal 文本精确汇总，再各自执行
-`ceil(raw_total × 10^6) / 10^6`；aggregate payout 是两个已取整结果之和。负金额归档为
-`failed_validation` 并 fatal 退出；某个 target 零总额不执行链上付款，直接完成该 target 的冻结
-records。两个 target 都无 pending records 时不创建 current 或 history。
+先按 decimal 文本精确汇总，再执行 `ceil(raw_total × 10^6) / 10^6`。负金额归档为
+`failed_validation` 并 fatal 退出；零总额不执行链上付款，直接完成冻结的 records。
+无 pending referral records 时不创建 current 或 history。
 
 ## 6. Payout 持久化边界
 
-两个 Settlement → recipient transfer 是对外资金边界；每个 target 都有相互独立的 at-most-once
-防护，执行顺序固定为 `PointsRebatePayout` 后 `ReferralPayout`。
+Settlement → referral recipient transfer 是对外资金边界，使用持久化 journal 提供
+at-most-once 防护。
 
 发送前验证完整可重放请求与 manifest 一致，然后依次：
 
@@ -155,13 +148,11 @@ Submit；该状态表示唯一一次 exact replay 已授权、可能已发送。
 
 首次观察耗尽后最多重放一次原请求；第二次观察仍无法判断时保存 `blocked`、归档现场、保留 current，
 发送包含首次提交、exact replay 和最终证据的终态报告，然后结束本次任务。系统绝不进行第三次 Submit，
-也绝不构造新请求。若
-`PointsRebatePayout` 已完成而 `ReferralPayout` 失败，前者保持 completed，其数据库 records 已完成，
-恢复不会回滚或重新发送前者。
+也绝不构造新请求。
 
 ## 7. Phase 与恢复
 
-下表适用于当前未完成 target；已完成 target 的 phase 为 `completed`，恢复时直接跳过。
+下表适用于唯一的 referral target；已完成时 phase 为 `completed`，恢复只完成归档与清理。
 
 | Phase | 恢复行为 |
 | --- | --- |
@@ -172,11 +163,10 @@ Submit；该状态表示唯一一次 exact replay 已授权、可能已发送。
 | `payout_confirmed` | 校验 journal、请求和 settlement 边界后，只重试数据库 Complete |
 | ambiguous `blocked` | 保持终态并报告，绝不重发 |
 | 其他 `blocked` | 立即 fatal，等待人工判断 |
-| `completed` | 不再发送、不再回滚，继续下一个 target |
+| `completed` | 不再发送，归档并清理 current |
 
-每个 target 的 MySQL Complete 成功后立即保存其 `completed` phase。两个 target 都 completed 后才
-归档整轮 `completed` 并清理 current。Complete 与 target phase 落盘之间崩溃时，恢复会幂等再次
-Complete；第一笔 completed、第二笔未完成时只继续第二笔。
+MySQL Complete 成功后立即保存 referral target 的 `completed` phase，随后归档整轮
+`completed` 并清理 current。Complete 与 phase 落盘之间崩溃时，恢复会幂等再次 Complete。
 
 ## 8. 本地状态
 
@@ -191,7 +181,9 @@ data/
 ```
 
 目录权限 `0700`，文件 `0600`。`current` 与 backup 使用 checksummed envelope、原子替换、
-`fsync` 和 backup 恢复协议。
+`fsync` 和 backup 恢复协议。Payout envelope 使用 schema 3，RunState 只接受一个 referral target。
+旧 schema（包括双任务 schema 2）不自动转换；升级前须用旧版本完成或核对 current 与 backup 的
+所有资金状态，保留 history。不能删除未解决的快照来绕过版本拒绝，详见运维升级流程。
 
 每日归集记录供报告与人工检阅，不参与 payout at-most-once 协议。同一零点任务先写
 `claimables_captured`，完成后更新为 `completed`；进程若在两次写入之间中断，一点报告仍可读
@@ -206,8 +198,8 @@ data/
 服务端原因和错误链上下文，同时对密码、私钥、token、URL userinfo 等高风险值脱敏。
 
 最终 funding report 只在 UTC 01:00 funding 结束时发送，内容包括：各 builder 的零点
-claimable 与 claim/sweep 结果、两个 target 各自的 raw/payout total 和状态、完整 claimable 合计与
-两类实际 payout 合计的差额、各笔首次提交是否发生、是否发生一次 exact replay、最终发送方确认依据
+claimable 与 claim/sweep 结果、Referral 的 raw/payout total 和状态、完整 claimable 合计与
+Referral Payout 的差额、首次提交是否发生、是否发生一次 exact replay、最终发送方确认依据
 或 blocked 结果、settlement 结束余额、rate limit、告警与处置
 建议。正数 payout 确认后，结束余额必须连续两次
 达到 `total before - amount` 或 `total before - amount - 1 USDC`，且两次 available 也相同，才可标记
@@ -217,17 +209,17 @@ Payout 结果本身仍不确定时同样不再追加一次普通余额查询，�
 对本轮已提交或从持久化 phase 判断为可能已提交的账户，若首次 Rate Limit 落在告警阈值附近，
 同样延迟重查；仍无法证明动作后计数可见时按 warning 展示最低观测值，不标成健康终值。
 
-全部 builder 的零点 claimable 都成功捕获时才做数值对账；合计低于两类实际 payout 之和时报告为 warning，
+全部 builder 的零点 claimable 都成功捕获时才做数值对账；合计低于实际 Referral Payout 时报告为 warning，
 但 settlement 余额充足时仍正常付款。Claim 不确定单独告警，不改变已冻结的 claimable 口径。
 `--run-on-start` 立即执行一点侧的数据库 payout，不补做错过的零点归集。
 
 ## 10. 安全不变量
 
-1. 每个 target 最多首次 Submit 一次并 exact replay 同一请求一次，且固定先 PointsRebate、后 Referral。
-2. 第一笔发送前必须确认 settlement Available 足以覆盖两个 target 已分别取整后的 payout 合计。
+1. 每轮仅处理一个 referral target，最多首次 Submit 一次并 exact replay 同一请求一次。
+2. 发送前必须确认 settlement Available 足以覆盖六位向上取整后的 referral payout。
 3. 每笔完整 payout 请求和“可能已发送”边界都在该笔发送前持久化。
 4. Exact replay 必须复用完全相同的 request body、nonce 与签名；禁止构造新请求或第三次 Submit。
-5. 第二笔失败不得回滚、重置数据库状态或重发已完成的第一笔。
+5. Payout 确认后只完成数据库 records 与归档，不能因数据库故障重发链上付款。
 6. UTC 01:00 及其重试、恢复路径都不得执行 builder claim 或 sweep。
 7. UTC 00:00 与 `--consolidate-only` 使用同一内部归集实现。
 8. `--consolidate-only` 不得读写零点每日归集记录。

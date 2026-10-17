@@ -9,7 +9,9 @@ import (
 	"builder-code-bot/internal/funding"
 )
 
-const schemaVersion = 2
+// Version 3 only supports referral payouts. Older snapshots must be reconciled
+// by their original version so no legacy payout journal is silently discarded.
+const schemaVersion = 3
 
 type envelope struct {
 	SchemaVersion int              `json:"schema_version"`

@@ -10,11 +10,10 @@ import (
 )
 
 const (
-	builderOneAddress         = "0x1111111111111111111111111111111111111111"
-	builderTwoAddress         = "0x2222222222222222222222222222222222222222"
-	settlementAddress         = "0x3333333333333333333333333333333333333333"
-	referralPayoutAddress     = "0x4444444444444444444444444444444444444444"
-	pointsRebatePayoutAddress = "0x5555555555555555555555555555555555555555"
+	builderOneAddress     = "0x1111111111111111111111111111111111111111"
+	builderTwoAddress     = "0x2222222222222222222222222222222222222222"
+	settlementAddress     = "0x3333333333333333333333333333333333333333"
+	referralPayoutAddress = "0x4444444444444444444444444444444444444444"
 )
 
 func TestLoadFileRejectsUnknownField(t *testing.T) {
@@ -41,9 +40,6 @@ func TestLoadFileDecodesMultipleBuildersAndSeparateSettlement(t *testing.T) {
 	}
 	if cfg.ReferralPayout.RecipientAddress != referralPayoutAddress {
 		t.Fatalf("ReferralPayout.RecipientAddress = %q", cfg.ReferralPayout.RecipientAddress)
-	}
-	if cfg.PointsRebatePayout.RecipientAddress != pointsRebatePayoutAddress {
-		t.Fatalf("PointsRebatePayout.RecipientAddress = %q", cfg.PointsRebatePayout.RecipientAddress)
 	}
 	if cfg.MySQL.Password.Reveal() != "" || cfg.Signing.DecryptPassword.Reveal() != "" {
 		t.Fatal("empty passwords must be accepted and preserved")
@@ -168,19 +164,9 @@ func TestLoadFileRejectsInvalidPayoutRecipientAddresses(t *testing.T) {
 			wantError: "referral payout recipient address must differ from settlement address",
 		},
 		{
-			name:    "points rebate payout uses settlement",
-			address: pointsRebatePayoutAddress, replacement: settlementAddress,
-			wantError: "points rebate payout recipient address must differ from settlement address",
-		},
-		{
 			name:    "referral payout uses builder",
 			address: referralPayoutAddress, replacement: builderOneAddress,
 			wantError: "referral payout recipient address must differ from builder addresses",
-		},
-		{
-			name:    "points rebate payout uses builder",
-			address: pointsRebatePayoutAddress, replacement: builderOneAddress,
-			wantError: "points rebate payout recipient address must differ from builder addresses",
 		},
 		{
 			name:    "referral payout uses zero address",
@@ -188,19 +174,9 @@ func TestLoadFileRejectsInvalidPayoutRecipientAddresses(t *testing.T) {
 			wantError: "referral payout recipient address must not be the zero address",
 		},
 		{
-			name:    "points rebate payout uses zero address",
-			address: pointsRebatePayoutAddress, replacement: zeroAddress,
-			wantError: "points rebate payout recipient address must not be the zero address",
-		},
-		{
 			name:    "referral payout uses malformed address",
 			address: referralPayoutAddress, replacement: "not-an-address",
 			wantError: "referral payout recipient address must match",
-		},
-		{
-			name:    "points rebate payout uses malformed address",
-			address: pointsRebatePayoutAddress, replacement: "not-an-address",
-			wantError: "points rebate payout recipient address must match",
 		},
 	}
 
@@ -215,11 +191,14 @@ func TestLoadFileRejectsInvalidPayoutRecipientAddresses(t *testing.T) {
 	}
 }
 
-func TestLoadFileRejectsDuplicatePayoutRecipientAddresses(t *testing.T) {
-	content := strings.Replace(validConfig(), pointsRebatePayoutAddress, referralPayoutAddress, 1)
+func TestLoadFileRejectsRetiredPointsRebatePayoutSection(t *testing.T) {
+	content := validConfig() + `
+[points_rebate_payout]
+recipient_address = "0x5555555555555555555555555555555555555555"
+`
 	_, err := LoadFile(writeConfig(t, content))
-	if err == nil || !strings.Contains(err.Error(), "payout recipient addresses must differ") {
-		t.Fatalf("LoadFile() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "points_rebate_payout") {
+		t.Fatalf("LoadFile() error = %v, want unknown points_rebate_payout section", err)
 	}
 }
 
@@ -329,9 +308,6 @@ encrypted_private_key = "settlement-ciphertext"
 
 [referral_payout]
 recipient_address = "` + referralPayoutAddress + `"
-
-[points_rebate_payout]
-recipient_address = "` + pointsRebatePayoutAddress + `"
 
 [aws]
 region = "ap-northeast-1"

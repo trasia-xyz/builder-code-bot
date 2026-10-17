@@ -13,19 +13,6 @@ import (
 const (
 	completeBatchSize = 500
 
-	pointsRebateListPendingSQL = `SELECT id, period_start_at, amount
-FROM trasia_points_rebate_funding_record
-WHERE status = 0
-ORDER BY period_start_at, id`
-
-	pointsRebateUpdatePrefix = `UPDATE trasia_points_rebate_funding_record
-SET status = 1
-WHERE status = 0 AND id IN`
-
-	pointsRebateStatusPrefix = `SELECT id, status
-FROM trasia_points_rebate_funding_record
-WHERE id IN`
-
 	referralListPendingSQL = `SELECT id, period_start_at, amount
 FROM trasia_referral_funding_record
 WHERE cycle_type IN (1, 2) AND status = 0
@@ -49,13 +36,6 @@ type repositoryQueries struct {
 }
 
 var (
-	pointsRebateQueries = repositoryQueries{
-		listPendingSQL:    pointsRebateListPendingSQL,
-		updatePrefix:      pointsRebateUpdatePrefix,
-		statusPrefix:      pointsRebateStatusPrefix,
-		listOperation:     "list_pending",
-		completeOperation: "complete_funding_records",
-	}
 	referralQueries = repositoryQueries{
 		listPendingSQL:    referralListPendingSQL,
 		updatePrefix:      referralUpdatePrefix,
@@ -69,17 +49,6 @@ type Repository struct {
 	db      *sql.DB
 	retryer Retryer
 	queries repositoryQueries
-}
-
-// NewRepository preserves the original Points Rebate repository constructor.
-// New code that assembles both payout targets should use the two explicit
-// constructors below.
-func NewRepository(db *sql.DB, retryer Retryer) *Repository {
-	return NewPointsRebateRepository(db, retryer)
-}
-
-func NewPointsRebateRepository(db *sql.DB, retryer Retryer) *Repository {
-	return newRepository(db, retryer, pointsRebateQueries)
 }
 
 func NewReferralRepository(db *sql.DB, retryer Retryer) *Repository {

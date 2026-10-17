@@ -82,7 +82,7 @@ func validateConfirmedPayoutState(target *PayoutTargetState) error {
 }
 
 func validateTargetProgress(state *RunState, active *PayoutTargetState) error {
-	resolved, activeIndex, err := state.activePayoutTarget()
+	resolved, _, err := state.activePayoutTarget()
 	if err != nil {
 		return err
 	}
@@ -101,47 +101,6 @@ func validateTargetProgress(state *RunState, active *PayoutTargetState) error {
 		case PhasePayoutReplaying:
 			if active.Payout.SubmitAttempts != 2 {
 				return fmt.Errorf("payout replaying requires exactly two reserved submit attempts")
-			}
-		}
-	}
-	for index := range state.Targets {
-		target := &state.Targets[index]
-		switch {
-		case index < activeIndex:
-			if target.Phase != PhaseCompleted {
-				return fmt.Errorf("prior payout target %s is not complete", target.Kind)
-			}
-			amount, amountErr := decimal.NewFromString(target.Manifest.PayoutTotal)
-			if amountErr != nil || amount.IsNegative() {
-				return fmt.Errorf("prior payout target %s amount is invalid", target.Kind)
-			}
-			if amount.IsPositive() {
-				if err := validateConfirmedPayoutState(target); err != nil {
-					return fmt.Errorf("validate completed %s payout: %w", target.Kind, err)
-				}
-			}
-		case index > activeIndex:
-			if target.Phase != PhasePrepared || target.Payout != nil ||
-				target.BlockedReason != "" || target.ConfirmationEvidence != "" {
-				return fmt.Errorf("future payout target %s has advanced unexpectedly", target.Kind)
-			}
-		}
-	}
-
-	if active.Kind == PayoutKindReferral && active.Payout != nil {
-		points := &state.Targets[0]
-		pointsAmount, pointsErr := decimal.NewFromString(points.Manifest.PayoutTotal)
-		if pointsErr != nil {
-			return fmt.Errorf("parse points rebate payout total: %w", pointsErr)
-		}
-		if pointsAmount.IsPositive() {
-			pointsBefore, beforeErr := decimal.NewFromString(points.Payout.TotalBefore)
-			referralBefore, referralErr := decimal.NewFromString(active.Payout.TotalBefore)
-			if beforeErr != nil || referralErr != nil ||
-				!matchesConfirmedPayoutBoundary(
-					referralBefore, pointsBefore, pointsAmount, points.ConfirmationEvidence,
-				) {
-				return fmt.Errorf("referral payout does not match points rebate settlement boundary")
 			}
 		}
 	}

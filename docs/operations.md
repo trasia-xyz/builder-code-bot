@@ -19,9 +19,6 @@ chmod 0600 config.toml
 ```
 
 ```toml
-[points_rebate_payout]
-recipient_address = "0x..."
-
 [referral_payout]
 recipient_address = "0x..."
 ```
@@ -31,9 +28,17 @@ recipient_address = "0x..."
 - 不要把私钥、密码或生产配置写入日志、邮件或 shell history。
 - Builder、settlement 均为我方账户；settlement **必须由本服务独占出账**，禁止人工或其他程序
   从该账户发送 spot USDC。
-- 使用 `[points_rebate_payout]` 与 `[referral_payout]` 分别配置两类 recipient；旧 `[payout]`
-  配置不兼容，strict TOML 会拒绝启动。
-- 两个 Recipient 都必须为非零地址，彼此不同，且不得与任一 builder 或 settlement 相同。
+- 使用 `[referral_payout]` 配置 recipient；strict TOML 会拒绝未知配置字段。
+- Referral recipient 必须为非零地址，且不得与任一 builder 或 settlement 相同。
+
+## 从双任务版本升级
+
+Points rebate 已结束，新版本仅处理 referral。删除配置中的整个 `[points_rebate_payout]` 段，
+只保留 `[referral_payout]`，否则 strict TOML 会拒绝启动。
+
+Payout 状态使用 schema 3，拒绝旧 schema，不提供自动迁移。升级前用旧版本完成或核对
+`current.json` 与 `current.json.bak` 的资金和数据库状态，再停服务并备份完整 `data/`。
+保留 history 与每日归集记录，禁止直接删除未解决的快照来绕过版本错误。
 
 ## 启动
 
@@ -61,7 +66,7 @@ recipient_address = "0x..."
 | 时间 | 任务 |
 | --- | --- |
 | UTC 00:00（北京 08:00） | Claim + 归集；失败不阻断一点 |
-| UTC 01:00（北京 09:00） | 冻结两类 pending records + 依次执行 PointsRebatePayout、ReferralPayout |
+| UTC 01:00（北京 09:00） | 冻结 cycle-1/2 pending referral records + 执行 ReferralPayout |
 
 一点普通错误约每分钟重试，最多 5 次；fatal 或重试耗尽则进程退出。一点重试只检查 settlement
 与 payout，不执行 builder 动作。
@@ -97,8 +102,8 @@ data/
 | 🟠 | 普通失败，仍有自动重试 |
 | 🔴 | fatal、重试耗尽，或需人工核查 payout |
 
-🟠 为精简重试通知；其余终态含完整明细。报告分别显示 PointsRebate 与 Referral，并用两类实际
-payout total 的合计与零点 claimable 对账。每个 target 还显示首次提交、是否发生一次 exact replay，
+🟠 为精简重试通知；其余终态含完整明细。报告显示 Referral Payout，并用六位向上取整后的
+payout total 与零点 claimable 对账，还显示首次提交、是否发生一次 exact replay，
 以及发送方精确减少 amount、精确减少 amount + 1 USDC 或最终 blocked 的结果。Claimable 短缺只升
 warning，不阻止 settlement 充足时的 payout。
 
@@ -107,25 +112,24 @@ warning，不阻止 settlement 充足时的 payout。
 ### Settlement 不足
 
 单次一点任务会先有限重查并要求连续两个完整余额样本稳定，避免刚入账但 `/info` 尚未刷新的旧值
-直接判定不足或成为付款基线。第一笔发送前按两个正金额 target 各自六位向上取整后的 payout total
-合计检查 Available；合计不足时一笔也不发送。可能出现的 1 USDC 新地址费用只用于提交后的精确余额
+直接判定不足或成为付款基线。发送前按 referral 六位向上取整后的 payout total
+检查 Available；不足时不发送。可能出现的 1 USDC 新地址费用只用于提交后的精确余额
 判断，不加入数据库 payout total 或零点对账。每笔发送方 settlement 基线同样必须稳定。仍不足时保留
 `prepared` current 并由调度器自动重试。重试耗尽后进程退出，current 仍在，修好余额后重启即可
 继续。
 
 ### 明确成功 / MySQL 未完成
 
-某个 target 状态为 `payout_confirmed`：先校验其持久化 journal、请求和 settlement 付款前边界，
-再只重试对应数据库表的 Complete，**不会**再发该笔链上 payout。每笔确认后会立即完成对应表；
-PointsRebate 已 completed、Referral 失败时，前者保持完成且不会回滚或重发。校验失败会保留 current
-并停止，不会完成当前 target 的 records。
+Referral target 状态为 `payout_confirmed`：先校验持久化 journal、请求和 settlement 付款前边界，
+再只重试冻结 referral records 的 Complete，**不会**再发链上 payout。校验失败会保留 current
+并停止，不会完成 records。
 
 ### 明确拒绝
 
-只有首次提交在尚未出现任何不确定结果时返回的明确拒绝，才能按本节处理。当前 target 归档
-`rejected`、清理 current、fatal 退出。当前 target records 仍 pending，且已知
-未付款；若拒绝发生在第二笔，第一笔 records 已完成且不得回滚或重发。修复原因后再按数据库状态
-重新运行。Exact replay 返回的 duplicate nonce 或其他 err 不能反证首次请求未执行，必须按下一节处理。
+只有首次提交在尚未出现任何不确定结果时返回的明确拒绝，才能按本节处理。本轮归档
+`rejected`、清理 current、fatal 退出。Referral records 仍 pending，且已知未付款。
+修复原因后再按数据库状态重新运行。Exact replay 返回的 duplicate nonce 或其他 err 不能反证
+首次请求未执行，必须按下一节处理。
 
 ### 响应不确定 → exact replay 一次 → blocked
 
@@ -137,9 +141,8 @@ PointsRebate 已 completed、Referral 失败时，前者保持完成且不会回
 相同的请求，保持相同 nonce 与签名，绝不重新 Prepare。查询样本不足或出现任何其他余额变化时直接
 blocked，不重放。重放返回 `Invalid nonce: duplicate nonce ...`、再次超时或响应仍不明确时，只再观察一次
 settlement；仍无法确认即进入最终 blocked，发送终态报告并结束本次任务。Blocked 后禁止第三次 Submit，
-也禁止生成新 nonce。根据 current 中该 target 的 `kind`、manifest、recipient、amount、nonce、request
-hash、settlement total before、首次提交与 exact replay 记录和时间人工核查；其他已 completed target
-必须保持不动：
+也禁止生成新 nonce。根据 current 中 referral target 的 manifest、recipient、amount、nonce、request
+hash、settlement total before、首次提交与 exact replay 记录和时间人工核查：
 
 - **已付款**：停机状态下幂等完成 manifest 中 records，再归档并移走 current/backup；
 - **未付款**：保留现场归档后，停机状态下移走 current/backup，再允许重新运行；

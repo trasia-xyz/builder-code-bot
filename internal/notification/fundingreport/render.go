@@ -527,10 +527,6 @@ func stageLabel(key string) string {
 		return "Reward"
 	case "sweep":
 		return "资金归集"
-	case "points_rebate_payout":
-		return "Points Rebate Payout"
-	case "points_rebate_database":
-		return "Points Rebate 数据库"
 	case "referral_payout":
 		return "Referral Payout"
 	case "referral_database":
@@ -544,8 +540,6 @@ func stageLabel(key string) string {
 
 func payoutName(kind funding.PayoutKind) string {
 	switch kind {
-	case funding.PayoutKindPointsRebate:
-		return "Points Rebate Payout"
 	case funding.PayoutKindReferral:
 		return "Referral Payout"
 	default:
@@ -841,8 +835,8 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
     <tr><td style="padding:0 16px 11px;color:#64748b;">完成时间</td><td style="padding:0 16px 11px;">{{.CompletedAt}}</td></tr>
     <tr><td style="padding:0 16px 11px;color:#64748b;">{{.TotalLabel}}</td><td style="padding:0 16px 11px;font-weight:700;">{{.Total}} USDC</td></tr>
     <tr><td style="padding:0 16px 11px;color:#64748b;">Builder 覆盖</td><td style="padding:0 16px 11px;">{{.Coverage}}</td></tr>
-	    <tr><td style="padding:0 16px 11px;color:#64748b;">本轮两类数据库 Payout 合计</td><td style="padding:0 16px 11px;font-weight:700;">{{.PayoutTotal}} USDC</td></tr>
-	    <tr><td style="padding:0 16px 13px;color:#64748b;">对账差额（Claimable - Payout 合计）</td><td style="padding:0 16px 13px;font-weight:700;color:{{.DifferenceColor}};">{{.Difference}} USDC</td></tr>
+	    <tr><td style="padding:0 16px 11px;color:#64748b;">本轮 Referral Payout</td><td style="padding:0 16px 11px;font-weight:700;">{{.PayoutTotal}} USDC</td></tr>
+	    <tr><td style="padding:0 16px 13px;color:#64748b;">对账差额（Claimable - Referral Payout）</td><td style="padding:0 16px 13px;font-weight:700;color:{{.DifferenceColor}};">{{.Difference}} USDC</td></tr>
   </table>
   {{if .Builders}}
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:12px;font-size:13px;border-collapse:collapse;">

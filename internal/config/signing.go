@@ -85,20 +85,6 @@ func (cfg *Config) normalizeAndValidateAccounts() error {
 	); err != nil {
 		return err
 	}
-	if err := normalizeAndValidatePayoutRecipient(
-		"points rebate payout",
-		&cfg.PointsRebatePayout,
-		cfg.Settlement.Address,
-		addresses,
-	); err != nil {
-		return err
-	}
-	if strings.EqualFold(
-		cfg.ReferralPayout.RecipientAddress,
-		cfg.PointsRebatePayout.RecipientAddress,
-	) {
-		return fmt.Errorf("referral and points rebate payout recipient addresses must differ")
-	}
 	return nil
 }
 

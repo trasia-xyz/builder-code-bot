@@ -33,8 +33,7 @@ const (
 	TriggerRunOnStart       Trigger = "run_on_start"
 	TriggerConsolidateOnly  Trigger = "consolidate_only"
 
-	PayoutKindPointsRebate PayoutKind = "points_rebate"
-	PayoutKindReferral     PayoutKind = "referral"
+	PayoutKindReferral PayoutKind = "referral"
 )
 
 type Manifest struct {
@@ -62,9 +61,8 @@ type PayoutJournal struct {
 	SubmitAttempts int                     `json:"submit_attempts"`
 }
 
-// PayoutTargetState freezes one database-backed payout independently from the
-// other target. Record IDs are only meaningful within the target repository,
-// so the kind is persisted alongside the manifest and recovery journal.
+// PayoutTargetState freezes the referral payout and its recovery journal.
+// The persisted kind prevents retired payout targets from being resumed.
 type PayoutTargetState struct {
 	Kind                 PayoutKind     `json:"kind"`
 	Phase                Phase          `json:"phase"`
@@ -91,9 +89,8 @@ func (s *RunState) activePayoutTarget() (*PayoutTargetState, int, error) {
 	if s == nil {
 		return nil, -1, fmt.Errorf("funding run state is nil")
 	}
-	if len(s.Targets) != 2 || s.Targets[0].Kind != PayoutKindPointsRebate ||
-		s.Targets[1].Kind != PayoutKindReferral {
-		return nil, -1, fmt.Errorf("funding payout targets are missing or out of order")
+	if len(s.Targets) != 1 || s.Targets[0].Kind != PayoutKindReferral {
+		return nil, -1, fmt.Errorf("funding run must contain only the referral payout target")
 	}
 	for index := range s.Targets {
 		if s.Targets[index].Phase != PhaseCompleted {

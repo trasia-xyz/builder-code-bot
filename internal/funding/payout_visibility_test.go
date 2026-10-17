@@ -39,10 +39,10 @@ func TestUncertainPayoutRequiresConsecutiveExpectedPostBalance(t *testing.T) {
 	if chain.calls != 5 {
 		t.Fatalf("settlement balance calls = %d, want 5", chain.calls)
 	}
-	pointsPayout := report.target(PayoutKindPointsRebate).Payout
-	if pointsPayout.Status != ReportStepSuccess ||
-		pointsPayout.ConfirmationEvidence != "settlement_balance_decreased" {
-		t.Fatalf("payout report = %#v", pointsPayout)
+	referralPayout := report.target(PayoutKindReferral).Payout
+	if referralPayout.Status != ReportStepSuccess ||
+		referralPayout.ConfirmationEvidence != "settlement_balance_decreased" {
+		t.Fatalf("payout report = %#v", referralPayout)
 	}
 	if len(fx.chain.events) != 0 {
 		t.Fatalf("uncertain observation submitted chain action: %v", fx.chain.events)
@@ -235,7 +235,7 @@ func payoutVisibilityState(
 ) (*RunState, *RunReport) {
 	t.Helper()
 	state := fx.positiveState(t, phase)
-	target := testTarget(t, &state, PayoutKindPointsRebate)
+	target := testTarget(t, &state, PayoutKindReferral)
 	target.Payout = &PayoutJournal{
 		Prepared: validPayout(t, state, 901), TotalBefore: totalBefore, SubmitAttempts: 1,
 	}
@@ -243,7 +243,7 @@ func payoutVisibilityState(
 	report := newRunReport(
 		fx.clock.now, state.Trigger, ReportExecution{}, fx.orchestrator.network,
 		fx.orchestrator.builders, fx.orchestrator.builderNames,
-		target.Manifest.Settlement, target.Manifest.Recipient, "0xreferral",
+		target.Manifest.Settlement, target.Manifest.Recipient,
 	)
 	report.Outcome = "completed"
 	report.syncState(&state)

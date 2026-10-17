@@ -26,9 +26,9 @@ func TestStoreLoadReturnsNilWhenNoSnapshotExists(t *testing.T) {
 	}
 }
 
-func TestEnvelopeSchemaVersionRemainsTwo(t *testing.T) {
-	if schemaVersion != 2 {
-		t.Fatalf("schemaVersion = %d, want 2", schemaVersion)
+func TestEnvelopeSchemaVersionIsThree(t *testing.T) {
+	if schemaVersion != 3 {
+		t.Fatalf("schemaVersion = %d, want 3", schemaVersion)
 	}
 }
 
@@ -214,14 +214,50 @@ func TestStoreRejectsLegacySchemaVersionOne(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsLegacyDualPayoutSchemaWithoutChangingSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	legacy := testRunState(t, "legacy-dual-payout")
+	legacy.Targets = append([]funding.PayoutTargetState{{
+		Kind: funding.PayoutKind("points_rebate"), Phase: funding.PhasePayoutSubmitting,
+		Manifest: legacy.Targets[0].Manifest,
+		Payout:   &funding.PayoutJournal{TotalBefore: "10", SubmitAttempts: 1},
+	}}, legacy.Targets...)
+	snapshots := make(map[string][]byte)
+	for _, name := range []string{currentFilename, backupFilename} {
+		path := filepath.Join(dir, name)
+		writeTestEnvelopeVersion(t, path, legacy, 2)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshots[path] = data
+	}
+
+	store := NewStore(dir)
+	if got, err := load(context.Background(), store); err == nil || got != nil ||
+		!strings.Contains(err.Error(), "unsupported state schema version 2") {
+		t.Fatalf("Load() = %#v, %v; want legacy schema rejection", got, err)
+	}
+	if err := store.Save(context.Background(), testRunState(t, "replacement")); err == nil ||
+		!strings.Contains(err.Error(), "unsupported state schema version 2") {
+		t.Fatalf("Save() error = %v; want legacy snapshot protection", err)
+	}
+	for path, want := range snapshots {
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("legacy snapshot %s was changed: %v", path, err)
+		}
+	}
+}
+
 func TestStoreRejectsFutureSchemaVersion(t *testing.T) {
 	dir := t.TempDir()
 	state := testRunState(t, "future")
 	path := filepath.Join(dir, "current.json")
-	writeTestEnvelopeVersion(t, path, state, 3)
+	writeTestEnvelopeVersion(t, path, state, 4)
 
 	if got, err := load(context.Background(), NewStore(dir)); err == nil || got != nil ||
-		!strings.Contains(err.Error(), "unsupported state schema version 3") {
+		!strings.Contains(err.Error(), "unsupported state schema version 4") {
 		t.Fatalf("Load() = %#v, %v", got, err)
 	}
 }
@@ -318,9 +354,8 @@ func TestStoreArchivesBeforeClear(t *testing.T) {
 	if saved.State.RunID != state.RunID {
 		t.Fatalf("archived run ID = %q, want %q", saved.State.RunID, state.RunID)
 	}
-	if saved.SchemaVersion != schemaVersion || len(saved.State.Targets) != 2 ||
-		saved.State.Targets[0].Kind != funding.PayoutKindPointsRebate ||
-		saved.State.Targets[1].Kind != funding.PayoutKindReferral {
+	if saved.SchemaVersion != schemaVersion || len(saved.State.Targets) != 1 ||
+		saved.State.Targets[0].Kind != funding.PayoutKindReferral {
 		t.Fatalf("archived envelope targets = %#v", saved)
 	}
 	loaded, exists, err := loadSnapshot(archive)
@@ -388,9 +423,9 @@ func TestStoreTerminalArchiveRemainsEnvelopeReadable(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
 	state := testRunState(t, "terminal")
-	state.Targets[1].Phase = funding.PhaseBlocked
-	state.Targets[1].BlockedReason = "referral record validation failed"
-	state.Targets[1].Manifest = funding.Manifest{
+	state.Targets[0].Phase = funding.PhaseBlocked
+	state.Targets[0].BlockedReason = "referral record validation failed"
+	state.Targets[0].Manifest = funding.Manifest{
 		Records: []funding.Record{{ID: 1, Amount: "-0.01"}}, RawTotal: "unavailable",
 		PayoutTotal: "unavailable", Settlement: "0xSettlement", Recipient: "0xReferralRecipient",
 	}
@@ -399,11 +434,11 @@ func TestStoreTerminalArchiveRemainsEnvelopeReadable(t *testing.T) {
 	}
 	path := filepath.Join(dir, "history", "2026-07-11-terminal-failed_validation.json")
 	loaded, exists, err := loadSnapshot(path)
-	if err != nil || !exists || loaded == nil || len(loaded.Targets) != 2 ||
-		loaded.Targets[1].Kind != funding.PayoutKindReferral ||
-		loaded.Targets[1].Phase != funding.PhaseBlocked ||
-		len(loaded.Targets[1].Manifest.Records) != 1 ||
-		loaded.Targets[1].Manifest.Records[0].ID != 1 {
+	if err != nil || !exists || loaded == nil || len(loaded.Targets) != 1 ||
+		loaded.Targets[0].Kind != funding.PayoutKindReferral ||
+		loaded.Targets[0].Phase != funding.PhaseBlocked ||
+		len(loaded.Targets[0].Manifest.Records) != 1 ||
+		loaded.Targets[0].Manifest.Records[0].ID != 1 {
 		t.Fatalf("loadSnapshot() = %#v, %v, %v", loaded, exists, err)
 	}
 }
@@ -442,14 +477,6 @@ type testEnvelope struct {
 
 func testRunState(t *testing.T, runID string) funding.RunState {
 	t.Helper()
-	pointsRebateManifest, err := funding.BuildManifest(funding.ManifestInput{
-		Records:    []funding.Record{{ID: 1, PeriodStartAt: 1, Amount: "0.000000000000000000"}},
-		Settlement: "0xSettlement",
-		Recipient:  "0xPointsRebateRecipient",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	referralManifest, err := funding.BuildManifest(funding.ManifestInput{
 		Records:    []funding.Record{{ID: 2, PeriodStartAt: 2, Amount: "0.000000000000000000"}},
 		Settlement: "0xSettlement",
@@ -462,10 +489,6 @@ func testRunState(t *testing.T, runID string) funding.RunState {
 	return funding.RunState{
 		RunID: runID, Trigger: funding.TriggerUTC, UTCDate: "2026-07-11",
 		Targets: []funding.PayoutTargetState{
-			{
-				Kind: funding.PayoutKindPointsRebate, Phase: funding.PhaseCompleted,
-				Manifest: pointsRebateManifest,
-			},
 			{
 				Kind: funding.PayoutKindReferral, Phase: funding.PhasePrepared,
 				Manifest: referralManifest,

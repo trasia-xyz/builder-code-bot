@@ -57,10 +57,10 @@ func TestFinalBalanceObservationRequiresSameBoundaryTwice(t *testing.T) {
 	report := newRunReport(
 		fx.clock.now, TriggerUTC, ReportExecution{}, "mainnet",
 		fx.orchestrator.builders, fx.orchestrator.builderNames,
-		"0xsettlement", "0xrecipient", "0xreferral",
+		"0xsettlement", "0xrecipient",
 	)
 	report.token = cloneToken(&fx.chain.token)
-	report.target(PayoutKindPointsRebate).Payout = PayoutReport{
+	report.target(PayoutKindReferral).Payout = PayoutReport{
 		Status: ReportStepSuccess, Amount: "1", SettlementTotalBefore: "3",
 	}
 	fx.chain.balanceSequence["0xsettlement"] = []info.SpotBalanceAmounts{
@@ -81,7 +81,6 @@ func TestFinalBalanceObservationRequiresSameBoundaryTwice(t *testing.T) {
 func TestRunReportSyncStateRecordsExactReplayAndFinalBlocked(t *testing.T) {
 	t.Parallel()
 	state := RunState{Targets: []PayoutTargetState{
-		{Kind: PayoutKindPointsRebate, Phase: PhaseCompleted},
 		{
 			Kind: PayoutKindReferral, Phase: PhaseBlocked,
 			BlockedReason: uncertainPayoutBlockedReasonPrefix + " after exact replay",
@@ -93,7 +92,7 @@ func TestRunReportSyncStateRecordsExactReplayAndFinalBlocked(t *testing.T) {
 	}}
 	report := newRunReport(
 		fixedClock{}.Now(), TriggerUTC, ReportExecution{}, "mainnet",
-		nil, nil, "0xsettlement", "0xpoints", "0xreferral",
+		nil, nil, "0xsettlement", "0xreferral",
 	)
 
 	report.syncState(&state)

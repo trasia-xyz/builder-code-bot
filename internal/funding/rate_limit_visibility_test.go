@@ -127,11 +127,10 @@ func TestRecoveredPayoutRetainsRateLimitVisibilityBoundary(t *testing.T) {
 	state := &RunState{
 		Targets: []PayoutTargetState{
 			{
-				Kind: PayoutKindPointsRebate, Phase: PhasePayoutSubmitting,
+				Kind: PayoutKindReferral, Phase: PhasePayoutSubmitting,
 				Manifest: Manifest{Settlement: "0xsettlement"},
 				Payout:   &PayoutJournal{},
 			},
-			{Kind: PayoutKindReferral, Phase: PhasePrepared},
 		},
 	}
 	markRecoveredPayoutSubmission(&fx.report, state, &state.Targets[0], StateLoadMetadata{})
@@ -148,16 +147,15 @@ func TestOnlyBackupPreparedPayoutMayHaveBeenSubmitted(t *testing.T) {
 	state := &RunState{
 		Targets: []PayoutTargetState{
 			{
-				Kind: PayoutKindPointsRebate, Phase: PhasePayoutPrepared,
+				Kind: PayoutKindReferral, Phase: PhasePayoutPrepared,
 				Manifest: Manifest{Settlement: "0xsettlement"},
 				Payout:   &PayoutJournal{},
 			},
-			{Kind: PayoutKindReferral, Phase: PhasePrepared},
 		},
 	}
 	primary := newRunReport(
 		time.Unix(0, 0), TriggerUTC, ReportExecution{}, "mainnet",
-		nil, nil, "0xsettlement", "0xrecipient", "0xreferral",
+		nil, nil, "0xsettlement", "0xrecipient",
 	)
 	markRecoveredPayoutSubmission(&primary, state, &state.Targets[0], StateLoadMetadata{})
 	if primary.submitted("0xsettlement") {
@@ -165,7 +163,7 @@ func TestOnlyBackupPreparedPayoutMayHaveBeenSubmitted(t *testing.T) {
 	}
 	backup := newRunReport(
 		time.Unix(0, 0), TriggerUTC, ReportExecution{}, "mainnet",
-		nil, nil, "0xsettlement", "0xrecipient", "0xreferral",
+		nil, nil, "0xsettlement", "0xrecipient",
 	)
 	markRecoveredPayoutSubmission(
 		&backup, state, &state.Targets[0], StateLoadMetadata{RecoveredFromBackup: true},
@@ -235,7 +233,7 @@ func newRateLimitVisibilityFixture(remaining ...uint64) rateLimitVisibilityFixtu
 	}
 	report := newRunReport(
 		time.Unix(0, 0), TriggerUTC, ReportExecution{}, "mainnet",
-		nil, nil, "0xsettlement", "0xrecipient", "0xreferral",
+		nil, nil, "0xsettlement", "0xrecipient",
 	)
 	report.markSubmitted("0xsettlement")
 	return rateLimitVisibilityFixture{

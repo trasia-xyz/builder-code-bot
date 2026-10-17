@@ -29,7 +29,7 @@ func (o *Orchestrator) RunScheduled(
 func (o *Orchestrator) run(ctx context.Context, trigger Trigger, execution ReportExecution) (err error) {
 	report := newRunReport(
 		o.clock.Now(), trigger, execution, o.network, o.builders, o.builderNames,
-		o.settlement, o.recipients[PayoutKindPointsRebate], o.recipients[PayoutKindReferral],
+		o.settlement, o.recipient,
 	)
 	defer func() { o.deliverRunReport(ctx, &report, err) }()
 	defer func() {
@@ -78,7 +78,7 @@ func (o *Orchestrator) Recover(ctx context.Context) (err error) {
 	report := newRunReport(
 		o.clock.Now(), current.Trigger, ReportExecution{Recovery: true}, o.network,
 		o.builders, o.builderNames, o.settlement,
-		o.recipients[PayoutKindPointsRebate], o.recipients[PayoutKindReferral],
+		o.recipient,
 	)
 	report.Outcome = "completed"
 	report.syncState(current)

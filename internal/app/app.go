@@ -255,7 +255,6 @@ func assembleOrchestrator(
 	}
 	retryObserver := notification.NewMySQLRetryObserver(dispatcher, logger)
 	retryer := mysql.NewRetryer(retryObserver)
-	pointsRebateRepository := mysql.NewPointsRebateRepository(db, retryer)
 	referralRepository := mysql.NewReferralRepository(db, retryer)
 	builders := make([]string, len(cfg.Builders))
 	builderNames := make(map[string]string, len(cfg.Builders))
@@ -265,21 +264,19 @@ func assembleOrchestrator(
 	}
 	stateStore := state.NewStoreWithLogger(state.DataDir, logger)
 	return funding.NewOrchestrator(funding.OrchestratorConfig{
-		PointsRebateRepository: pointsRebateRepository,
-		ReferralRepository:     referralRepository,
-		Store:                  stateStore,
-		DailyConsolidations:    stateStore,
-		Chain:                  hyperliquidChain{info: infoClient, exchange: exchangeClient},
-		Notifier:               notifier,
-		Logger:                 logger,
-		Builders:               builders,
-		BuilderNames:           builderNames,
-		Settlement:             cfg.Settlement.Address,
-		PointsRebateRecipient:  cfg.PointsRebatePayout.RecipientAddress,
-		ReferralRecipient:      cfg.ReferralPayout.RecipientAddress,
-		Network:                cfg.Hyperliquid.Network,
-		Clock:                  systemClock{},
-		Nonce:                  signing.NewNonceGenerator(),
+		ReferralRepository:  referralRepository,
+		Store:               stateStore,
+		DailyConsolidations: stateStore,
+		Chain:               hyperliquidChain{info: infoClient, exchange: exchangeClient},
+		Notifier:            notifier,
+		Logger:              logger,
+		Builders:            builders,
+		BuilderNames:        builderNames,
+		Settlement:          cfg.Settlement.Address,
+		ReferralRecipient:   cfg.ReferralPayout.RecipientAddress,
+		Network:             cfg.Hyperliquid.Network,
+		Clock:               systemClock{},
+		Nonce:               signing.NewNonceGenerator(),
 	})
 }
 

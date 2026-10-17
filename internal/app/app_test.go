@@ -158,33 +158,27 @@ func TestBuildBuilderSignersDoesNotDecryptSettlementKey(t *testing.T) {
 	}
 }
 
-func TestAssembleOrchestratorWiresBothRepositoriesAndRecipients(t *testing.T) {
+func TestAssembleOrchestratorWiresOnlyReferralRepositoryAndRecipient(t *testing.T) {
 	server := hyperliquidmock.New(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	mock.MatchExpectationsInOrder(false)
 	emptyRows := func() *sqlmock.Rows {
 		return sqlmock.NewRows([]string{"id", "period_start_at", "amount"})
 	}
-	mock.ExpectQuery("FROM trasia_points_rebate_funding_record").WillReturnRows(emptyRows())
 	mock.ExpectQuery("FROM trasia_referral_funding_record").WillReturnRows(emptyRows())
 
 	const (
-		builderAddress        = "0x0000000000000000000000000000000000000001"
-		settlementAddress     = "0x0000000000000000000000000000000000000002"
-		pointsRebateRecipient = "0x0000000000000000000000000000000000000003"
-		referralRecipient     = "0x0000000000000000000000000000000000000004"
+		builderAddress    = "0x0000000000000000000000000000000000000001"
+		settlementAddress = "0x0000000000000000000000000000000000000002"
+		referralRecipient = "0x0000000000000000000000000000000000000004"
 	)
 	cfg := config.Config{
-		Hyperliquid: config.HyperliquidConfig{Network: "testnet", BaseURL: server.URL},
-		Builders:    []config.BuilderConfig{{Name: "builder", Address: builderAddress}},
-		Settlement:  config.AccountConfig{Address: settlementAddress},
-		PointsRebatePayout: config.PayoutConfig{
-			RecipientAddress: pointsRebateRecipient,
-		},
+		Hyperliquid:    config.HyperliquidConfig{Network: "testnet", BaseURL: server.URL},
+		Builders:       []config.BuilderConfig{{Name: "builder", Address: builderAddress}},
+		Settlement:     config.AccountConfig{Address: settlementAddress},
 		ReferralPayout: config.PayoutConfig{RecipientAddress: referralRecipient},
 	}
 	notifier := &recordingFundingNotifier{}
@@ -203,7 +197,7 @@ func TestAssembleOrchestratorWiresBothRepositoriesAndRecipients(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("repository queries were not both executed: %v", err)
+		t.Fatalf("referral repository query was not executed: %v", err)
 	}
 	if len(notifier.reports) != 1 {
 		t.Fatalf("reports = %d, want 1", len(notifier.reports))
@@ -211,8 +205,7 @@ func TestAssembleOrchestratorWiresBothRepositoriesAndRecipients(t *testing.T) {
 
 	report := notifier.reports[0]
 	wantRecipients := map[funding.PayoutKind]string{
-		funding.PayoutKindPointsRebate: pointsRebateRecipient,
-		funding.PayoutKindReferral:     referralRecipient,
+		funding.PayoutKindReferral: referralRecipient,
 	}
 	if len(report.Payouts) != len(wantRecipients) {
 		t.Fatalf("payout reports = %d, want %d", len(report.Payouts), len(wantRecipients))

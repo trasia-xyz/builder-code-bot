@@ -9,14 +9,14 @@ import (
 	"builder-code-bot/internal/notification"
 )
 
-func TestRenderBuildsRichDualPayoutEmailAndEscapesValues(t *testing.T) {
+func TestRenderBuildsRichReferralEmailAndEscapesValues(t *testing.T) {
 	t.Parallel()
 	started := time.Date(2026, 7, 23, 1, 0, 0, 0, time.UTC)
 	report := funding.RunReport{
 		Status: funding.ReportStatusWarning, Trigger: funding.TriggerUTC,
 		Network: "mainnet", RunID: "abcd1234", UTCDate: "2026-07-23",
 		Phase: funding.PhasePayoutConfirmed, StartedAt: started, FinishedAt: started.Add(3200 * time.Millisecond),
-		RecordsRead: true, RecordCount: 3, RawTotal: "1.4999998", PayoutTotal: "1.5",
+		RecordsRead: true, RecordCount: 3, RawTotal: "1.4999999", PayoutTotal: "1.5",
 		Stages: []funding.ReportStage{
 			{Label: "数据快照", Status: funding.ReportStepSuccess, Summary: "2 条记录"},
 			{Label: "Reward", Status: funding.ReportStepWarning, Summary: "1 个告警"},
@@ -38,24 +38,12 @@ func TestRenderBuildsRichDualPayoutEmailAndEscapesValues(t *testing.T) {
 		},
 		Payouts: []funding.PayoutTargetReport{
 			{
-				Kind: funding.PayoutKindPointsRebate, RecordsRead: true,
-				RecordCount: 2, RawTotal: "1.0999999", PayoutTotal: "1.1",
-				Payout: funding.PayoutReport{
-					Status: funding.ReportStepSuccess, Amount: "1.1",
-					Settlement: "0xsettlement", Recipient: "0xpointsrecipient",
-					SettlementTotalBefore: "2", SubmitAttempts: 1,
-					ConfirmationEvidence: "exchange_response",
-					RequestHash:          "points-hash", Nonce: 123,
-				},
-				DatabaseStatus: funding.ReportStepSuccess,
-			},
-			{
 				Kind: funding.PayoutKindReferral, RecordsRead: true,
-				RecordCount: 1, RawTotal: "0.3999999", PayoutTotal: "0.4",
+				RecordCount: 3, RawTotal: "1.4999999", PayoutTotal: "1.5",
 				Payout: funding.PayoutReport{
-					Status: funding.ReportStepSuccess, Amount: "0.4",
+					Status: funding.ReportStepSuccess, Amount: "1.5",
 					Settlement: "0xsettlement", Recipient: "0xreferralrecipient",
-					SettlementTotalBefore: "0.9", SubmitAttempts: 2,
+					SettlementTotalBefore: "3", SubmitAttempts: 2,
 					ConfirmationEvidence: "settlement_balance_decreased_with_activation_fee",
 					RequestHash:          "referral-hash", Nonce: 124,
 				},
@@ -67,7 +55,7 @@ func TestRenderBuildsRichDualPayoutEmailAndEscapesValues(t *testing.T) {
 		},
 		Warnings: []string{
 			"builder-1: Reward 领取结果不确定",
-			"UTC 00:00 Claimable 合计 1.2 USDC，低于两类数据库 Payout 合计 1.5 USDC，短缺 0.3 USDC，请人工核查结算口径",
+			"UTC 00:00 Claimable 合计 1.2 USDC，低于 Referral Payout 1.5 USDC，短缺 0.3 USDC，请人工核查结算口径",
 		},
 	}
 
@@ -80,15 +68,15 @@ func TestRenderBuildsRichDualPayoutEmailAndEscapesValues(t *testing.T) {
 	}
 	for _, want := range []string{
 		"成功但有告警", "Payout 1.5 USDC", "Builder 明细", "Payout 明细",
-		"Points Rebate Payout", "Referral Payout", "Exchange 明确确认",
+		"Referral Payout",
 		"Settlement 精确减少 amount", "1 USDC（新地址费用）",
 		"首次 Submit", "Exact replay", "已授权 / 可能已发送（原请求 / 相同 nonce）",
-		"0xpointsrecipient", "0xreferralrecipient", "points-hash", "referral-hash",
+		"0xreferralrecipient", "referral-hash",
 		"0x123456…345678", "builder-1: Reward 领取结果不确定",
 		"Settlement 结束余额", "0.4 USDC",
 		"UTC 00:00 Claim 与资金归集", "零点 Claimable 合计", "1.2 USDC",
 		"00:00 Reward", "Claimable 作为对账基准",
-		"本轮两类数据库 Payout 合计", "对账差额（Claimable - Payout 合计）", "-0.3 USDC",
+		"本轮 Referral Payout", "对账差额（Claimable - Referral Payout）", "-0.3 USDC",
 		"查询 1 次", "提交 3 次", "完整但低于 Payout", "短缺 0.3 USDC",
 	} {
 		if !strings.Contains(message.HTMLBody, want) {
@@ -101,27 +89,22 @@ func TestRenderBuildsRichDualPayoutEmailAndEscapesValues(t *testing.T) {
 	if strings.Contains(message.HTMLBody, "ZgotmplZ") {
 		t.Fatalf("HTML template rejected a trusted style value: %s", message.HTMLBody)
 	}
-	if count := strings.Count(message.HTMLBody, "付款状态"); count != 2 {
-		t.Fatalf("payout card count = %d, want 2", count)
+	if count := strings.Count(message.HTMLBody, "付款状态"); count != 1 {
+		t.Fatalf("payout card count = %d, want 1", count)
 	}
-	if count := strings.Count(message.HTMLBody, "数据库状态"); count != 2 {
-		t.Fatalf("database status count = %d, want 2", count)
+	if count := strings.Count(message.HTMLBody, "数据库状态"); count != 1 {
+		t.Fatalf("database status count = %d, want 1", count)
 	}
 
 	view := buildView(report)
-	if len(view.Payouts) != 2 {
-		t.Fatalf("len(Payouts) = %d, want 2", len(view.Payouts))
+	if len(view.Payouts) != 1 {
+		t.Fatalf("len(Payouts) = %d, want 1", len(view.Payouts))
 	}
 	wants := []struct {
 		name, records, raw, amount, recipient, firstSubmit, exactReplay, evidence, status, database string
 	}{
 		{
-			name: "Points Rebate Payout", records: "2", raw: "1.0999999", amount: "1.1",
-			recipient: "0xpointsrecipient", firstSubmit: "已授权 / 可能已发送", exactReplay: "未授权",
-			evidence: "Exchange 明确确认", status: "已完成", database: "已完成",
-		},
-		{
-			name: "Referral Payout", records: "1", raw: "0.3999999", amount: "0.4",
+			name: "Referral Payout", records: "3", raw: "1.4999999", amount: "1.5",
 			recipient: "0xreferralrecipient", firstSubmit: "已授权 / 可能已发送",
 			exactReplay: "已授权 / 可能已发送（原请求 / 相同 nonce）",
 			evidence:    "Settlement 精确减少 amount + 1 USDC（新地址费用）",
@@ -186,30 +169,21 @@ func TestRenderShowsUnconfirmedPostPayoutBalanceWithoutAmounts(t *testing.T) {
 	}
 }
 
-func TestBuildViewKeepsPayoutTargetStatusesIndependent(t *testing.T) {
+func TestBuildViewKeepsReferralPayoutAndDatabaseStatusesIndependent(t *testing.T) {
 	t.Parallel()
-	report := funding.RunReport{Payouts: []funding.PayoutTargetReport{
-		{
-			Kind: funding.PayoutKindPointsRebate, RecordsRead: true,
-			Payout:         funding.PayoutReport{Status: funding.ReportStepSuccess},
-			DatabaseStatus: funding.ReportStepFailed,
-		},
-		{
-			Kind: funding.PayoutKindReferral, RecordsRead: true,
-			Payout:         funding.PayoutReport{Status: funding.ReportStepWarning},
-			DatabaseStatus: funding.ReportStepSkipped,
-		},
-	}}
+	report := funding.RunReport{Payouts: []funding.PayoutTargetReport{{
+		Kind: funding.PayoutKindReferral, RecordsRead: true,
+		Payout:         funding.PayoutReport{Status: funding.ReportStepSuccess, SubmitAttempts: 1, ConfirmationEvidence: "exchange_response"},
+		DatabaseStatus: funding.ReportStepFailed,
+	}}}
 
 	view := buildView(report)
-	if len(view.Payouts) != 2 {
-		t.Fatalf("len(Payouts) = %d, want 2", len(view.Payouts))
+	if len(view.Payouts) != 1 {
+		t.Fatalf("len(Payouts) = %d, want 1", len(view.Payouts))
 	}
-	if view.Payouts[0].Status != "已完成" || view.Payouts[0].Database != "失败" {
-		t.Fatalf("points rebate statuses = %#v", view.Payouts[0])
-	}
-	if view.Payouts[1].Status != "有告警" || view.Payouts[1].Database != "已跳过" {
-		t.Fatalf("referral statuses = %#v", view.Payouts[1])
+	if got := view.Payouts[0]; got.Status != "已完成" || got.Database != "失败" ||
+		got.ExactReplay != "未授权" || got.Evidence != "Exchange 明确确认" {
+		t.Fatalf("referral statuses = %#v", got)
 	}
 }
 
