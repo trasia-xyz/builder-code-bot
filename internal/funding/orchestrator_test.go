@@ -2,8 +2,6 @@ package funding
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1550,6 +1548,91 @@ func TestPayoutRecoveryNeverResubmitsUncertainState(t *testing.T) {
 	})
 }
 
+func TestPayoutRecoveryRejectsInconsistentPreparedRequestBeforeWrites(t *testing.T) {
+	tests := []struct {
+		name   string
+		phase  Phase
+		mutate func(*exchange.PreparedAction, map[string]any)
+	}{
+		{
+			name: "manifest signer", phase: PhasePayoutPrepared,
+			mutate: func(action *exchange.PreparedAction, _ map[string]any) {
+				action.Signer = "0xother"
+			},
+		},
+		{
+			name: "manifest amount", phase: PhasePayoutSubmitting,
+			mutate: func(action *exchange.PreparedAction, _ map[string]any) {
+				action.Amount = "2"
+			},
+		},
+		{
+			name: "request destination", phase: PhasePayoutPrepared,
+			mutate: func(_ *exchange.PreparedAction, body map[string]any) {
+				body["action"].(map[string]any)["destination"] = "0xother"
+			},
+		},
+		{
+			name: "request token", phase: PhasePayoutSubmitting,
+			mutate: func(_ *exchange.PreparedAction, body map[string]any) {
+				body["action"].(map[string]any)["token"] = "OTHER:0xabc"
+			},
+		},
+		{
+			name: "request amount", phase: PhasePayoutPrepared,
+			mutate: func(_ *exchange.PreparedAction, body map[string]any) {
+				body["action"].(map[string]any)["amount"] = "2"
+			},
+		},
+		{
+			name: "request nonce", phase: PhasePayoutSubmitting,
+			mutate: func(action *exchange.PreparedAction, body map[string]any) {
+				body["nonce"] = action.Nonce + 1
+			},
+		},
+		{
+			name: "request time", phase: PhasePayoutPrepared,
+			mutate: func(action *exchange.PreparedAction, body map[string]any) {
+				body["action"].(map[string]any)["time"] = action.Nonce + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fx := newFixture(t)
+			state := fx.positiveState(t, test.phase)
+			prepared := validPayout(t, state, 906)
+			var body map[string]any
+			if err := json.Unmarshal(prepared.RequestBody, &body); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&prepared, body)
+			var err error
+			prepared.RequestBody, err = json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testTarget(t, &state, PayoutKindReferral).Payout = &PayoutJournal{
+				Prepared: prepared, TotalBefore: "2", SubmitAttempts: 1,
+			}
+			fx.store.current = &state
+			wantCurrent := cloneState(&state)
+
+			err = fx.orchestrator.Recover(context.Background())
+			if err == nil || !IsFatal(err) {
+				t.Fatalf("Recover() error = %v, want fatal validation failure", err)
+			}
+			if len(fx.chain.submittedActions) != 0 || len(fx.repo.completedIDs) != 0 ||
+				!reflect.DeepEqual(fx.store.current, wantCurrent) || len(fx.store.saved) != 0 ||
+				fx.store.archiveResult != "" {
+				t.Fatalf("invalid request changed state: submitted=%#v completed=%v current=%#v saved=%d archive=%q",
+					fx.chain.submittedActions, fx.repo.completedIDs, fx.store.current,
+					len(fx.store.saved), fx.store.archiveResult)
+			}
+		})
+	}
+}
+
 func TestConfirmedPayoutRecoveryOnlyCompletesDatabase(t *testing.T) {
 	fx := newFixture(t)
 	state := fx.positiveState(t, PhasePayoutConfirmed)
@@ -2259,10 +2342,9 @@ func preparedAction(
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(raw)
 	return exchange.PreparedAction{
 		Kind: kind, Signer: signer, Destination: destination, Token: token, Amount: amount,
-		Nonce: nonce, RequestBody: raw, RequestHash: hex.EncodeToString(digest[:]),
+		Nonce: nonce, RequestBody: raw,
 	}
 }
 

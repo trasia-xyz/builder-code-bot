@@ -75,7 +75,6 @@ func (o *Orchestrator) executePayout(
 		report.failTarget(target.Kind, "payout", "Payout 请求未通过安全校验。", "请保留现场并检查不可变 Manifest 和签名请求。")
 		return err
 	}
-	targetReport.Payout.RequestHash = prepared.RequestHash
 	targetReport.Payout.Nonce = prepared.Nonce
 	target.Payout = &PayoutJournal{
 		Prepared: clonePrepared(prepared), TotalBefore: before.Total.String(), SubmitAttempts: 1,
@@ -286,8 +285,7 @@ func (o *Orchestrator) observeUncertainPayout(
 			slog.String("event", "funding_payout_exact_replay_authorized"),
 			slog.String("run_id", state.RunID),
 			slog.String("payout_kind", string(target.Kind)),
-			slog.Uint64("nonce", target.Payout.Prepared.Nonce),
-			slog.String("request_hash", target.Payout.Prepared.RequestHash))
+			slog.Uint64("nonce", target.Payout.Prepared.Nonce))
 		return o.replayPreparedPayout(ctx, state, target, report)
 	}
 	reason := fmt.Sprintf(
@@ -405,7 +403,7 @@ func (o *Orchestrator) blockUncertainPayout(
 	report.failTarget(
 		target.Kind, "payout",
 		"Payout 结果仍不确定，Settlement total 未能稳定达到任一精确付款后余额。",
-		"已停止观察和重试；请根据最终报告核查 request hash、nonce 与 Settlement 余额。",
+		"已停止观察和重试；请结合最终报告与持久化的完整请求，核查 nonce 与 Settlement 余额。",
 	)
 	target.BlockedReason = reason
 	// Make terminality survive primary corruption: both rotating snapshots must

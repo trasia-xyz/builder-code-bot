@@ -132,7 +132,7 @@ at-most-once 防护。
 2. 保存 `payout_submitting`。
 3. 第二次保存成功后才调用 submit。
 
-完整请求包括原始 request body、nonce、签名、action time 与 request hash。任何 exact replay 必须逐字节
+完整请求包括原始 request body、nonce、签名、action time。任何 exact replay 必须逐字节
 复用该请求，禁止重新 Prepare、重新签名或取得新 nonce。首次网络调用前先将 `submit_attempts = 1`
 与 `payout_submitting` 持久化，表示首次提交已授权、可能已发送；重放调用前先将
 `submit_attempts = 2` 与 `payout_replaying` 连续保存两代，使 current 与 backup 都耗尽重放预算，再调用
@@ -198,10 +198,13 @@ data/
 服务端原因和错误链上下文，同时对密码、私钥、token、URL userinfo 等高风险值脱敏。
 
 最终 funding report 只在 UTC 01:00 funding 结束时发送，内容包括：各 builder 的零点
-claimable 与 claim/sweep 结果、Referral 的 raw/payout total 和状态、完整 claimable 合计与
-Referral Payout 的差额、首次提交是否发生、是否发生一次 exact replay、最终发送方确认依据
-或 blocked 结果、settlement 结束余额、rate limit、告警与处置
-建议。正数 payout 确认后，结束余额必须连续两次
+claimable 与 claim/sweep 结果、Referral 的 payout total 和状态、完整 claimable 合计与
+Referral Payout 的差额、settlement 结束可用余额、告警与处置建议。邮件仅保留一份 Builder
+明细；正常限额与单次查询/提交次数省略，异常限额继续展示。完整报告在告警、失败、恢复执行或
+exact replay 时额外显示 raw total、首次提交、重放与确认依据、nonce；普通成功邮件省略
+这些诊断字段。精简重试通知保留精确 Payout 金额及付款、数据库状态摘要。
+标题只将总 payout 显示为两位小数，正文与对账继续使用精确金额。
+正数 payout 确认后，结束余额必须连续两次
 达到 `total before - amount` 或 `total before - amount - 1 USDC`，且两次 available 也相同，才可标记
 为已观察；查询错误不消耗成功样本
 预算。有限观察内仍不可见时只报告未确认，不得把付款前余额展示为结束余额。

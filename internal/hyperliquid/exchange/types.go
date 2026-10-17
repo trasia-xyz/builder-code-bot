@@ -9,7 +9,6 @@ type PreparedAction struct {
 	Token       string          `json:"token,omitempty"`
 	Amount      string          `json:"amount,omitempty"`
 	Nonce       uint64          `json:"nonce"`
-	RequestHash string          `json:"request_hash"`
 	RequestBody json.RawMessage `json:"request_body"`
 }
 

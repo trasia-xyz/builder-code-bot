@@ -93,7 +93,6 @@ type PayoutReport struct {
 	SubmitAttempts        int
 	Blocked               bool
 	ConfirmationEvidence  string
-	RequestHash           string
 	Nonce                 uint64
 }
 
@@ -246,7 +245,6 @@ func (r *RunReport) syncState(state *RunState) {
 		if stateTarget.Payout != nil {
 			targetReport.Payout.SettlementTotalBefore = stateTarget.Payout.TotalBefore
 			targetReport.Payout.SubmitAttempts = stateTarget.Payout.SubmitAttempts
-			targetReport.Payout.RequestHash = stateTarget.Payout.Prepared.RequestHash
 			targetReport.Payout.Nonce = stateTarget.Payout.Prepared.Nonce
 		}
 		targetReport.Payout.Blocked = isUncertainPayoutBlock(stateTarget)

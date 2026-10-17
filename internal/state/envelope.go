@@ -9,8 +9,8 @@ import (
 	"builder-code-bot/internal/funding"
 )
 
-// Version 3 only supports referral payouts. Older snapshots must be reconciled
-// by their original version so no legacy payout journal is silently discarded.
+// Version 3 only supports referral payouts and persists the complete signed
+// request without a separate digest. Older snapshots require their original version.
 const schemaVersion = 3
 
 type envelope struct {

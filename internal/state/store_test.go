@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"builder-code-bot/internal/funding"
+	"builder-code-bot/internal/hyperliquid/exchange"
 	"builder-code-bot/internal/logging"
 )
 
@@ -202,10 +203,45 @@ func TestStoreRejectsChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsTamperedPersistedRequestBody(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	state := testRunState(t, "request-body")
+	body := json.RawMessage(`{"nonce":7,"signature":{"r":"original","s":"value","v":27}}`)
+	state.Targets[0].Payout = &funding.PayoutJournal{
+		Prepared: exchange.PreparedAction{Nonce: 7, RequestBody: body},
+	}
+	if err := store.Save(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := load(context.Background(), store)
+	if err != nil || loaded == nil ||
+		!bytes.Equal(loaded.Targets[0].Payout.Prepared.RequestBody, body) {
+		t.Fatalf("Load() = %#v, %v; want persisted request body", loaded, err)
+	}
+	path := filepath.Join(dir, currentFilename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := bytes.Replace(data, []byte(`"r":"original"`), []byte(`"r":"tampered"`), 1)
+	if bytes.Equal(tampered, data) {
+		t.Fatal("snapshot did not contain request signature")
+	}
+	if err := os.WriteFile(path, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := load(context.Background(), NewStore(dir)); err == nil || got != nil ||
+		!strings.Contains(err.Error(), "state checksum mismatch") {
+		t.Fatalf("Load() = %#v, %v; want checksum error for tampered request body", got, err)
+	}
+}
+
 func TestStoreRejectsLegacySchemaVersionOne(t *testing.T) {
 	dir := t.TempDir()
 	state := testRunState(t, "legacy")
-	path := filepath.Join(dir, "current.json")
+	path := filepath.Join(dir, currentFilename)
 	writeTestEnvelopeVersion(t, path, state, 1)
 
 	if got, err := load(context.Background(), NewStore(dir)); err == nil || got != nil ||

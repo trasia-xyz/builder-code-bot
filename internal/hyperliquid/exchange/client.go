@@ -2,8 +2,6 @@ package exchange
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -166,10 +164,9 @@ func prepare(kind, signer, destination, token, amount string, nonce uint64, body
 	if err != nil {
 		return PreparedAction{}, fmt.Errorf("encode prepared %s request: %w", kind, err)
 	}
-	digest := sha256.Sum256(requestBody)
 	return PreparedAction{
 		Kind: kind, Signer: signer, Destination: destination, Token: token, Amount: amount,
-		Nonce: nonce, RequestHash: hex.EncodeToString(digest[:]), RequestBody: requestBody,
+		Nonce: nonce, RequestBody: requestBody,
 	}, nil
 }
 

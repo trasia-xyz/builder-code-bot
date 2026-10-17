@@ -2,8 +2,6 @@ package exchange
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -20,7 +18,7 @@ import (
 
 const testPrivateKey = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-func TestPrepareClaimUsesL1SignatureAndHashesExactBody(t *testing.T) {
+func TestPrepareClaimUsesL1Signature(t *testing.T) {
 	c, address := newTestClient(t, hyperliquid.NetworkTestnet, &recordingTransport{})
 	prepared, err := c.PrepareClaim(address, 1720000000123)
 	if err != nil {
@@ -44,10 +42,6 @@ func TestPrepareClaimUsesL1SignatureAndHashesExactBody(t *testing.T) {
 	recovered, err := signing.RecoverL1ActionSigner(signing.L1ActionRecoverInput{Action: action, Nonce: body.Nonce, Network: hyperliquid.NetworkTestnet, Signature: body.Signature})
 	if err != nil || !strings.EqualFold(recovered, address) {
 		t.Fatalf("recovered = %q, %v", recovered, err)
-	}
-	digest := sha256.Sum256(prepared.RequestBody)
-	if prepared.RequestHash != hex.EncodeToString(digest[:]) {
-		t.Fatalf("hash = %q", prepared.RequestHash)
 	}
 }
 

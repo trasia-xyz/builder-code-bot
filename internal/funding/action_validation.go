@@ -1,7 +1,6 @@
 package funding
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -29,10 +28,6 @@ func validatePreparedPayout(target *PayoutTargetState, action exchange.PreparedA
 	}
 	if len(action.RequestBody) == 0 {
 		return fmt.Errorf("prepared payout request body is empty")
-	}
-	digest := sha256.Sum256(action.RequestBody)
-	if !strings.EqualFold(action.RequestHash, fmt.Sprintf("%x", digest)) {
-		return fmt.Errorf("prepared payout request hash mismatch")
 	}
 	var body struct {
 		Action struct {

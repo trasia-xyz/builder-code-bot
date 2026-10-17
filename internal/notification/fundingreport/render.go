@@ -20,12 +20,7 @@ type view struct {
 	Subject            string
 	Preheader          string
 	Compact            bool
-	PayoutTotal        string
-	RawTotal           string
-	RecordCount        string
-	BuilderCount       int
 	Duration           string
-	Stages             []stageView
 	Builders           []builderView
 	DailyConsolidation dailyConsolidationView
 	Settlement         settlementView
@@ -39,18 +34,8 @@ type view struct {
 	Trigger            string
 	Execution          string
 	Network            string
-	UTCDate            string
 	Phase              string
-	StartedAt          string
 	FinishedAt         string
-}
-
-type stageView struct {
-	Label   string
-	Summary string
-	Symbol  string
-	Color   string
-	Tint    string
 }
 
 type builderView struct {
@@ -63,6 +48,7 @@ type builderView struct {
 	SweepColor string
 	RateLimit  string
 	RateColor  string
+	RateIssue  bool
 }
 
 type dailyConsolidationView struct {
@@ -71,54 +57,42 @@ type dailyConsolidationView struct {
 	Color           string
 	Tint            string
 	UTCDate         string
-	CapturedAt      string
-	CompletedAt     string
 	Total           string
 	TotalLabel      string
 	Coverage        string
-	PayoutTotal     string
 	Difference      string
 	DifferenceColor string
-	Builders        []dailyConsolidationBuilderView
-}
-
-type dailyConsolidationBuilderView struct {
-	Name    string
-	Address string
-	Amount  string
-	Status  string
-	Color   string
 }
 
 type payoutView struct {
-	Name          string
-	RecordCount   string
-	RawTotal      string
-	Amount        string
-	Settlement    string
-	Recipient     string
-	TotalBefore   string
-	FirstSubmit   string
-	ExactReplay   string
-	Evidence      string
-	RequestHash   string
-	Nonce         string
-	Status        string
-	StatusColor   string
-	Database      string
-	DatabaseColor string
+	ShowDiagnostics bool
+	Name            string
+	RecordCount     string
+	RawTotal        string
+	Amount          string
+	TotalBefore     string
+	FirstSubmit     string
+	ExactReplay     string
+	Evidence        string
+	Nonce           string
+	Status          string
+	StatusColor     string
+	Database        string
+	DatabaseColor   string
 }
 
 type settlementView struct {
-	Address   string
-	Total     string
-	Hold      string
-	Available string
-	Status    string
-	Color     string
-	Tint      string
-	RateLimit string
-	RateColor string
+	ShowBalances  bool
+	ShowBreakdown bool
+	RateIssue     bool
+	Total         string
+	Hold          string
+	Available     string
+	Status        string
+	Color         string
+	Tint          string
+	RateLimit     string
+	RateColor     string
 }
 
 func Render(report funding.RunReport) notification.Message {
@@ -156,10 +130,6 @@ func buildView(report funding.RunReport) view {
 		Subject:            subject(report, statusLabel),
 		Preheader:          preheader(report, duration),
 		Compact:            report.Compact,
-		PayoutTotal:        displayAmount(report.PayoutTotal),
-		RawTotal:           displayAmount(report.RawTotal),
-		RecordCount:        recordCount(report),
-		BuilderCount:       len(report.Builders),
 		Duration:           formatDuration(duration),
 		Warnings:           append([]string(nil), report.Warnings...),
 		ShowFailure:        report.FailureSummary != "",
@@ -170,24 +140,15 @@ func buildView(report funding.RunReport) view {
 		Trigger:            triggerLabel(report.Trigger),
 		Execution:          executionLabel(report),
 		Network:            fallback(strings.ToUpper(report.Network), "—"),
-		UTCDate:            fallback(report.UTCDate, "—"),
 		Phase:              fallback(string(report.Phase), "—"),
-		StartedAt:          formatTime(report.StartedAt),
 		FinishedAt:         formatTime(report.FinishedAt),
 		Settlement:         buildSettlementView(report),
 		DailyConsolidation: buildDailyConsolidationView(report),
 	}
 
-	for _, stage := range report.Stages {
-		symbol, color, tint := stepStyle(stage.Status)
-		data.Stages = append(data.Stages, stageView{
-			Label: stage.Label, Summary: fallback(stage.Summary, "尚未执行"),
-			Symbol: symbol, Color: color, Tint: tint,
-		})
-	}
 	for _, builder := range report.Builders {
 		claimText, claimColor := builderStep(builder.ClaimStatus, builder.ClaimSummary)
-		if builder.ClaimAttempts > 0 {
+		if builder.ClaimAttempts > 1 {
 			claimText += fmt.Sprintf(" · 提交 %d 次", builder.ClaimAttempts)
 		}
 		sweepText, sweepColor := builderStep(builder.SweepStatus, builder.SweepSummary)
@@ -210,7 +171,7 @@ func buildView(report funding.RunReport) view {
 			}
 		}
 		claimableText := displayClaimable(builder.ClaimableUSDC)
-		if builder.ClaimableQueryAttempts > 0 {
+		if builder.ClaimableQueryAttempts > 1 {
 			claimableText += fmt.Sprintf(" · 查询 %d 次", builder.ClaimableQueryAttempts)
 		}
 		data.Builders = append(data.Builders, builderView{
@@ -219,6 +180,8 @@ func buildView(report funding.RunReport) view {
 			Claim:     claimText, ClaimColor: claimColor,
 			Sweep: sweepText, SweepColor: sweepColor,
 			RateLimit: rateText, RateColor: rateColor,
+			RateIssue: builder.RateLimitQueryFailed || builder.RateLimitVisibilityUnconfirmed ||
+				(builder.RateLimitObserved && builder.RateLimitRemaining < 200),
 		})
 	}
 
@@ -230,17 +193,16 @@ func buildView(report funding.RunReport) view {
 		payoutStatus, payoutColor := builderStep(target.Payout.Status, "")
 		databaseStatus, databaseColor := builderStep(target.DatabaseStatus, "")
 		item := payoutView{
+			ShowDiagnostics: (report.Status != funding.ReportStatusSuccess && report.Status != funding.ReportStatusNoData) ||
+				report.Recovery || target.Payout.SubmitAttempts > 1,
 			Name:          payoutName(target.Kind),
 			RecordCount:   fmt.Sprintf("%d", target.RecordCount),
 			RawTotal:      displayAmount(target.RawTotal),
 			Amount:        displayAmount(target.Payout.Amount),
-			Settlement:    fallback(target.Payout.Settlement, "—"),
-			Recipient:     fallback(target.Payout.Recipient, "—"),
 			TotalBefore:   displayAmount(target.Payout.SettlementTotalBefore),
 			FirstSubmit:   firstSubmitLabel(target.Payout.SubmitAttempts),
 			ExactReplay:   exactReplayLabel(target.Payout.SubmitAttempts),
 			Evidence:      evidenceLabel(target.Payout.ConfirmationEvidence, target.Payout.Blocked),
-			RequestHash:   fallback(target.Payout.RequestHash, "—"),
 			Status:        payoutStatus,
 			StatusColor:   payoutColor,
 			Database:      databaseStatus,
@@ -268,12 +230,9 @@ func buildDailyConsolidationView(report funding.RunReport) dailyConsolidationVie
 		Color:           "#b45309",
 		Tint:            "#fffbeb",
 		UTCDate:         fallback(consolidation.UTCDate, "—"),
-		CapturedAt:      formatTime(consolidation.ClaimablesCapturedAt),
-		CompletedAt:     formatTime(consolidation.CompletedAt),
 		Total:           displayAmount(consolidation.TotalClaimableUSDC),
 		TotalLabel:      "零点 Claimable 合计",
 		Coverage:        fmt.Sprintf("%d/%d", consolidation.ObservedBuilders, consolidation.BuilderCount),
-		PayoutTotal:     displayAmount(report.PayoutTotal),
 		Difference:      "—",
 		DifferenceColor: "#64748b",
 	}
@@ -314,38 +273,24 @@ func buildDailyConsolidationView(report funding.RunReport) dailyConsolidationVie
 			}
 		}
 	}
-	for _, builder := range report.Builders {
-		row := dailyConsolidationBuilderView{
-			Name: fallback(builder.Name, "Builder"), Address: shortAddress(builder.Address),
-			Amount: "—", Status: "未记录", Color: "#64748b",
-		}
-		if builder.ClaimableObserved {
-			row.Amount = displayAmount(builder.ClaimableUSDC) + " USDC"
-			row.Status, row.Color = builderStep(builder.ClaimStatus, builder.ClaimSummary)
-			if builder.ClaimUncertain {
-				row.Status, row.Color = "领取结果不确定", "#b45309"
-			}
-		} else if builder.ClaimableQueryAttempts > 0 {
-			row.Status, row.Color = builderStep(builder.ClaimStatus, builder.ClaimSummary)
-		}
-		if builder.ClaimAttempts > 0 {
-			row.Status += fmt.Sprintf(" · 提交 %d 次", builder.ClaimAttempts)
-		}
-		data.Builders = append(data.Builders, row)
-	}
 	return data
 }
 
 func subject(report funding.RunReport, statusLabel string) string {
-	parts := []string{statusLabel}
-	if report.Status == funding.ReportStatusRetrying && report.Attempt > 0 && report.MaxAttempts > 0 {
-		parts[0] = fmt.Sprintf("第 %d/%d 次执行失败 · 等待重试", report.Attempt, report.MaxAttempts)
+	var parts []string
+	if report.Status != funding.ReportStatusSuccess {
+		if report.Status == funding.ReportStatusRetrying && report.Attempt > 0 && report.MaxAttempts > 0 {
+			statusLabel = fmt.Sprintf("第 %d/%d 次执行失败 · 等待重试", report.Attempt, report.MaxAttempts)
+		}
+		parts = append(parts, statusLabel)
 	}
-	if report.PayoutTotal != "" && report.PayoutTotal != "0" {
-		parts = append(parts, report.PayoutTotal+" USDC")
+	if report.Status != funding.ReportStatusNoData && report.Outcome != "no_data" {
+		if amount, err := decimal.NewFromString(report.PayoutTotal); err == nil && !amount.IsNegative() {
+			parts = append(parts, "Payout "+amount.StringFixed(2)+" USDC")
+		}
 	}
-	if report.RecordsRead && report.RecordCount > 0 {
-		parts = append(parts, fmt.Sprintf("%d 条记录", report.RecordCount))
+	if len(parts) == 0 {
+		return "Payout — USDC"
 	}
 	return strings.Join(parts, " · ")
 }
@@ -365,21 +310,26 @@ func preheader(report funding.RunReport, duration time.Duration) string {
 			settlementBalanceSummary(report.SettlementBalance),
 		), " · ")
 	}
-	return fmt.Sprintf(
-		"Payout %s USDC · %d 条记录 · Settlement available %s · 耗时 %s",
-		displayAmount(report.PayoutTotal), report.RecordCount,
-		displayAmount(report.SettlementBalance.Available), formatDuration(duration),
-	)
+	return strings.Join(nonempty(
+		recordCount(report)+" 条记录",
+		settlementBalanceSummary(report.SettlementBalance),
+		"耗时 "+formatDuration(duration),
+	), " · ")
 }
 
 func buildSettlementView(report funding.RunReport) settlementView {
 	balance := report.SettlementBalance
 	data := settlementView{
-		Address: fallback(balance.Address, "—"),
-		Total:   displayAmount(balance.Total), Hold: displayAmount(balance.Hold),
+		ShowBalances: balance.Observed && !balance.QueryFailed && !balance.PostPayoutUnconfirmed,
+		RateIssue: report.SettlementRateLimitQueryFailed || report.SettlementRateLimitVisibilityUnconfirmed ||
+			(report.SettlementRateLimitObserved && report.SettlementRateLimitRemaining < 200),
+		Total: displayAmount(balance.Total), Hold: displayAmount(balance.Hold),
 		Available: displayAmount(balance.Available),
 		Status:    "未观察", Color: "#64748b", Tint: "#f8fafc",
 		RateLimit: "未观察", RateColor: "#64748b",
+	}
+	if hold, err := decimal.NewFromString(balance.Hold); err == nil && !hold.IsZero() {
+		data.ShowBreakdown = data.ShowBalances
 	}
 	switch {
 	case balance.PostPayoutUnconfirmed:
@@ -409,22 +359,22 @@ func buildSettlementView(report funding.RunReport) settlementView {
 }
 
 func settlementBalanceSummary(balance funding.SettlementBalanceReport) string {
-	if balance.Observed {
-		return "Settlement available " + balance.Available + " USDC"
-	}
-	if balance.QueryFailed {
-		return "Settlement 结束余额查询失败"
-	}
-	if balance.PostPayoutUnconfirmed {
+	switch {
+	case balance.PostPayoutUnconfirmed:
 		return "Settlement Payout 后余额未确认"
+	case balance.QueryFailed:
+		return "Settlement 结束余额查询失败"
+	case balance.Observed:
+		return "Settlement available " + displayAmount(balance.Available) + " USDC"
+	default:
+		return ""
 	}
-	return ""
 }
 
 func reportStatus(status funding.ReportStatus) (label, color, tint string) {
 	switch status {
 	case funding.ReportStatusSuccess:
-		return "资金任务成功", "#15803d", "#ecfdf3"
+		return "已完成", "#15803d", "#ecfdf3"
 	case funding.ReportStatusWarning:
 		return "成功但有告警", "#b45309", "#fffbeb"
 	case funding.ReportStatusNoData:
@@ -448,21 +398,6 @@ func notificationStatus(status funding.ReportStatus) notification.Status {
 		return notification.StatusRetrying
 	default:
 		return notification.StatusCritical
-	}
-}
-
-func stepStyle(status funding.ReportStepStatus) (symbol, color, tint string) {
-	switch status {
-	case funding.ReportStepSuccess:
-		return "✓", "#15803d", "#ecfdf3"
-	case funding.ReportStepWarning:
-		return "!", "#b45309", "#fffbeb"
-	case funding.ReportStepSkipped:
-		return "–", "#64748b", "#f1f5f9"
-	case funding.ReportStepFailed:
-		return "×", "#b91c1c", "#fef2f2"
-	default:
-		return "·", "#64748b", "#f1f5f9"
 	}
 }
 
@@ -646,7 +581,6 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
     @media only screen and (max-width:620px) {
       .container { width:100% !important; }
       .pad { padding-left:16px !important; padding-right:16px !important; }
-      .metric { display:block !important; width:auto !important; border-right:0 !important; border-bottom:1px solid #e5e9f0 !important; }
       .builder-table { font-size:12px !important; }
     }
   </style>
@@ -655,204 +589,122 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">{{.Preheader}}&#847;&zwnj;&#8199;&#65279;&#847;&zwnj;&#8199;&#65279;</div>
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f3f5f8;">
     <tr><td align="center" style="padding:20px 10px;">
-      <table role="presentation" class="container" width="680" cellspacing="0" cellpadding="0" border="0" style="width:680px;max-width:680px;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
-        <tr>
-          <td class="pad" style="padding:28px 30px;background:{{.StatusTint}};border-bottom:1px solid #e2e8f0;">
-            <div style="font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:{{.StatusColor}};">BUILDER CODE FUNDING</div>
-            <div style="margin-top:8px;font-size:26px;line-height:1.25;font-weight:750;color:{{.StatusColor}};">{{.StatusLabel}}</div>
-            <div style="margin-top:8px;font-size:14px;line-height:1.5;color:#475569;">{{.Preheader}}</div>
-          </td>
-        </tr>
+      <table role="presentation" class="container" width="680" cellspacing="0" cellpadding="0" border="0" style="width:680px;max-width:680px;background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;">
+        <tr><td class="pad" style="padding:22px 30px;background:{{.StatusTint}};">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+            <tr>
+              <td style="font-size:20px;font-weight:700;color:#0f172a;">资金报告</td>
+              <td align="right" style="font-size:14px;font-weight:700;color:{{.StatusColor}};">{{.StatusLabel}}</td>
+            </tr>
+          </table>
+          {{if and (not .ShowFailure) (or .Compact (not .Payouts))}}
+          {{if .Compact}}{{template "compact-payout-summary" .Payouts}}{{end}}
+          <div style="margin-top:12px;">{{template "settlement-summary" .Settlement}}</div>
+          {{end}}
+        </td></tr>
 
-        {{if .Compact}}
-        <tr><td class="pad" style="padding:24px 30px;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;">
-            <tr><td style="padding:18px;">
-              <div style="font-size:13px;font-weight:700;color:#9a3412;">{{.FailureStage}}</div>
-              <div style="margin-top:6px;font-size:16px;font-weight:650;color:#7c2d12;">{{.FailureSummary}}</div>
-              {{if .NextAction}}<div style="margin-top:10px;font-size:14px;line-height:1.55;color:#9a3412;">{{.NextAction}}</div>{{end}}
+        {{if .ShowFailure}}
+        <tr><td class="pad" style="padding:20px 30px;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:{{.StatusTint}};border:1px solid #e2e8f0;border-radius:10px;">
+            <tr><td style="padding:16px;font-size:14px;line-height:1.6;">
+              <strong style="color:{{.StatusColor}};">{{.FailureStage}} · {{.FailureSummary}}</strong>
+              {{if .Compact}}{{template "compact-payout-summary" .Payouts}}{{end}}
+              {{if .NextAction}}<div style="margin-top:8px;color:#475569;">{{.NextAction}}</div>{{end}}
+              {{if or .Compact (not .Payouts)}}<div style="margin-top:10px;">{{template "settlement-summary" .Settlement}}</div>{{end}}
             </td></tr>
           </table>
-	          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:12px;background:{{.Settlement.Tint}};border:1px solid #e2e8f0;border-radius:12px;">
-	            <tr><td style="padding:14px 18px;font-size:13px;color:#475569;">
-	              <strong style="color:{{.Settlement.Color}};">Settlement 结束余额 · {{.Settlement.Status}}</strong><br>
-	              <span style="display:inline-block;margin-top:6px;word-break:break-all;">{{.Settlement.Address}}</span><br>
-	              <span style="display:inline-block;margin-top:6px;">Total {{.Settlement.Total}} USDC · Hold {{.Settlement.Hold}} USDC · Available {{.Settlement.Available}} USDC</span>
-	            </td></tr>
-	          </table>
         </td></tr>
-        {{if .DailyConsolidation.Show}}{{template "daily-consolidation" .DailyConsolidation}}{{end}}
-        {{else}}
-        <tr><td style="padding:0;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-            <tr>
-              <td class="metric" width="25%" align="center" style="padding:20px 8px;border-right:1px solid #e5e9f0;">
-                <div style="font-size:20px;font-weight:750;color:#0f172a;">{{.PayoutTotal}}</div><div style="margin-top:4px;font-size:11px;color:#64748b;">PAYOUT USDC</div>
-              </td>
-              <td class="metric" width="25%" align="center" style="padding:20px 8px;border-right:1px solid #e5e9f0;">
-                <div style="font-size:20px;font-weight:750;color:#0f172a;">{{.RecordCount}}</div><div style="margin-top:4px;font-size:11px;color:#64748b;">RECORDS</div>
-              </td>
-              <td class="metric" width="25%" align="center" style="padding:20px 8px;border-right:1px solid #e5e9f0;">
-                <div style="font-size:20px;font-weight:750;color:#0f172a;">{{.BuilderCount}}</div><div style="margin-top:4px;font-size:11px;color:#64748b;">BUILDERS</div>
-              </td>
-              <td class="metric" width="25%" align="center" style="padding:20px 8px;">
-                <div style="font-size:20px;font-weight:750;color:#0f172a;">{{.Duration}}</div><div style="margin-top:4px;font-size:11px;color:#64748b;">DURATION</div>
-              </td>
-            </tr>
-          </table>
-        </td></tr>
+        {{end}}
 
-        {{if .DailyConsolidation.Show}}{{template "daily-consolidation" .DailyConsolidation}}{{end}}
-
-        <tr><td class="pad" style="padding:26px 30px 8px;border-top:1px solid #e5e9f0;">
-          <div style="font-size:16px;font-weight:750;color:#0f172a;">执行流程</div>
+        {{if not .Compact}}
+        {{if .Payouts}}
+        <tr><td class="pad" style="padding:20px 30px 8px;">
+          <div style="font-size:15px;font-weight:700;color:#0f172a;">Payout 明细</div>
         </td></tr>
-        <tr><td class="pad" style="padding:4px 30px 22px;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-            {{range .Stages}}
-            <tr>
-              <td width="34" valign="top" style="padding:7px 0;">
-                <div style="width:24px;height:24px;line-height:24px;text-align:center;border-radius:50%;font-size:13px;font-weight:800;color:{{.Color}};background:{{.Tint}};">{{.Symbol}}</div>
-              </td>
-              <td style="padding:7px 0;border-bottom:1px solid #f1f5f9;">
-                <span style="font-size:14px;font-weight:700;color:#334155;">{{.Label}}</span>
-                <span style="margin-left:8px;font-size:13px;color:#64748b;">{{.Summary}}</span>
-              </td>
-            </tr>
+        {{range .Payouts}}
+        <tr><td class="pad" style="padding:0 30px 20px;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13px;line-height:1.6;background:#f8fafc;border-radius:10px;">
+            <tr><td colspan="2" style="padding:14px 16px 10px;">
+              <div style="font-size:12px;color:#64748b;">{{.Name}}</div>
+              <div style="font-size:24px;font-weight:700;color:#0f172a;">{{.Amount}} <span style="font-size:13px;font-weight:400;color:#64748b;">USDC · {{.RecordCount}} 条记录</span></div>
+            </td></tr>
+            <tr><td colspan="2" style="padding:0 16px 10px;">
+              <span style="color:#64748b;">付款状态 </span><strong style="color:{{.StatusColor}};">{{.Status}}</strong>
+              <span style="color:#64748b;"> · 数据库状态 </span><strong style="color:{{.DatabaseColor}};">{{.Database}}</strong>
+            </td></tr>
+            {{if .ShowDiagnostics}}
+            <tr><td style="padding:0 16px 10px;color:#64748b;">Raw total</td><td style="padding:0 16px 10px;">{{.RawTotal}} USDC</td></tr>
+            <tr><td style="padding:0 16px 10px;color:#64748b;">付款前 total</td><td style="padding:0 16px 10px;">{{.TotalBefore}} USDC</td></tr>
+            <tr><td style="padding:0 16px 10px;color:#64748b;">首次 Submit</td><td style="padding:0 16px 10px;">{{.FirstSubmit}}</td></tr>
+            <tr><td style="padding:0 16px 10px;color:#64748b;">Exact replay</td><td style="padding:0 16px 10px;">{{.ExactReplay}}</td></tr>
+            <tr><td style="padding:0 16px 10px;color:#64748b;">确认依据</td><td style="padding:0 16px 10px;">{{.Evidence}}</td></tr>
+            <tr><td style="padding:0 16px 14px;color:#64748b;">Nonce</td><td style="padding:0 16px 14px;">{{.Nonce}}</td></tr>
             {{end}}
+            <tr><td colspan="2" style="padding:0 16px 14px;">{{template "settlement-summary" $.Settlement}}</td></tr>
           </table>
         </td></tr>
+        {{end}}
+        {{end}}
+        {{end}}
 
-        <tr><td class="pad" style="padding:22px 30px 10px;border-top:1px solid #e5e9f0;">
-          <div style="font-size:16px;font-weight:750;color:#0f172a;">Settlement 结束余额</div>
-        </td></tr>
-        <tr><td class="pad" style="padding:4px 30px 24px;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13px;line-height:1.55;background:{{.Settlement.Tint}};border:1px solid #e2e8f0;border-radius:10px;">
-            <tr><td style="padding:14px 16px;color:#64748b;">状态</td><td style="padding:14px 16px;color:{{.Settlement.Color}};font-weight:700;">{{.Settlement.Status}}</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">地址</td><td style="padding:0 16px 12px;word-break:break-all;">{{.Settlement.Address}}</td></tr>
-            <tr><td style="padding:0 16px 12px;color:#64748b;">Total</td><td style="padding:0 16px 12px;font-weight:700;">{{.Settlement.Total}} USDC</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">Hold</td><td style="padding:0 16px 12px;">{{.Settlement.Hold}} USDC</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">Available</td><td style="padding:0 16px 12px;font-weight:700;">{{.Settlement.Available}} USDC</td></tr>
-	            <tr><td style="padding:0 16px 14px;color:#64748b;">Rate Limit</td><td style="padding:0 16px 14px;color:{{.Settlement.RateColor}};">{{.Settlement.RateLimit}}</td></tr>
+        {{if .DailyConsolidation.Show}}
+        <tr><td class="pad" style="padding:18px 30px;border-top:1px solid #e5e9f0;">
+          <div style="font-size:15px;font-weight:700;color:#0f172a;">归集对账 <span style="font-size:12px;font-weight:400;color:#64748b;">{{.DailyConsolidation.UTCDate}} UTC 00:00</span></div>
+          <div style="margin-top:8px;font-size:13px;color:{{.DailyConsolidation.Color}};">{{.DailyConsolidation.Status}} · Builder 覆盖 {{.DailyConsolidation.Coverage}}</div>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:8px;font-size:13px;line-height:1.6;">
+            <tr><td style="padding:3px 0;color:#64748b;">{{.DailyConsolidation.TotalLabel}}</td><td align="right" style="padding:3px 0;">{{.DailyConsolidation.Total}} USDC</td></tr>
+            <tr><td style="padding:3px 0;color:#64748b;">对账差额（Claimable - Payout）</td><td align="right" style="padding:3px 0;color:{{.DailyConsolidation.DifferenceColor}};">{{.DailyConsolidation.Difference}} USDC</td></tr>
           </table>
         </td></tr>
+        {{end}}
 
+        {{if not .Compact}}
         {{if .Builders}}
-        <tr><td class="pad" style="padding:22px 30px 10px;border-top:1px solid #e5e9f0;">
-          <div style="font-size:16px;font-weight:750;color:#0f172a;">Builder 明细</div>
-        </td></tr>
-        <tr><td class="pad" style="padding:4px 30px 24px;">
-          <table role="presentation" class="builder-table" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size:13px;border-collapse:collapse;">
+        <tr><td class="pad" style="padding:0 30px 20px;">
+          <div style="margin:8px 0;font-size:14px;font-weight:700;color:#0f172a;">Builder 明细</div>
+          <table class="builder-table" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#f8fafc;color:#64748b;">
-              <th align="left" style="padding:10px 8px;">Builder</th>
-              <th align="left" style="padding:10px 8px;">00:00 Reward</th>
-              <th align="left" style="padding:10px 8px;">Sweep</th>
-              <th align="left" style="padding:10px 8px;">Rate Limit</th>
+              <th align="left" style="padding:8px;">Builder</th>
+              <th align="left" style="padding:8px;">00:00 Reward</th>
+              <th align="left" style="padding:8px;">Sweep</th>
             </tr>
             {{range .Builders}}
             <tr>
-              <td valign="top" style="padding:12px 8px;border-bottom:1px solid #edf1f5;"><strong style="color:#334155;">{{.Name}}</strong><br><span style="font-size:11px;color:#94a3b8;">{{.Address}}</span></td>
-              <td valign="top" style="padding:12px 8px;border-bottom:1px solid #edf1f5;"><span style="color:#64748b;">{{.Claimable}}</span><br><span style="color:{{.ClaimColor}};">{{.Claim}}</span></td>
-              <td valign="top" style="padding:12px 8px;border-bottom:1px solid #edf1f5;color:{{.SweepColor}};">{{.Sweep}}</td>
-              <td valign="top" style="padding:12px 8px;border-bottom:1px solid #edf1f5;color:{{.RateColor}};">{{.RateLimit}}</td>
+              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;"><strong style="color:#334155;">{{.Name}}</strong><br><span style="font-size:11px;color:#94a3b8;">{{.Address}}</span>{{if .RateIssue}}<br><span style="font-size:11px;color:{{.RateColor}};">Rate Limit · {{.RateLimit}}</span>{{end}}</td>
+              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;"><span style="color:#64748b;">{{.Claimable}}</span><br><span style="color:{{.ClaimColor}};">{{.Claim}}</span></td>
+              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;color:{{.SweepColor}};">{{.Sweep}}</td>
             </tr>
             {{end}}
           </table>
         </td></tr>
         {{end}}
-
-	        {{if .Payouts}}
-	        <tr><td class="pad" style="padding:22px 30px 10px;border-top:1px solid #e5e9f0;">
-	          <div style="font-size:16px;font-weight:750;color:#0f172a;">Payout 明细</div>
-	        </td></tr>
-	        {{range .Payouts}}
-	        <tr><td class="pad" style="padding:4px 30px 24px;">
-	          <div style="margin-bottom:8px;font-size:14px;font-weight:750;color:#334155;">{{.Name}}</div>
-	          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13px;line-height:1.55;background:#f8fafc;border-radius:10px;">
-	            <tr><td style="padding:14px 16px;color:#64748b;">付款状态</td><td style="padding:14px 16px;color:{{.StatusColor}};font-weight:700;">{{.Status}}</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">数据库状态</td><td style="padding:0 16px 12px;color:{{.DatabaseColor}};font-weight:700;">{{.Database}}</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">Records</td><td style="padding:0 16px 12px;">{{.RecordCount}}</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">金额</td><td style="padding:0 16px 12px;font-weight:700;">{{.Amount}} USDC</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">Raw total</td><td style="padding:0 16px 12px;">{{.RawTotal}} USDC</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">付款前 total</td><td style="padding:0 16px 12px;">{{.TotalBefore}} USDC</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">首次 Submit</td><td style="padding:0 16px 12px;">{{.FirstSubmit}}</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">Exact replay</td><td style="padding:0 16px 12px;">{{.ExactReplay}}</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">确认依据</td><td style="padding:0 16px 12px;">{{.Evidence}}</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">Settlement</td><td style="padding:0 16px 12px;word-break:break-all;">{{.Settlement}}</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">Recipient</td><td style="padding:0 16px 12px;word-break:break-all;">{{.Recipient}}</td></tr>
-	            <tr><td style="padding:0 16px 12px;color:#64748b;">Request hash</td><td style="padding:0 16px 12px;word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;">{{.RequestHash}}</td></tr>
-	            <tr><td style="padding:0 16px 14px;color:#64748b;">Nonce</td><td style="padding:0 16px 14px;">{{.Nonce}}</td></tr>
-	          </table>
-	        </td></tr>
-	        {{end}}
-	        {{end}}
+        {{end}}
 
         {{if .Warnings}}
-        <tr><td class="pad" style="padding:22px 30px;border-top:1px solid #e5e9f0;">
-          <div style="font-size:15px;font-weight:750;color:#92400e;">告警</div>
-          <ul style="margin:10px 0 0;padding-left:20px;color:#92400e;font-size:13px;line-height:1.6;">{{range .Warnings}}<li>{{.}}</li>{{end}}</ul>
+        <tr><td class="pad" style="padding:18px 30px;border-top:1px solid #e5e9f0;">
+          <div style="font-size:14px;font-weight:700;color:#92400e;">告警</div>
+          <ul style="margin:8px 0 0;padding-left:20px;color:#92400e;font-size:13px;line-height:1.6;">{{range .Warnings}}<li>{{.}}</li>{{end}}</ul>
         </td></tr>
         {{end}}
 
-        {{if .ShowFailure}}
-        <tr><td class="pad" style="padding:22px 30px;border-top:1px solid #e5e9f0;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#fef2f2;border:1px solid #fecaca;border-radius:12px;">
-            <tr><td style="padding:18px;">
-              <div style="font-size:13px;font-weight:700;color:#991b1b;">{{.FailureStage}}</div>
-              <div style="margin-top:6px;font-size:15px;font-weight:700;color:#7f1d1d;">{{.FailureSummary}}</div>
-              {{if .NextAction}}<div style="margin-top:10px;font-size:13px;line-height:1.55;color:#991b1b;"><strong>下一步: </strong>{{.NextAction}}</div>{{end}}
-            </td></tr>
-          </table>
-        </td></tr>
-        {{end}}
-        {{end}}
-
-        <tr><td class="pad" style="padding:22px 30px;background:#f8fafc;border-top:1px solid #e5e9f0;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:11px;line-height:1.7;color:#64748b;">
-            <tr><td>Run ID</td><td align="right" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">{{.RunID}}</td></tr>
-            <tr><td>触发 / 执行</td><td align="right">{{.Trigger}} · {{.Execution}}</td></tr>
-            <tr><td>Network / Phase</td><td align="right">{{.Network}} · {{.Phase}}</td></tr>
-            <tr><td>开始</td><td align="right">{{.StartedAt}}</td></tr>
-            <tr><td>结束</td><td align="right">{{.FinishedAt}}</td></tr>
-          </table>
+        <tr><td class="pad" style="padding:16px 30px;background:#f8fafc;border-top:1px solid #e5e9f0;font-size:11px;line-height:1.8;color:#64748b;">
+          <div>{{.Network}} · {{.FinishedAt}} · 耗时 {{.Duration}}</div>
+          <div style="word-break:break-all;">{{.Trigger}} · {{.Execution}} · Run ID: {{.RunID}}{{if .ShowFailure}} · Phase: {{.Phase}}{{end}}</div>
         </td></tr>
       </table>
     </td></tr>
   </table>
 </body>
-</html>
-
-{{define "daily-consolidation"}}
-<tr><td class="pad" style="padding:22px 30px 24px;border-top:1px solid #e5e9f0;">
-  <div style="font-size:16px;font-weight:750;color:#0f172a;">UTC 00:00 Claim 与资金归集</div>
-  <div style="margin-top:7px;font-size:13px;line-height:1.55;color:#64748b;">
-    零点先并行捕获各 Builder 的 Claimable 作为对账基准并落盘，再执行 Reward 领取与资金归集；Claim 的执行结果不会改变零点数据。
-  </div>
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:12px;font-size:13px;line-height:1.55;background:{{.Tint}};border:1px solid #e2e8f0;border-radius:10px;">
-    <tr><td style="padding:13px 16px;color:#64748b;">状态</td><td style="padding:13px 16px;color:{{.Color}};font-weight:700;">{{.Status}}</td></tr>
-    <tr><td style="padding:0 16px 11px;color:#64748b;">归集日期</td><td style="padding:0 16px 11px;">{{.UTCDate}} UTC</td></tr>
-    <tr><td style="padding:0 16px 11px;color:#64748b;">Claimable 捕获完成</td><td style="padding:0 16px 11px;">{{.CapturedAt}}</td></tr>
-    <tr><td style="padding:0 16px 11px;color:#64748b;">完成时间</td><td style="padding:0 16px 11px;">{{.CompletedAt}}</td></tr>
-    <tr><td style="padding:0 16px 11px;color:#64748b;">{{.TotalLabel}}</td><td style="padding:0 16px 11px;font-weight:700;">{{.Total}} USDC</td></tr>
-    <tr><td style="padding:0 16px 11px;color:#64748b;">Builder 覆盖</td><td style="padding:0 16px 11px;">{{.Coverage}}</td></tr>
-	    <tr><td style="padding:0 16px 11px;color:#64748b;">本轮 Referral Payout</td><td style="padding:0 16px 11px;font-weight:700;">{{.PayoutTotal}} USDC</td></tr>
-	    <tr><td style="padding:0 16px 13px;color:#64748b;">对账差额（Claimable - Referral Payout）</td><td style="padding:0 16px 13px;font-weight:700;color:{{.DifferenceColor}};">{{.Difference}} USDC</td></tr>
-  </table>
-  {{if .Builders}}
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:12px;font-size:13px;border-collapse:collapse;">
-    <tr style="background:#f8fafc;color:#64748b;">
-      <th align="left" style="padding:9px 8px;">Builder</th>
-      <th align="left" style="padding:9px 8px;">00:00 Claimable</th>
-      <th align="left" style="padding:9px 8px;">状态</th>
-    </tr>
-    {{range .Builders}}
-    <tr>
-      <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;"><strong style="color:#334155;">{{.Name}}</strong><br><span style="font-size:11px;color:#94a3b8;">{{.Address}}</span></td>
-      <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;">{{.Amount}}</td>
-      <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;color:{{.Color}};">{{.Status}}</td>
-    </tr>
-    {{end}}
-  </table>
-  {{end}}
-</td></tr>
+</html>{{define "compact-payout-summary"}}{{range .}}
+<div style="margin-top:8px;font-size:13px;line-height:1.6;">
+  <strong style="color:#0f172a;">Payout {{.Amount}} USDC</strong>
+  <span style="color:#64748b;"> · 付款状态 </span><span style="color:{{.StatusColor}};">{{.Status}}</span>
+  <span style="color:#64748b;"> · 数据库状态 </span><span style="color:{{.DatabaseColor}};">{{.Database}}</span>
+</div>
+{{end}}{{end}}{{define "settlement-summary"}}
+<div style="font-size:13px;line-height:1.6;">
+  <span style="color:#64748b;">Settlement 结束余额 · </span><span style="color:{{.Color}};">{{if .ShowBalances}}Available {{.Available}} USDC{{else}}{{.Status}}{{end}}</span>
+</div>
+{{if .ShowBreakdown}}<div style="margin-top:3px;font-size:12px;color:#64748b;">Total {{.Total}} USDC · Hold {{.Hold}} USDC</div>{{end}}
+{{if .RateIssue}}<div style="margin-top:3px;font-size:12px;color:{{.RateColor}};">Rate Limit · {{.RateLimit}}</div>{{end}}
 {{end}}`))

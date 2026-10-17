@@ -162,7 +162,7 @@ func (o *Orchestrator) recoverState(
 			report.failTarget(
 				target.Kind, "payout",
 				"已确认 Payout 状态不完整，未更新数据库。",
-				"请保留 current 状态并核查 journal、request hash 与付款前余额边界。",
+				"请保留 current 状态并核查持久化的完整请求、nonce 与付款前余额边界。",
 			)
 			return &FatalError{Err: fmt.Errorf("validate confirmed payout state: %w", err)}
 		}

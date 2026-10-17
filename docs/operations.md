@@ -102,10 +102,12 @@ data/
 | 🟠 | 普通失败，仍有自动重试 |
 | 🔴 | fatal、重试耗尽，或需人工核查 payout |
 
-🟠 为精简重试通知；其余终态含完整明细。报告显示 Referral Payout，并用六位向上取整后的
-payout total 与零点 claimable 对账，还显示首次提交、是否发生一次 exact replay，
-以及发送方精确减少 amount、精确减少 amount + 1 USDC 或最终 blocked 的结果。Claimable 短缺只升
-warning，不阻止 settlement 充足时的 payout。
+成功邮件标题为 `🟢 <配置前缀> Payout 123.45 USDC`，金额取本轮总 payout，四舍五入保留两位小数；
+正文金额仍保留完整精度。正文集中展示付款与数据库状态、结算可用余额、归集对账和一份 Builder
+明细，正常的 Rate Limit 与单次查询/提交次数不再展示。告警、失败、恢复执行或 exact replay 时，
+完整报告的付款部分保留首次提交、重放、确认依据、nonce 等排查信息。🟠 重试通知保留
+精确 Payout 金额及付款、数据库状态摘要，以及失败原因、下一步、结算余额与对账摘要。
+Claimable 短缺只升 warning，不阻止 settlement 充足时的 payout。
 
 ## 故障处置
 
@@ -141,8 +143,8 @@ Referral target 状态为 `payout_confirmed`：先校验持久化 journal、请�
 相同的请求，保持相同 nonce 与签名，绝不重新 Prepare。查询样本不足或出现任何其他余额变化时直接
 blocked，不重放。重放返回 `Invalid nonce: duplicate nonce ...`、再次超时或响应仍不明确时，只再观察一次
 settlement；仍无法确认即进入最终 blocked，发送终态报告并结束本次任务。Blocked 后禁止第三次 Submit，
-也禁止生成新 nonce。根据 current 中 referral target 的 manifest、recipient、amount、nonce、request
-hash、settlement total before、首次提交与 exact replay 记录和时间人工核查：
+也禁止生成新 nonce。根据 current 中 referral target 的 manifest、recipient、amount、nonce、
+完整签名请求、settlement total before、首次提交与 exact replay 记录和时间人工核查：
 
 - **已付款**：停机状态下幂等完成 manifest 中 records，再归档并移走 current/backup；
 - **未付款**：保留现场归档后，停机状态下移走 current/backup，再允许重新运行；
