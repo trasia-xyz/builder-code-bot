@@ -22,11 +22,16 @@ func TestNotifierSendsConciseFundingSubjectWithStatusAndPrefix(t *testing.T) {
 	message := fundingreport.Render(funding.RunReport{
 		Status: funding.ReportStatusSuccess, RecordsRead: true, RecordCount: 42,
 		PayoutTotal: "123.456789",
+		DailyConsolidation: funding.DailyConsolidationReport{
+			UTCDate: "2026-07-23", Status: funding.DailyConsolidationCompleted,
+			TotalClaimableUSDC: "200.123456", BuilderCount: 1,
+			RecordedBuilders: 1, ObservedBuilders: 1, Observed: true, CoversPayout: true,
+		},
 	})
 	if err := notifier.Notify(context.Background(), message); err != nil {
 		t.Fatal(err)
 	}
-	if got := aws.ToString(fake.input.Message.Subject.Data); got != "🟢 [prod] Payout 123.46 USDC" {
+	if got := aws.ToString(fake.input.Message.Subject.Data); got != "🟢 [prod] 收入 76.67 USDC" {
 		t.Fatalf("sent subject = %q", got)
 	}
 	if got := aws.ToString(fake.input.Message.Body.Html.Data); got != message.HTMLBody {

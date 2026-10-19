@@ -66,18 +66,18 @@ func TestRenderKeepsWarningDetailsAndEscapesValues(t *testing.T) {
 	if message.Status != notification.StatusWarning {
 		t.Fatalf("message status = %q", message.Status)
 	}
-	if message.Subject != "成功但有告警 · Payout 1.50 USDC" {
+	if message.Subject != "成功但有告警 · 收入 -0.30 USDC" {
 		t.Fatalf("subject = %q", message.Subject)
 	}
 	for _, want := range []string{
-		"成功但有告警", "1.5 USDC", "Builder 明细", "Payout 明细",
+		"成功但有告警", "1.5 USDC", "Payout 明细",
 		"Referral Payout",
 		"Settlement 精确减少 amount", "1 USDC（新地址费用）",
 		"首次 Submit", "Exact replay", "已授权 / 可能已发送（原请求 / 相同 nonce）",
 		"0x123456…345678", "builder-1: Reward 领取结果不确定",
 		"Settlement 结束余额", "0.4 USDC",
 		"归集对账", "零点 Claimable 合计", "1.2 USDC",
-		"00:00 Reward", "对账差额（Claimable - Payout）", "-0.3 USDC",
+		"00:00 Reward", "收入（Claimable - Payout）", "-0.3",
 		"提交 3 次", "完整但低于 Payout", "短缺 0.3 USDC",
 	} {
 		if !strings.Contains(message.HTMLBody, want) {
@@ -229,7 +229,7 @@ func TestBuildDailyConsolidationViewShowsCoveredPayoutAsNormal(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			view := buildDailyConsolidationView(funding.RunReport{
-				PayoutTotal: tt.payout,
+				RecordsRead: true, PayoutTotal: tt.payout,
 				DailyConsolidation: funding.DailyConsolidationReport{
 					UTCDate: "2026-07-23", Status: funding.DailyConsolidationCompleted,
 					TotalClaimableUSDC: tt.claimable,
@@ -366,7 +366,7 @@ func TestRenderCompactRetryKeepsExactPayoutAndIndependentStatuses(t *testing.T) 
 			if count := strings.Count(message.HTMLBody, tt.amount); count != 1 {
 				t.Fatalf("exact payout amount appears %d times, want once", count)
 			}
-			if tt.name == "tiny payout" && !strings.HasSuffix(message.Subject, "Payout 0.00 USDC") {
+			if tt.name == "tiny payout" && !strings.HasSuffix(message.Subject, "收入 1.50 USDC") {
 				t.Fatalf("tiny payout subject = %q", message.Subject)
 			}
 			for _, omitted := range []string{
@@ -411,24 +411,25 @@ func TestRenderCompactEarlyFailureDoesNotInventPayout(t *testing.T) {
 func TestRenderSubjectUsesRoundedAmountWithoutChangingBodyPrecision(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
-		name, amount, outcome, want string
-		status                      funding.ReportStatus
+		name, claimable, amount, outcome, want string
+		status                                 funding.ReportStatus
 	}{
-		{name: "success", status: funding.ReportStatusSuccess, amount: "123.45", want: "Payout 123.45 USDC"},
-		{name: "missing amount", status: funding.ReportStatusSuccess, want: "Payout — USDC"},
-		{name: "round up", status: funding.ReportStatusSuccess, amount: "1.235", want: "Payout 1.24 USDC"},
-		{name: "tiny payout", status: funding.ReportStatusSuccess, amount: "0.000001", want: "Payout 0.00 USDC"},
-		{name: "warning", status: funding.ReportStatusWarning, amount: "1.5", want: "成功但有告警 · Payout 1.50 USDC"},
-		{name: "critical", status: funding.ReportStatusCritical, amount: "1.5", want: "需要人工处理 · Payout 1.50 USDC"},
-		{name: "retry", status: funding.ReportStatusRetrying, amount: "1.234568", want: "第 2/6 次执行失败 · 等待重试 · Payout 1.23 USDC"},
-		{name: "exhausted", status: funding.ReportStatusCritical, outcome: "retry_exhausted", amount: "1.5", want: "自动重试已耗尽 · Payout 1.50 USDC"},
-		{name: "no data", status: funding.ReportStatusNoData, outcome: "no_data", amount: "0", want: "无待处理数据"},
-		{name: "no data warning", status: funding.ReportStatusWarning, outcome: "no_data", amount: "0", want: "无数据但有告警"},
+		{name: "success", status: funding.ReportStatusSuccess, claimable: "124.95", amount: "1.5", want: "收入 123.45 USDC"},
+		{name: "missing amount", status: funding.ReportStatusSuccess, claimable: "1.5", want: "收入 — USDC"},
+		{name: "round up", status: funding.ReportStatusSuccess, claimable: "2.735", amount: "1.5", want: "收入 1.24 USDC"},
+		{name: "tiny income", status: funding.ReportStatusSuccess, claimable: "1.500001", amount: "1.5", want: "收入 0.00 USDC"},
+		{name: "warning", status: funding.ReportStatusWarning, claimable: "3", amount: "1.5", want: "成功但有告警 · 收入 1.50 USDC"},
+		{name: "critical", status: funding.ReportStatusCritical, claimable: "3", amount: "1.5", want: "需要人工处理 · 收入 1.50 USDC"},
+		{name: "retry", status: funding.ReportStatusRetrying, claimable: "2.469136", amount: "1.234568", want: "第 2/6 次执行失败 · 等待重试 · 收入 1.23 USDC"},
+		{name: "exhausted", status: funding.ReportStatusCritical, outcome: "retry_exhausted", claimable: "3", amount: "1.5", want: "自动重试已耗尽 · 收入 1.50 USDC"},
+		{name: "no data", status: funding.ReportStatusNoData, outcome: "no_data", claimable: "1.5", amount: "0", want: "无待处理数据 · 收入 1.50 USDC"},
+		{name: "no data warning", status: funding.ReportStatusWarning, outcome: "no_data", claimable: "1.5", amount: "0", want: "无数据但有告警 · 收入 1.50 USDC"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			report := successfulReport()
 			report.Status, report.Outcome = tt.status, tt.outcome
 			report.Compact = tt.status == funding.ReportStatusRetrying
+			report.DailyConsolidation.TotalClaimableUSDC = tt.claimable
 			report.PayoutTotal = tt.amount
 			report.Payouts[0].Payout.Amount = tt.amount
 			report.Attempt, report.MaxAttempts = 2, 6
@@ -452,7 +453,7 @@ func TestRenderSuccessfulReportKeepsOneConciseSetOfDetails(t *testing.T) {
 	message := Render(report)
 	assertNoRequestHashHTML(t, message.HTMLBody)
 	for _, want := range []string{
-		"Builder 明细", "00:00 Reward", "Reward 已领取", "资金已归集",
+		"00:00 Reward", "Reward 已领取", "资金已归集",
 		"Payout 明细", "付款状态", "数据库状态",
 		"Settlement 结束余额", "Available", "8.765432 USDC",
 		"归集对账", "2026-07-23", "完整，Claimable ≥ Payout",
@@ -467,6 +468,7 @@ func TestRenderSuccessfulReportKeepsOneConciseSetOfDetails(t *testing.T) {
 		}
 	}
 	for _, omitted := range []string{
+		"Builder 明细",
 		"执行流程", "PAYOUT USDC", "RECORDS", "BUILDERS", "DURATION",
 		"本轮 Referral Payout", "Claimable 作为对账基准", "查询 1 次", "提交 1 次",
 		"Rate Limit", "剩余 999", "剩余 888", "首次 Submit", "Exact replay",
@@ -504,6 +506,54 @@ func TestRenderRetainsPayoutDiagnosticsWhenInvestigationIsNeeded(t *testing.T) {
 			} {
 				if !strings.Contains(message.HTMLBody, want) {
 					t.Fatalf("diagnostic body missing %q", want)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderPrioritizesConsolidationAndOnlyListsMultipleBuilders(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		count   int
+		compact bool
+	}{
+		{name: "no builders"},
+		{name: "single builder", count: 1},
+		{name: "multiple builders", count: 2},
+		{name: "compact multiple builders", count: 2, compact: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			report := successfulReport()
+			builder := report.Builders[0]
+			report.Builders = nil
+			for i := 0; i < tt.count; i++ {
+				report.Builders = append(report.Builders, builder)
+			}
+			report.Compact = tt.compact
+			body := Render(report).HTMLBody
+			showDetails := tt.count > 1 && !tt.compact
+			if strings.Contains(body, "Builder 明细") != showDetails {
+				t.Fatalf("Builder details visibility is wrong for %s", tt.name)
+			}
+			payoutLabel := "Payout 明细"
+			if tt.compact {
+				payoutLabel = "Payout 1.234568 USDC"
+				if strings.Contains(body, builder.Name) {
+					t.Fatal("compact report contains builder details")
+				}
+			} else if got := strings.Count(body, builder.Name); got != tt.count {
+				t.Fatalf("builder names appear %d times, want %d", got, tt.count)
+			}
+			consolidation, payout := strings.Index(body, "归集对账"), strings.Index(body, payoutLabel)
+			if consolidation < 0 || payout < 0 || consolidation >= payout {
+				t.Fatal("consolidation must precede payout")
+			}
+			if showDetails {
+				details := strings.Index(body, "Builder 明细")
+				if details <= consolidation || details >= payout {
+					t.Fatal("builder details must follow consolidation and precede payout")
 				}
 			}
 		})

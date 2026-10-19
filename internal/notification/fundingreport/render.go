@@ -22,6 +22,7 @@ type view struct {
 	Compact            bool
 	Duration           string
 	Builders           []builderView
+	SingleBuilder      *builderView
 	DailyConsolidation dailyConsolidationView
 	Settlement         settlementView
 	Payouts            []payoutView
@@ -39,16 +40,17 @@ type view struct {
 }
 
 type builderView struct {
-	Name       string
-	Address    string
-	Claimable  string
-	Claim      string
-	ClaimColor string
-	Sweep      string
-	SweepColor string
-	RateLimit  string
-	RateColor  string
-	RateIssue  bool
+	Name             string
+	Address          string
+	Claimable        string
+	ClaimableQueries string
+	Claim            string
+	ClaimColor       string
+	Sweep            string
+	SweepColor       string
+	RateLimit        string
+	RateColor        string
+	RateIssue        bool
 }
 
 type dailyConsolidationView struct {
@@ -183,6 +185,12 @@ func buildView(report funding.RunReport) view {
 			RateIssue: builder.RateLimitQueryFailed || builder.RateLimitVisibilityUnconfirmed ||
 				(builder.RateLimitObserved && builder.RateLimitRemaining < 200),
 		})
+		if builder.ClaimableQueryAttempts > 1 {
+			data.Builders[len(data.Builders)-1].ClaimableQueries = fmt.Sprintf("Claimable 查询 %d 次", builder.ClaimableQueryAttempts)
+		}
+	}
+	if !report.Compact && len(data.Builders) == 1 {
+		data.SingleBuilder = &data.Builders[0]
 	}
 
 	for _, target := range report.Payouts {
@@ -260,20 +268,30 @@ func buildDailyConsolidationView(report funding.RunReport) dailyConsolidationVie
 	case consolidation.Observed:
 		data.Status, data.Color, data.Tint = "记录不完整", "#b45309", "#fffbeb"
 	}
-	if consolidation.Observed && consolidation.ObservedBuilders == consolidation.BuilderCount {
-		claimable, claimableErr := decimal.NewFromString(consolidation.TotalClaimableUSDC)
-		payout, payoutErr := decimal.NewFromString(report.PayoutTotal)
-		if claimableErr == nil && payoutErr == nil {
-			difference := claimable.Sub(payout)
-			data.Difference = difference.String()
-			if difference.IsNegative() {
-				data.DifferenceColor = "#b91c1c"
-			} else {
-				data.DifferenceColor = "#15803d"
-			}
+	if income, ok := reportIncome(report); ok {
+		data.Difference = income.String()
+		if income.IsNegative() {
+			data.DifferenceColor = "#b91c1c"
+		} else {
+			data.DifferenceColor = "#15803d"
 		}
 	}
 	return data
+}
+
+func reportIncome(report funding.RunReport) (decimal.Decimal, bool) {
+	consolidation := report.DailyConsolidation
+	if !report.RecordsRead || !consolidation.Observed || consolidation.Missing || consolidation.LoadFailed ||
+		consolidation.BuilderCount <= 0 || consolidation.RecordedBuilders != consolidation.BuilderCount ||
+		consolidation.ObservedBuilders != consolidation.BuilderCount {
+		return decimal.Zero, false
+	}
+	claimable, claimableErr := decimal.NewFromString(consolidation.TotalClaimableUSDC)
+	payout, payoutErr := decimal.NewFromString(report.PayoutTotal)
+	if claimableErr != nil || payoutErr != nil || claimable.IsNegative() || payout.IsNegative() {
+		return decimal.Zero, false
+	}
+	return claimable.Sub(payout), true
 }
 
 func subject(report funding.RunReport, statusLabel string) string {
@@ -284,13 +302,11 @@ func subject(report funding.RunReport, statusLabel string) string {
 		}
 		parts = append(parts, statusLabel)
 	}
-	if report.Status != funding.ReportStatusNoData && report.Outcome != "no_data" {
-		if amount, err := decimal.NewFromString(report.PayoutTotal); err == nil && !amount.IsNegative() {
-			parts = append(parts, "Payout "+amount.StringFixed(2)+" USDC")
-		}
+	if income, ok := reportIncome(report); ok {
+		parts = append(parts, "收入 "+income.StringFixed(2)+" USDC")
 	}
 	if len(parts) == 0 {
-		return "Payout — USDC"
+		return "收入 — USDC"
 	}
 	return strings.Join(parts, " · ")
 }
@@ -597,10 +613,6 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
               <td align="right" style="font-size:14px;font-weight:700;color:{{.StatusColor}};">{{.StatusLabel}}</td>
             </tr>
           </table>
-          {{if and (not .ShowFailure) (or .Compact (not .Payouts))}}
-          {{if .Compact}}{{template "compact-payout-summary" .Payouts}}{{end}}
-          <div style="margin-top:12px;">{{template "settlement-summary" .Settlement}}</div>
-          {{end}}
         </td></tr>
 
         {{if .ShowFailure}}
@@ -608,12 +620,51 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
           <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:{{.StatusTint}};border:1px solid #e2e8f0;border-radius:10px;">
             <tr><td style="padding:16px;font-size:14px;line-height:1.6;">
               <strong style="color:{{.StatusColor}};">{{.FailureStage}} · {{.FailureSummary}}</strong>
-              {{if .Compact}}{{template "compact-payout-summary" .Payouts}}{{end}}
               {{if .NextAction}}<div style="margin-top:8px;color:#475569;">{{.NextAction}}</div>{{end}}
-              {{if or .Compact (not .Payouts)}}<div style="margin-top:10px;">{{template "settlement-summary" .Settlement}}</div>{{end}}
             </td></tr>
           </table>
         </td></tr>
+        {{end}}
+
+        {{if or .DailyConsolidation.Show .SingleBuilder}}
+        <tr><td class="pad" style="padding:20px 30px;">
+          <div style="font-size:15px;font-weight:700;color:#0f172a;">归集对账{{if .DailyConsolidation.Show}} <span style="font-size:12px;font-weight:400;color:#64748b;">{{.DailyConsolidation.UTCDate}} UTC 00:00</span>{{end}}</div>
+          {{if .DailyConsolidation.Show}}
+          <div style="margin-top:12px;font-size:12px;color:#64748b;">收入（Claimable - Payout）</div>
+          <div style="margin-top:2px;font-size:28px;font-weight:700;color:{{.DailyConsolidation.DifferenceColor}};">{{.DailyConsolidation.Difference}} <span style="font-size:13px;font-weight:400;color:#64748b;">USDC</span></div>
+          <div style="margin-top:8px;font-size:13px;color:{{.DailyConsolidation.Color}};">{{.DailyConsolidation.Status}} · Builder 覆盖 {{.DailyConsolidation.Coverage}}</div>
+          <div style="margin-top:8px;font-size:13px;color:#64748b;">{{.DailyConsolidation.TotalLabel}} · {{.DailyConsolidation.Total}} USDC</div>
+          {{end}}
+          {{with .SingleBuilder}}
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid #edf1f5;font-size:12px;line-height:1.6;">
+            <div style="color:#64748b;">{{.Name}} · {{.Address}}{{if .ClaimableQueries}} · {{.ClaimableQueries}}{{end}}</div>
+            <div><span style="color:{{.ClaimColor}};">00:00 Reward · {{.Claim}}</span><span style="color:{{.SweepColor}};"> · Sweep {{.Sweep}}</span></div>
+            {{if .RateIssue}}<div style="color:{{.RateColor}};">Rate Limit · {{.RateLimit}}</div>{{end}}
+          </div>
+          {{end}}
+        </td></tr>
+        {{end}}
+
+        {{if not .Compact}}
+        {{if gt (len .Builders) 1}}
+        <tr><td class="pad" style="padding:0 30px 20px;">
+          <div style="margin:8px 0;font-size:14px;font-weight:700;color:#0f172a;">Builder 明细</div>
+          <table class="builder-table" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size:13px;border-collapse:collapse;">
+            <tr style="background:#f8fafc;color:#64748b;">
+              <th align="left" style="padding:8px;">Builder</th>
+              <th align="left" style="padding:8px;">00:00 Reward</th>
+              <th align="left" style="padding:8px;">Sweep</th>
+            </tr>
+            {{range .Builders}}
+            <tr>
+              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;"><strong style="color:#334155;">{{.Name}}</strong><br><span style="font-size:11px;color:#94a3b8;">{{.Address}}</span>{{if .RateIssue}}<br><span style="font-size:11px;color:{{.RateColor}};">Rate Limit · {{.RateLimit}}</span>{{end}}</td>
+              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;"><span style="color:#64748b;">{{.Claimable}}</span><br><span style="color:{{.ClaimColor}};">{{.Claim}}</span></td>
+              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;color:{{.SweepColor}};">{{.Sweep}}</td>
+            </tr>
+            {{end}}
+          </table>
+        </td></tr>
+        {{end}}
         {{end}}
 
         {{if not .Compact}}
@@ -626,7 +677,7 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
           <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13px;line-height:1.6;background:#f8fafc;border-radius:10px;">
             <tr><td colspan="2" style="padding:14px 16px 10px;">
               <div style="font-size:12px;color:#64748b;">{{.Name}}</div>
-              <div style="font-size:24px;font-weight:700;color:#0f172a;">{{.Amount}} <span style="font-size:13px;font-weight:400;color:#64748b;">USDC · {{.RecordCount}} 条记录</span></div>
+              <div style="font-size:18px;font-weight:700;color:#0f172a;">{{.Amount}} <span style="font-size:13px;font-weight:400;color:#64748b;">USDC · {{.RecordCount}} 条记录</span></div>
             </td></tr>
             <tr><td colspan="2" style="padding:0 16px 10px;">
               <span style="color:#64748b;">付款状态 </span><strong style="color:{{.StatusColor}};">{{.Status}}</strong>
@@ -647,37 +698,11 @@ var reportTemplate = template.Must(template.New("funding-report").Parse(`<!docty
         {{end}}
         {{end}}
 
-        {{if .DailyConsolidation.Show}}
-        <tr><td class="pad" style="padding:18px 30px;border-top:1px solid #e5e9f0;">
-          <div style="font-size:15px;font-weight:700;color:#0f172a;">归集对账 <span style="font-size:12px;font-weight:400;color:#64748b;">{{.DailyConsolidation.UTCDate}} UTC 00:00</span></div>
-          <div style="margin-top:8px;font-size:13px;color:{{.DailyConsolidation.Color}};">{{.DailyConsolidation.Status}} · Builder 覆盖 {{.DailyConsolidation.Coverage}}</div>
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:8px;font-size:13px;line-height:1.6;">
-            <tr><td style="padding:3px 0;color:#64748b;">{{.DailyConsolidation.TotalLabel}}</td><td align="right" style="padding:3px 0;">{{.DailyConsolidation.Total}} USDC</td></tr>
-            <tr><td style="padding:3px 0;color:#64748b;">对账差额（Claimable - Payout）</td><td align="right" style="padding:3px 0;color:{{.DailyConsolidation.DifferenceColor}};">{{.DailyConsolidation.Difference}} USDC</td></tr>
-          </table>
-        </td></tr>
-        {{end}}
-
-        {{if not .Compact}}
-        {{if .Builders}}
+        {{if or .Compact (not .Payouts)}}
         <tr><td class="pad" style="padding:0 30px 20px;">
-          <div style="margin:8px 0;font-size:14px;font-weight:700;color:#0f172a;">Builder 明细</div>
-          <table class="builder-table" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#f8fafc;color:#64748b;">
-              <th align="left" style="padding:8px;">Builder</th>
-              <th align="left" style="padding:8px;">00:00 Reward</th>
-              <th align="left" style="padding:8px;">Sweep</th>
-            </tr>
-            {{range .Builders}}
-            <tr>
-              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;"><strong style="color:#334155;">{{.Name}}</strong><br><span style="font-size:11px;color:#94a3b8;">{{.Address}}</span>{{if .RateIssue}}<br><span style="font-size:11px;color:{{.RateColor}};">Rate Limit · {{.RateLimit}}</span>{{end}}</td>
-              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;"><span style="color:#64748b;">{{.Claimable}}</span><br><span style="color:{{.ClaimColor}};">{{.Claim}}</span></td>
-              <td valign="top" style="padding:10px 8px;border-bottom:1px solid #edf1f5;color:{{.SweepColor}};">{{.Sweep}}</td>
-            </tr>
-            {{end}}
-          </table>
+          {{if .Compact}}{{template "compact-payout-summary" .Payouts}}{{end}}
+          <div style="margin-top:10px;">{{template "settlement-summary" .Settlement}}</div>
         </td></tr>
-        {{end}}
         {{end}}
 
         {{if .Warnings}}
